@@ -309,6 +309,11 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 		name, fsType = e.source, e.fsType
 	}
 
+	mediaType := ""
+	if strings.HasPrefix(name, "/dev/") {
+		mediaType = mediaTypeOfDevice(name)
+	}
+
 	free := size.freeBytes
 	// 该路径落在某个 thin 卷上时，还要看它所属**池**还剩多少（多存储池下各算各的）：
 	// 池见底后这个卷再空也写不进去。猜不出池（厚卷、宿主目录）就只看文件系统本身。
@@ -320,7 +325,74 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 		FileSystem: fsType,
 		FreeBytes:  free,
 		TotalBytes: size.totalBytes,
+		MediaType:  mediaType,
 	}, nil
+}
+
+// mediaTypeOfDevice 判断 /dev 下的设备（含 dm / 分区）所在物理盘的介质类型。
+//
+// 返回 hdd / ssd / 空串（识别不出来）。
+func mediaTypeOfDevice(dev string) string {
+	base := filepath.Base(strings.TrimSpace(dev))
+	if resolved, err := filepath.EvalSymlinks(dev); err == nil {
+		base = filepath.Base(resolved)
+	}
+	if base == "" || base == "." || base == "/" {
+		return ""
+	}
+	switch blockRotational(base, 0) {
+	case 1:
+		return domain.MediaTypeHDD
+	case 0:
+		return domain.MediaTypeSSD
+	default:
+		return ""
+	}
+}
+
+// blockRotational 读取 /sys/class/block/<name>/queue/rotational：
+// 1 = 机械盘，0 = 固态盘，-1 = 读不到。
+//
+// dm 设备与分区要向下追：thin LV → thin-pool → 物理 PV；sda1 → sda。
+// 任何一块底层盘是机械盘就按机械盘算（性能上限由最慢的那块决定）。
+func blockRotational(name string, depth int) int {
+	if depth > 4 {
+		return -1
+	}
+	// 先看 slaves：dm 设备真正承载数据的底层设备在这里。
+	if entries, err := os.ReadDir(filepath.Join("/sys/class/block", name, "slaves")); err == nil && len(entries) > 0 {
+		allKnown := true
+		for _, e := range entries {
+			switch blockRotational(e.Name(), depth+1) {
+			case 1:
+				return 1
+			case -1:
+				allKnown = false
+			}
+		}
+		if allKnown {
+			return 0
+		}
+	}
+	if raw, err := os.ReadFile(filepath.Join("/sys/class/block", name, "queue", "rotational")); err == nil {
+		if strings.TrimSpace(string(raw)) == "1" {
+			return 1
+		}
+		return 0
+	}
+	// 分区设备没有自己的 queue：用 sysfs 的真实层级找父盘（nvme0n1p2 → nvme0n1、sda1 → sda）。
+	if resolved, err := filepath.EvalSymlinks(filepath.Join("/sys/class/block", name)); err == nil {
+		parent := filepath.Base(filepath.Dir(resolved))
+		if parent != "" && parent != "." && parent != "block" && parent != name {
+			return blockRotational(parent, depth+1)
+		}
+	}
+	// 兜底：老内核 / 非标准命名下按尾部数字去掉分区号。
+	parent := strings.TrimRight(name, "0123456789")
+	if parent != "" && parent != name {
+		return blockRotational(parent, depth+1)
+	}
+	return -1
 }
 
 // FileSystemOf 返回路径所在卷的文件系统名。

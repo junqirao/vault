@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Button, Popconfirm, Progress, Select, Tooltip, Typography, message } from 'antd'
+import { Button, Modal, Popconfirm, Progress, Select, Typography, message } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -11,6 +11,7 @@ import { StatusTag } from '../../components/StatusTag'
 import { translateError } from '../../api/errors'
 import { useApi } from '../../api/provider'
 import type { JobDTO, JobState } from '../../api/types'
+import { useAgent } from '../../hooks/useAgent'
 import { usePermission } from '../../hooks/useAuth'
 import { isJobTerminal } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
@@ -25,13 +26,36 @@ export function JobList(): JSX.Element {
   const { t } = useI18n()
   const { isSuperAdmin } = usePermission()
   const queryClient = useQueryClient()
+  const agent = useAgent()
   const [state, setState] = useState<JobState | undefined>(undefined)
+  // 错误信息详情：表格里只展示截断后的一行，点击后弹窗看完整文本。
+  const [errorDetail, setErrorDetail] = useState<{ job: JobDTO; text: string } | null>(null)
 
   const jobsQuery = useQuery({
     queryKey: ['jobs', state ?? 'all'],
-    queryFn: () => api.listJobs({ state, limit: 200 }),
-    refetchInterval: 10000
+    queryFn: () => api.listJobs({ state, limit: 200 })
+    // 不再 refetchInterval：任务状态/进度由 SSE `job` 事件持续推来（见下面的 rows 合并）。
   })
+
+  // 把 SSE 的最新状态合并进列表：进度条与状态标签随事件走，列表本身只在进入页面/手点刷新时查一次。
+  const rows = useMemo(
+    () =>
+      (jobsQuery.data?.items ?? []).map((job) => {
+        // 列表里的终态比事件旧快照可信：事件可能丢终态、也可能晚到。已终态的任务不再被
+        // 旧 running 事件覆盖；非终态才用 SSE 的实时进度。
+        if (isJobTerminal(job.state)) return job
+        const live = agent.jobs[job.id]
+        if (!live) return job
+        return {
+          ...job,
+          state: live.state,
+          progress: live.progress,
+          failed: live.state === 'failed' || job.failed,
+          last_error: live.last_error ?? job.last_error
+        }
+      }),
+    [jobsQuery.data, agent.jobs]
+  )
 
   // 取消任务：卡住的发布/拆除任务没有别的出口（真实诉求："任务一直卡着，给个取消按钮"）。
   const cancelMutation = useMutation({
@@ -46,7 +70,13 @@ export function JobList(): JSX.Element {
   const columns = useMemo<TableColumnsType<JobDTO>>(
     () => [
       { title: t('field.type'), dataIndex: 'type', key: 'type', width: 200, render: (value: string) => jobTypeLabel(value) },
-      { title: t('field.refId'), dataIndex: 'ref_id', key: 'ref_id', render: (value: string) => <span style={{ fontSize: 12 }}>{value}</span> },
+      {
+        title: t('field.refId'),
+        dataIndex: 'ref_id',
+        key: 'ref_id',
+        ellipsis: true,
+        render: (value: string) => <span style={{ fontSize: 12 }}>{value}</span>
+      },
       {
         title: t('common.status'),
         dataIndex: 'state',
@@ -69,17 +99,30 @@ export function JobList(): JSX.Element {
       {
         // 失败原因（稳定错误码）直接列出来：否则用户只能看到"失败"却不知道卡在哪，
         // 又没法翻服务端日志（真实反馈："看不到任何日志"）。
+        //
+        // 列宽必须锁死、正文必须自己截断：错误码/底层报错可能很长，不截断会把前面的列挤变形。
+        // 点击整段文字打开详情弹窗，完整内容可滚动、可复制。
         title: t('job.field.error'),
         dataIndex: 'last_error',
         key: 'last_error',
-        width: 240,
-        render: (value: string | undefined) =>
+        width: 220,
+        ellipsis: true,
+        render: (value: string | undefined, job) =>
           value ? (
-            <Tooltip title={value}>
-              <Typography.Text type="danger" style={{ fontSize: 12 }} ellipsis>
-                {value}
-              </Typography.Text>
-            </Tooltip>
+            <Typography.Link
+              type="danger"
+              onClick={() => setErrorDetail({ job, text: value })}
+              style={{
+                display: 'block',
+                maxWidth: '100%',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+                fontSize: 12
+              }}
+            >
+              {value}
+            </Typography.Link>
           ) : null
       },
       {
@@ -125,12 +168,42 @@ export function JobList(): JSX.Element {
       {jobsQuery.error ? <ErrorNotice error={jobsQuery.error} /> : null}
       <DataTable<JobDTO>
         columns={columns}
-        rows={jobsQuery.data?.items ?? []}
+        rows={rows}
         rowKey={(job) => job.id}
         loading={jobsQuery.isLoading}
         empty={<EmptyState title={t('job.empty')} />}
         scroll={{ x: 1340 }}
       />
+
+      <Modal
+        open={errorDetail !== null}
+        title={t('job.errorDetail.title')}
+        width={760}
+        centered
+        onCancel={() => setErrorDetail(null)}
+        footer={<Button onClick={() => setErrorDetail(null)}>{t('common.close')}</Button>}
+      >
+        {errorDetail ? (
+          <div>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {`${jobTypeLabel(errorDetail.job.type)} · ${errorDetail.job.id}`}
+            </Typography.Text>
+            <Typography.Paragraph
+              copyable={{ text: errorDetail.text }}
+              style={{
+                marginTop: 8,
+                marginBottom: 0,
+                maxHeight: '50vh',
+                overflow: 'auto',
+                whiteSpace: 'pre-wrap',
+                wordBreak: 'break-word'
+              }}
+            >
+              {errorDetail.text}
+            </Typography.Paragraph>
+          </div>
+        ) : null}
+      </Modal>
     </PageShell>
   )
 }

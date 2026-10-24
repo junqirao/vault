@@ -21,10 +21,13 @@ import type {
   AgentMountMode,
   AgentMountState,
   AgentMountVolumeUsage,
+  AgentRepoEvent,
   AgentServerState,
   AgentSessionState,
   AgentState,
+  AgentVerifyDiffProgress,
   DownloadState,
+  LocalManifestStatus,
   UploadState,
   WebUpdateState
 } from '../api/agentTypes'
@@ -97,6 +100,12 @@ export interface UseAgentResult {
    * 事件是尽力而为的，关心某个任务时请用 useJobProgress（自带兜底查询）。
    */
   jobs: Record<string, AgentJobState>
+  /** 本地清单任务进度（manifest_id → 状态，来自 `manifest` 事件）。 */
+  manifests: Record<string, LocalManifestStatus>
+  /** 上传核对服务端进度（job_id → 进度，来自 `verifydiff` 事件）。 */
+  verifyDiffs: Record<string, AgentVerifyDiffProgress>
+  /** 存储库状态/迁移进度（repo_id → 最新事件，来自 `repo` 事件）。 */
+  repoEvents: Record<string, AgentRepoEvent>
   /** 客户端资源热更状态（来自 web_update 事件与 GET /agent/update/web）。 */
   webUpdate: WebUpdateState | null
   mount: (input: AgentMountInput) => Promise<AgentMountState>
@@ -146,6 +155,12 @@ let snapshot: {
    * 历史。界面关心某个任务时用它拿实时进度，收不到就自己兜底查一次（见 useJobProgress）。
    */
   jobs: Record<string, AgentJobState>
+  /** 本地清单任务进度（manifest_id → 状态），来自本地事件流 `event: manifest`。 */
+  manifests: Record<string, LocalManifestStatus>
+  /** 上传核对服务端进度（job_id → 进度），来自本地事件流 `event: verifydiff`。 */
+  verifyDiffs: Record<string, AgentVerifyDiffProgress>
+  /** 存储库状态/迁移进度（repo_id → 最新事件），来自本地事件流 `event: repo`。 */
+  repoEvents: Record<string, AgentRepoEvent>
   webUpdate: WebUpdateState | null
   error: unknown
 } = {
@@ -159,6 +174,9 @@ let snapshot: {
   downloads: [],
   uploads: [],
   jobs: {},
+  manifests: {},
+  verifyDiffs: {},
+  repoEvents: {},
   webUpdate: null,
   error: null
 }
@@ -619,6 +637,21 @@ function applyEvent(event: AgentEvent): void {
       setSnapshot({ jobs: upsertJob(snapshot.jobs, event.job) })
       return
     }
+    case 'manifest': {
+      // 上传核对的本地清单进度：按 manifest_id 更新，界面不再轮询 status 接口。
+      setSnapshot({ manifests: { ...snapshot.manifests, [event.manifest.manifest_id]: event.manifest } })
+      return
+    }
+    case 'verifydiff': {
+      // 上传核对的服务端细粒度进度：按 job_id 存，界面直接取阶段/当前文件/字节。
+      setSnapshot({ verifyDiffs: { ...snapshot.verifyDiffs, [event.verifydiff.job_id]: event.verifydiff } })
+      return
+    }
+    case 'repo': {
+      // 存储库状态/迁移进度：按 repo_id 保留最新一条，列表与详情据此原地更新。
+      setSnapshot({ repoEvents: { ...snapshot.repoEvents, [event.repo.repo_id]: event.repo } })
+      return
+    }
     case 'heartbeat':
       return
   }
@@ -642,6 +675,9 @@ const EVENT_TYPES = [
   'download',
   'upload',
   'job',
+  'manifest',
+  'verifydiff',
+  'repo',
   'heartbeat'
 ] as const
 

@@ -39,8 +39,6 @@ import type {
   MemberDTO,
   PoolCatalogDTO,
   MountSpec,
-  OrphanDeleteResultDTO,
-  OrphanScanDTO,
   ParentAction,
   ParentFileListingDTO,
   VerifyDiffMode,
@@ -167,22 +165,10 @@ export class VaultApi extends ApiClient {
     })
   }
 
-  /** 现扫一遍孤儿磁盘文件（未登记却真实存在的 .vhdx；仅超级管理员）。 */
-  scanOrphans(): Promise<OrphanScanDTO> {
-    return this.request<OrphanScanDTO>('GET', '/v1/system/orphans')
-  }
-
-  /**
-   * 删除一个孤儿磁盘文件（仅超级管理员；不可逆，服务端会在删除前重新校验它仍未被登记）。
-   */
-  deleteOrphan(path: string): Promise<OrphanDeleteResultDTO> {
-    return this.request<OrphanDeleteResultDTO>('POST', '/v1/system/orphans/delete', { path })
-  }
-
   /**
    * 现扫一遍可导入的磁盘文件（仅超级管理员）。
    *
-   * 与孤儿扫描扫的是同一批文件，但**全部** .vhdx 都会返回（含已登记的）：
+   * **全部** .vhdx 都会返回（含已登记的）：
    * 导入页面要回答的是"我那几块盘是不是都搬过来了"，藏起已登记的就没法确认。
    */
   scanDiskImports(): Promise<DiskImportScanDTO> {
@@ -430,7 +416,12 @@ export class VaultApi extends ApiClient {
     )
   }
 
-  /** 细粒度进度：阶段、当前文件、已处理字节（界面 1s 轮询）。 */
+  /**
+   * 细粒度进度：阶段、当前文件、已处理字节。
+   *
+   * ⚠️ **不要轮询它**：实时进度走服务端 SSE `verifydiff`（经代理转成本地 `event: verifydiff`）。
+   * 本接口只在任务开始时取一次初始快照/事件通道不可用时兜底。
+   */
   getVerifyDiffProgress(id: string, jobId: string): Promise<VerifyDiffProgressDTO> {
     return this.request<VerifyDiffProgressDTO>(
       'GET',

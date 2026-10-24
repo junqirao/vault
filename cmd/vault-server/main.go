@@ -628,6 +628,16 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	startTicker("disk_usage_sample", 5*time.Minute, func(ctx context.Context) error {
 		return application.Disks().SamplePhysicalUsage(ctx)
 	})
+	// 存储卷信息缓存：Windows 上查卷空间要起 PowerShell，绝不能放在请求路径里。
+	// 启动先预热一次，之后每分钟刷新（列表/详情只读缓存，见 app/storage.go）。
+	startTicker("storage_volume_cache", time.Minute, func(ctx context.Context) error {
+		return application.Storages().RefreshVolumeCache(ctx)
+	})
+	safeGo(log, "storage_volume_cache_warmup", func() {
+		if err := application.Storages().RefreshVolumeCache(bgCtx); err != nil {
+			log.Warn("存储卷信息缓存预热失败", "error", err)
+		}
+	})
 	// 定时对账：每 5 分钟一次增量对账（见 docs/implementation.md 5.11）。
 	startTicker("reconcile", 5*time.Minute, func(ctx context.Context) error {
 		return application.Reconcile(ctx)
@@ -666,11 +676,12 @@ func runServe(configPath *string, migrateOnly *bool) int {
 
 	jobs.OnFinished(func(j *domain.Job) {
 		events.Publish(api.Event{Type: "job", Data: map[string]any{
-			"job_id":   j.ID,
-			"type":     string(j.Type),
-			"ref_id":   j.RefID,
-			"state":    string(j.State),
-			"progress": j.Progress,
+			"job_id":     j.ID,
+			"type":       string(j.Type),
+			"ref_id":     j.RefID,
+			"state":      string(j.State),
+			"progress":   j.Progress,
+			"last_error": j.LastError,
 		}})
 	})
 

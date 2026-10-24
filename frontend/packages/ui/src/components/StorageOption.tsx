@@ -88,6 +88,7 @@ export function StorageOption({ name, path, usedBytes, totalBytes }: StorageOpti
         >
           {percent > 0 ? (
             <div
+              className="vault-progress-fill"
               style={{
                 position: 'absolute',
                 insetBlock: 0,
@@ -98,10 +99,14 @@ export function StorageOption({ name, path, usedBytes, totalBytes }: StorageOpti
               }}
             />
           ) : null}
-          <span style={{ ...centeredLabel, color: palette.textSecondary, clipPath: `inset(0 0 0 ${percent}%)` }}>
+          <span
+            className="vault-progress-clip"
+            style={{ ...centeredLabel, color: palette.textSecondary, clipPath: `inset(0 0 0 ${percent}%)` }}
+          >
             {label}
           </span>
           <span
+            className="vault-progress-clip"
             style={{
               ...centeredLabel,
               color: palette.textInverse,

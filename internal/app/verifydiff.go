@@ -107,16 +107,18 @@ type VerifyDiffProgress struct {
 // 每次都落盘会把磁盘打满；200ms 对界面（1s 轮询）已经足够顺滑。
 const verifyProgressInterval = 200 * time.Millisecond
 
-// verifyProgressWriter 把进度原子地写到临时 JSON 文件。
+// verifyProgressWriter 把进度原子地写到临时 JSON 文件，并推给 SSE（不再让界面 1s 轮询）。
 type verifyProgressWriter struct {
 	path string
 	mu   sync.Mutex
 	last time.Time
 	data VerifyDiffProgress
+	// onUpdate 在每次真正写盘/推送时回调；可为 nil。
+	onUpdate func(VerifyDiffProgress)
 }
 
-func newVerifyProgressWriter(path string) *verifyProgressWriter {
-	w := &verifyProgressWriter{path: path}
+func newVerifyProgressWriter(path string, onUpdate func(VerifyDiffProgress)) *verifyProgressWriter {
+	w := &verifyProgressWriter{path: path, onUpdate: onUpdate}
 	w.update(true, func(p *VerifyDiffProgress) {
 		p.State = "running"
 		p.Phase = "prepare"
@@ -126,9 +128,7 @@ func newVerifyProgressWriter(path string) *verifyProgressWriter {
 }
 
 func (w *verifyProgressWriter) update(force bool, mutate func(*VerifyDiffProgress)) {
-	if w == nil || w.path == "" {
-		// 升级前入队的历史任务没有 progress_path：只更新内存，不落盘（也绝不能把
-		// 临时文件写到进程工作目录里）。
+	if w == nil {
 		return
 	}
 	w.mu.Lock()
@@ -138,8 +138,18 @@ func (w *verifyProgressWriter) update(force bool, mutate func(*VerifyDiffProgres
 		return
 	}
 	w.last = time.Now()
-	raw, err := json.Marshal(w.data)
+	payload := w.data
 	w.mu.Unlock()
+
+	// 事件是主通道：即使没有 progress_path（历史任务），也要把进度推给事件流。
+	if w.onUpdate != nil {
+		w.onUpdate(payload)
+	}
+	if w.path == "" {
+		// 升级前入队的历史任务没有 progress_path：只更新内存，不落盘。
+		return
+	}
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		return
 	}
@@ -360,7 +370,21 @@ func (s *DiskService) runVerifyDiff(ctx context.Context, j *domain.Job, rep job.
 	if err = decodePayload(j.Payload, &p); err != nil {
 		return apperr.InvalidParam("payload").WithCause(err)
 	}
-	prog := newVerifyProgressWriter(p.ProgressPath)
+	prog := newVerifyProgressWriter(p.ProgressPath, func(progress VerifyDiffProgress) {
+		s.emit(VerifyDiffEventTopic, map[string]any{
+			"job_id":      j.ID,
+			"repo_id":     p.RepoID,
+			"state":       progress.State,
+			"phase":       progress.Phase,
+			"message":     progress.Message,
+			"current":     progress.Current,
+			"done":        progress.Done,
+			"total":       progress.Total,
+			"bytes":       progress.Bytes,
+			"total_bytes": progress.TotalBytes,
+			"error":       progress.Error,
+		})
+	})
 	defer func() {
 		if err != nil {
 			prog.fail(err)

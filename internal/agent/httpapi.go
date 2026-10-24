@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -45,6 +46,11 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/usage", a.handleMountVolumeUsage)
 	// 本机 iSCSI 读缓存代理的用量与命中情况（客户端存储库页面展示，见 cacheproxy.go）。
 	mux.HandleFunc("GET /agent/cache", a.handleCacheStatus)
+	// 某个目录所在**物理磁盘**的介质类型（hdd / ssd / unknown）。
+	//
+	// 设置页用它提示"L2 缓存目录落在机械盘上"。做成独立接口而不是并进 /agent/cache：
+	// 用户正在编辑目录、尚未保存时也要能立即看到类型。
+	mux.HandleFunc("GET /agent/media-type", a.handleMediaType)
 	// 近 5 分钟的缓存指标采样（存储库页面"缓存指标曲线"弹窗）。
 	mux.HandleFunc("GET /agent/cache/history", a.handleCacheHistory)
 	// 清空某个库的本地读缓存内容（两级都清，会话与门户目标都留着）——存储库设置里的
@@ -483,6 +489,28 @@ func (a *Agent) handleListMounts(w http.ResponseWriter, _ *http.Request) {
 // "缓存用量/命中情况"；门户没开（没有任何库启用缓存）时 running=false、targets 为空。
 func (a *Agent) handleCacheStatus(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, a.cache.Status())
+}
+
+// handleMediaType 返回路径所在物理磁盘的介质类型（GET /agent/media-type?path=...）。
+//
+// 用于客户端设置页：L2 缓存目录若落在 HDD 上，随机读写提升有限，应提示用户换到 SSD。
+func (a *Agent) handleMediaType(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	if path == "" {
+		// 空串 = L2 缓存的默认位置（程序数据目录）；探它所在盘即可，
+		// 不必等 iscsi-cache 目录真的建出来。
+		path = DataDir()
+	}
+	if !filepath.IsAbs(path) {
+		a.writeError(w, apperr.InvalidParam("path"))
+		return
+	}
+	mediaType, err := a.vol.MediaTypeOf(r.Context(), path)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
+	a.writeJSON(w, http.StatusOK, map[string]any{"media_type": mediaType})
 }
 
 // handleCacheHistory 返回近 5 分钟的缓存指标采样（每 5 秒一点，见 cacheproxy.go）。

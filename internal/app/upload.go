@@ -1263,6 +1263,11 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 			return err
 		}
 		repo.State = domain.RepoStateImporting
+		s.emit("repo", map[string]any{
+			"action":  "state_changed",
+			"repo_id": repo.ID,
+			"state":   string(domain.RepoStateImporting),
+		})
 	}
 	rep.Progress(35)
 
@@ -1300,6 +1305,11 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 	if err := s.Store.SetRepositoryState(ctx, repo.ID, domain.RepoStateActive); err != nil {
 		return err
 	}
+	s.emit("repo", map[string]any{
+		"action":  "state_changed",
+		"repo_id": repo.ID,
+		"state":   string(domain.RepoStateActive),
+	})
 	if err := s.Store.UpdateUploadState(ctx, u.ID, domain.UploadStateComplete); err != nil {
 		return err
 	}
@@ -1400,6 +1410,11 @@ func (s *UploadService) MarkUploadCompleteFailed(ctx context.Context, payload st
 	if err := s.Store.SetRepositoryState(ctx, repo.ID, domain.RepoStateError); err != nil {
 		return err
 	}
+	s.emit("repo", map[string]any{
+		"action":  "state_changed",
+		"repo_id": repo.ID,
+		"state":   string(domain.RepoStateError),
+	})
 	s.Log.Warn("上传建库失败，已回滚存储库与母盘状态",
 		"upload_id", u.ID, "repo_id", repo.ID, "disk_id", diskID, "error", cause)
 	return nil

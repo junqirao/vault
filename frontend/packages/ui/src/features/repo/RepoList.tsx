@@ -37,6 +37,7 @@ import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
 import { GroupMountSettingsModal, RepoMountSettingsModal } from './RepoMountSettings'
+import { StorageUsageCard } from '../storage/StorageUsage'
 import { isPlaceholderRepoId, uploadPlaceholderRepo } from './uploadView'
 
 export interface RepoListProps {
@@ -50,6 +51,11 @@ export interface RepoListProps {
    * 可选：管理端看的是服务端全量库，本机上传与它无关，不传即不出现上传中的条目。
    */
   onOpenUpload?: (uploadId: string) => void
+  /**
+   * 打开客户端只读存储页（首页「存储」卡片的整卡点击）。
+   * 不传时（管理端列表）不渲染该卡片。
+   */
+  onOpenStorages?: () => void
   /**
    * 打开「导入母盘」页：把存储根里已存在的 VHDX 文件原地接管成存储库。
    *
@@ -134,29 +140,6 @@ function storeView(view: RepoViewMode): void {
     // 忽略：偏好没记住不是错误，不值得打扰用户。
   }
 }
-
-/**
- * 「中间态」：库会**自己往下走**、不需要人管的状态（建库中 / 写母盘中 / 加封中 / 删除中）。
- *
- * error 刻意不算：它不会自己好，等人动手修的状态盯着轮询只是白耗请求。
- */
-const PENDING_REPO_STATES: ReadonlyArray<RepoDTO['state']> = [
-  'creating',
-  'importing',
-  'sealing',
-  // 迁移是后台任务，进度快照只落库、不会推到这个列表：动作期间按固定节拍重取，
-  // 用户的卡片才能跟着走进度并在完成时自动恢复成普通库。
-  'moving',
-  'deleting'
-]
-
-/**
- * 列表里还有中间态时的自动刷新间隔。
- *
- * 5s 是"标签该消失时基本立刻就消失"与"别把列表当心跳打"之间的取中：这段窗口本身是分钟级的
- * （写母盘 30G 几十分钟起步），刷新只是去接一个迟早会发生的状态变化。
- */
-const PENDING_REFRESH_MS = 5000
 
 /**
  * 用户端分组区块标题：标题 + 数量在左，`extra`（形态切换）贴右。
@@ -782,7 +765,14 @@ function RepoGroupDetail({
 }
 
 /** 存储库列表：管理端表格；用户端卡片/列表两种形态（可切换 + 分组分页）。 */
-export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImport }: RepoListProps): JSX.Element {
+export function RepoList({
+  isSuperAdmin,
+  onCreate,
+  onOpen,
+  onOpenUpload,
+  onOpenStorages,
+  onImport
+}: RepoListProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const { user } = useAuth()
@@ -846,43 +836,8 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
     [agent.uploads, isSuperAdmin, onOpenUpload]
   )
 
-  /**
-   * 列表里还有"没走完"的库吗 —— 有就自己盯着刷新，直到一个都不剩。
-   *
-   * 为什么必须自动刷（真实反馈："上传完成后要去掉上传中这个标签"）：那张「上传中」卡是
-   * **客户端合成**的占位库（服务端此刻还没有这条记录，见 uploadPlaceholderRepo），它变成真库、
-   * 以及真库从「写入中」变成正常，全都只发生在服务端，而且都是后台异步发生的（建库任务是队列里
-   * 的另一次请求、写母盘几十分钟）—— 没有任何事件会推到这个页面上。于是不手点刷新的人会一直
-   * 看着一枚早就该消失的标签（在新建页发起上传、随后切到列表页时尤其明显：那里的收尾刷新随
-   * 表单卸载一起没了）。
-   *
-   * 两头一起看：
-   *   - 服务端侧：列表里有 creating / importing / sealing / deleting 的库（见 PENDING_REPO_STATES），
-   *     它们自己会往下走；
-   *   - 本机侧：还有进行中的上传 —— 包括**重传覆盖**（那时库仍是 active，只看状态会漏），以及
-   *     刚够到「建库中」那一帧（服务端的库记录还没出现，全靠占位卡顶着）。
-   */
-  const hasPendingRepos = useMemo(
-    () =>
-      activeUploads.length > 0 ||
-      (reposQuery.data?.items ?? []).some((repo) => PENDING_REPO_STATES.includes(repo.state)),
-    [activeUploads, reposQuery.data]
-  )
-
-  // 中间态存在期间按固定节拍重取。
-  //
-  // 用 effect + setInterval 而不是 useQuery 的 refetchInterval：这条判据要读的正是**这次查询的
-  // 结果**（列表里有没有中间态的库），写成 refetchInterval 就得绕回上一轮渲染的值；这样子写也
-  // 与本页复用缓存那个轮询器（见上面的 refreshCache）一个模样。卸载即停，不留后台心跳。
-  const refetchRepos = reposQuery.refetch
-  useEffect(() => {
-    if (!hasPendingRepos) return
-    const timer = window.setInterval(() => void refetchRepos(), PENDING_REFRESH_MS)
-    return () => window.clearInterval(timer)
-  }, [hasPendingRepos, refetchRepos])
-
   // 上传刚收工的那一拍**立刻**补一次：真库记录正是这一刻才在服务端出现的，而列表手里还是旧快照。
-  // 不补的话，占位卡先消失、真库要等下一拍轮询才回来 —— 中间那几秒列表里空着一块，看着像库被
+  // 不补的话，占位卡先消失、真库要等下一次查询才回来 —— 中间那几秒列表里空着一块，看着像库被
   // 弄丢了。判据用"活跃集合里少了人"：只在上传真正结束时触发一次，不跟着进度事件走（进度事件
   // 每秒都有，跟着它走就等于每秒打一次列表接口）。
   const activeUploadIds = useMemo(
@@ -890,6 +845,7 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
     [activeUploads]
   )
   const lastActiveIds = useRef(activeUploadIds)
+  const refetchRepos = reposQuery.refetch
   useEffect(() => {
     const finished = lastActiveIds.current.some((id) => !activeUploadIds.includes(id))
     lastActiveIds.current = activeUploadIds
@@ -907,7 +863,27 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
       // 仍然是 active 的库不算"上传中"：它此刻能正常挂载使用（这是重传覆盖还没轮到重建
       // 母盘的场景），给它贴上「上传中」只会让人以为库不能用了 —— 这次覆盖上传的进度去
       // 「上传任务」页看（新建页发起后就在那儿）。
-      return { repo, upload: upload && repo.state !== 'active' ? upload : undefined }
+      const live = agent.repoEvents[repo.id]
+      let next = repo
+      if (live) {
+        // SSE 的存储库事件：只在"进度类"事件上原地合并。
+        // 状态切换（state_changed / moved / move_canceled）不直接改本地快照，而是由下面的
+        // effect 触发一次列表刷新 —— 事件可能丢失/滞后，服务端记录永远比旧事件可信。
+        if (live.action === 'move_started' || live.action === 'move_progress') {
+          next = {
+            ...repo,
+            state: (live.state as RepoDTO['state'] | undefined) ?? repo.state,
+            move: live.move ?? repo.move
+          }
+        } else if (live.action === 'prepare_progress') {
+          next = {
+            ...repo,
+            state: (live.state as RepoDTO['state'] | undefined) ?? repo.state,
+            prepare: live.prepare ?? repo.prepare
+          }
+        }
+      }
+      return { repo: next, upload: upload && next.state !== 'active' ? upload : undefined }
     })
 
     // 服务端还没有的（扫描 / 建会话 / 传数据三个阶段）：合成一条，让它和其他库一样出现在
@@ -921,7 +897,22 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
     const lowered = keyword.trim().toLowerCase()
     if (!lowered) return merged
     return merged.filter((entry) => entry.repo.name.toLowerCase().includes(lowered))
-  }, [reposQuery.data, keyword, activeUploads, user?.id])
+  }, [reposQuery.data, keyword, activeUploads, user?.id, agent.repoEvents])
+
+  // 状态类事件只触发一次列表刷新（事件本身可能丢/滞后，不直接改本地快照）。
+  // 进度类事件（move_progress / prepare_progress）不在这里，靠上面的 entries 合并实时更新。
+  const repoStateEventKey = useMemo(
+    () =>
+      Object.values(agent.repoEvents)
+        .filter((event) => event.action === 'state_changed' || event.action === 'moved' || event.action === 'move_canceled')
+        .map((event) => `${event.repo_id}:${event.action}:${event.state ?? ''}`)
+        .sort()
+        .join('|'),
+    [agent.repoEvents]
+  )
+  useEffect(() => {
+    if (repoStateEventKey) void refetchRepos()
+  }, [repoStateEventKey, refetchRepos])
 
   // 记忆的分组可能已经被改名/删空：这时落回总览，别停在一个不存在的分组里。
   //
@@ -988,11 +979,14 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
     // 上传中的占位库已经算在 entries 里，所以这里不必再单独判一次"有没有在上传"。
     if (entries.length === 0) {
       return (
-        <EmptyState
-          title={t('repo.empty')}
-          description={t('repo.empty.desc')}
-          action={{ label: t('common.create'), onClick: onCreate }}
-        />
+        <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
+          {onOpenStorages ? <StorageUsageCard onOpen={onOpenStorages} /> : null}
+          <EmptyState
+            title={t('repo.empty')}
+            description={t('repo.empty.desc')}
+            action={{ label: t('common.create'), onClick: onCreate }}
+          />
+        </Space>
       )
     }
 
@@ -1020,6 +1014,8 @@ export function RepoList({ isSuperAdmin, onCreate, onOpen, onOpenUpload, onImpor
 
     return (
       <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
+        {/* 「存储」总览：整卡点击进入只读存储页，右上角箭头进管理端（仅超管）。 */}
+        {onOpenStorages ? <StorageUsageCard onOpen={onOpenStorages} /> : null}
         {/* 配额总览只认服务端的库：还没建成的上传中库不算"一个存储库"，也不占容量。 */}
         <QuotaOverview repos={entries.filter((entry) => !isPlaceholderRepoId(entry.repo.id)).map((entry) => entry.repo)} />
         <Row gutter={[spacing.md, spacing.md]}>

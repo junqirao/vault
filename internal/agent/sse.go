@@ -262,6 +262,16 @@ const jobEventBuffer = 8
 // 边界（主进程转发、渲染层解析）不需要再翻译一次。
 const localJobEventType = "job"
 
+// 本地事件名：清单进度、上传核对进度、存储库状态/迁移进度。
+// 这些是"代理/服务端 → 界面"的实时快照，界面不再轮询对应的 status/progress/repo 接口。
+const (
+	localManifestEventType   = "manifest"
+	localVerifyDiffEventType = "verifydiff"
+	localRepoEventType       = "repo"
+	// serverVerifyDiffEventType 是服务端上传核对细粒度进度的 SSE topic。
+	serverVerifyDiffEventType = "verifydiff"
+)
+
 // jobEvent 是任务事件在两个方向上的共同形状（服务端推来的 data，也就是转发给界面的 data）。
 //
 // 字段名沿用服务端那一版（job_id 而不是 serverJob 的 id）：这个形状是**线上契约**，
@@ -272,6 +282,8 @@ type jobEvent struct {
 	RefID    string `json:"ref_id"`
 	State    string `json:"state"`
 	Progress int    `json:"progress"`
+	// LastError 只在终态（通常是 failed）时由服务端带上，便于任务中心直接显示原因。
+	LastError string `json:"last_error,omitempty"`
 }
 
 // jobWatch 是"服务端建库任务进度"的订阅中心。
@@ -423,14 +435,23 @@ func (a *Agent) handleServerEvent(key, eventType string, data json.RawMessage) {
 		payload.JobID = jobID
 		payload.State = strings.TrimSpace(payload.State)
 		a.jobWatch.publish(serverJob{
-			ID:       payload.JobID,
-			Type:     payload.Type,
-			RefID:    payload.RefID,
-			State:    payload.State,
-			Progress: payload.Progress,
+			ID:        payload.JobID,
+			Type:      payload.Type,
+			RefID:     payload.RefID,
+			State:     payload.State,
+			Progress:  payload.Progress,
+			LastError: payload.LastError,
 		})
 		// 尽力而为：渲染层没订阅或缓冲满时丢弃（见 EventHub）。
 		a.hub.Publish(Event{Type: localJobEventType, Data: payload})
+	case serverVerifyDiffEventType:
+		// 上传核对的细粒度进度（阶段/当前文件/已读字节）：服务端 200ms 节流推送，
+		// 界面不再 1s 轮询 /diff/progress。
+		a.hub.Publish(Event{Type: localVerifyDiffEventType, Data: data})
+	case localRepoEventType:
+		// 存储库状态/迁移进度（move_progress / moved / prepare 等）：原样转发给界面，
+		// 列表与详情据此更新卡片进度，不再定时拉 /v1/repos。
+		a.hub.Publish(Event{Type: localRepoEventType, Data: data})
 	default:
 		// 其余事件（租约变更等）对代理无动作需求：权威状态以心跳与显式查询为准。
 		a.logger.Debug("忽略服务端事件", "type", eventType)

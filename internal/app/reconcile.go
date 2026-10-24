@@ -3,7 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
-	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -181,11 +181,16 @@ func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 	// 孤儿目标：DB 无记录 → 自动删除（真实诉求："磁盘已删但 iSCSI 目标还挂着的，
 	// 启动时自动清理"，避免资源泄漏）。删除只解映射+删目标，不删底层 VHDX 文件。
 	//
-	// ⚠️ 分批删除：每个 RemoveTarget 都要跑一次 PowerShell（本机实测 15-20 秒），而整个
-	// 对账受 reconcileBudget（60s）约束，一次删太多必然 context deadline exceeded
-	// （真实事故：大量孤儿时日志刷屏超时）。故每轮最多删 maxOrphanDelete 个，剩余留到
-	// 下一轮对账（对账定期运行，慢慢清完即可）。
-	const maxOrphanDelete = 2
+	// 不再人为限制"每轮最多删几个"：每删一个都要跑 PowerShell（本机实测 15-20 秒），
+	// 对账本身有 60s 预算，ctx 一到循环自然停下，剩余目标下一轮继续。限制数量只会在
+	// 孤儿较多时把清理拖成十几轮，反而更容易看到"一直清不完"。
+	//
+	// 目标删除后再顺手清掉它映射的虚拟盘登记（Windows 的 iSCSI 虚拟盘是独立登记，
+	// 删目标不会自动移除）：只有路径不在 disks 表里才删，导出/导入中的文件数据不受影响。
+	dbPaths, pathErr := a.registeredDiskPaths(ctx)
+	if pathErr != nil {
+		log.Warn("查询磁盘登记失败，本轮跳过孤儿虚拟盘清理", "error", pathErr)
+	}
 	deleted := 0
 	for i := range winTargets {
 		w := &winTargets[i]
@@ -203,9 +208,6 @@ func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 			// 对账预算已耗尽，剩余孤儿留下轮，避免刷超时日志。
 			break
 		}
-		if deleted >= maxOrphanDelete {
-			continue
-		}
 		// 走统一拆除实现：孤儿恰恰是"名字不符合我们推导规则"的目标，必须按平台读回的
 		// 名字寻址（见 IscsiService.TeardownOrphanTarget）。
 		if err := a.iscsi.TeardownOrphanTarget(ctx, w.Name); err != nil {
@@ -217,6 +219,25 @@ func (a *App) reconcileIscsi(ctx context.Context, rep *ReconcileReport,
 		report("iscsi.orphan_target", w.Name, "已删除孤儿目标", true)
 		log.Warn("已删除孤儿 iSCSI 目标", "target", w.Name)
 		a.audit(ctx, "system", "reconcile.orphan_target", "target:"+w.Name, "removed", domain.AuditResultOK)
+
+		if pathErr != nil || a.platformKind() != platform.KindWindows || a.Deps.Iscsi == nil {
+			continue
+		}
+		for _, dev := range w.Devices {
+			dev = strings.TrimSpace(dev)
+			if dev == "" || dbPaths[pathKeyLocal(dev)] {
+				continue
+			}
+			if err := a.Deps.Iscsi.RemoveVirtualDisk(ctx, dev); err != nil {
+				log.Warn("移除孤儿 iSCSI 虚拟盘登记失败", "path", dev, "error", err)
+				continue
+			}
+			report("iscsi.orphan_virtual_disk", dev, "已移除孤儿 iSCSI 虚拟盘登记", true)
+			a.audit(ctx, "system", "reconcile.orphan_virtual_disk", "path:"+dev, "removed", domain.AuditResultOK)
+		}
+	}
+	if deleted > 0 {
+		log.Info("本轮自动清理孤儿 iSCSI 目标完成", "deleted", deleted)
 	}
 }
 
@@ -330,6 +351,16 @@ func (a *App) checkParentFingerprint(ctx context.Context, d *domain.Disk,
 		return
 	}
 
+	// 迁移/复制会让 VHDX 的 mtime 变化，而 Windows 的指纹包含 mtime。若不重算，迁移后的
+	// 母盘会被误判成"被绕过改写"。新迁移已在 afterMove 里主动重算；这里兜住升级前已经
+	// 完成迁移的库：mtime 变了、但 size 与头部哈希不变，且磁盘变更时间/审计记录能与
+	// 一次 repo.move.done 对上 → 判定为系统自身搬迁，刷新指纹而不是停用目标。
+	if a.repairMovedParentFingerprint(ctx, d, actual, log) {
+		report("parent.fingerprint_refreshed", d.ID,
+			"母盘指纹仅 mtime 变化，已根据迁移记录刷新指纹", true)
+		return
+	}
+
 	// 母盘被绕过改写：全部差异盘已不可信，停用该库全部子盘 target（见 5.4 / 5.11）。
 	log.Error("母盘指纹不一致：母盘可能被绕过改写，将停用全部子盘目标",
 		"repo_id", repo.ID, "disk_id", d.ID)
@@ -361,6 +392,82 @@ func (a *App) checkParentFingerprint(ctx context.Context, d *domain.Disk,
 		"母盘指纹与记录不一致，已停用子盘目标 "+strconv.Itoa(disabled)+" 个", true)
 }
 
+// repairMovedParentFingerprint 判断一次指纹不一致是否只是"系统搬迁造成的 mtime 变化"。
+//
+// 判据（全部满足才修）：
+//   - 新旧指纹的 size 与头部 SHA-256 完全一致（内容头部没变）；
+//   - 旧记录带 mtime，且新文件 mtime 与旧 mtime 不同；
+//   - 该库在"新文件 mtime 附近"有一条成功的 repo.move.done 审计 —— 说明这个 mtime 是
+//     迁移复制时写出来的，而不是之后有人绕过系统改盘。
+//
+// 修复后刷新 ContentFingerprint 并返回 true；调用方不再停用子盘目标。
+func (a *App) repairMovedParentFingerprint(ctx context.Context, d *domain.Disk, actual string, log *slog.Logger) bool {
+	oldSize, oldMtime, oldHead, okOld := parseParentFingerprint(d.ContentFingerprint)
+	newSize, newMtime, newHead, okNew := parseParentFingerprint(actual)
+	if !okOld || !okNew || oldSize != newSize || oldHead != newHead {
+		return false
+	}
+	if oldMtime <= 0 || newMtime <= 0 || oldMtime == newMtime {
+		return false
+	}
+	logs, err := a.Store.ListAuditLogs(ctx, "", "repo.move.done", 200, 0)
+	if err != nil {
+		return false
+	}
+	const moveWindowSeconds = int64(30 * 60)
+	for i := range logs {
+		l := &logs[i]
+		if l.Resource != "repo:"+d.RepoID || l.Result != domain.AuditResultOK {
+			continue
+		}
+		movedAt := l.CreatedAt / 1000
+		if oldMtime >= movedAt {
+			continue
+		}
+		diff := movedAt - newMtime
+		if diff < 0 {
+			diff = -diff
+		}
+		if diff > moveWindowSeconds {
+			continue
+		}
+		d.ContentFingerprint = actual
+		if err := a.Store.UpdateDisk(ctx, d); err != nil {
+			log.Warn("刷新迁移后母盘指纹失败", "disk_id", d.ID, "error", err)
+			return false
+		}
+		log.Warn("母盘指纹仅 mtime 变化且与迁移记录吻合，判定为系统搬迁并已刷新指纹",
+			"repo_id", d.RepoID, "disk_id", d.ID, "old_mtime", oldMtime, "new_mtime", newMtime)
+		a.audit(ctx, "system", "reconcile.parent_fingerprint_refreshed", "disk:"+d.ID,
+			"old_mtime="+strconv.FormatInt(oldMtime, 10)+" new_mtime="+strconv.FormatInt(newMtime, 10),
+			domain.AuditResultOK)
+		return true
+	}
+	return false
+}
+
+// parseParentFingerprint 解析平台层的内容指纹。
+//
+// Windows: size=<n>;mtime=<n>;head=<sha256>
+// Linux:   size=<n>;head=<sha256>（没有 mtime，不参与搬迁修复）
+func parseParentFingerprint(fp string) (size, mtime int64, head string, ok bool) {
+	for _, part := range strings.Split(fp, ";") {
+		key, value, found := strings.Cut(part, "=")
+		if !found {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "size":
+			size, _ = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		case "mtime":
+			mtime, _ = strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+		case "head":
+			head = strings.TrimSpace(value)
+		}
+	}
+	return size, mtime, head, head != ""
+}
+
 // checkDiffParentVersion 比对差异盘 parent_version 与母盘当前版本；不一致则标记不可挂载。
 func (a *App) checkDiffParentVersion(ctx context.Context, d *domain.Disk,
 	report func(kind, ref, detail string, fixed bool), log *slog.Logger) {
@@ -389,15 +496,24 @@ func (a *App) checkDiffParentVersion(ctx context.Context, d *domain.Disk,
 		"差异盘基准版本与母盘当前版本不一致，标记为不可挂载", true)
 }
 
-// reconcileOrphanFiles 扫描各白名单根的 disks 目录下未被数据库登记的文件。
+// orphanFileGrace 是自动删除未登记文件前的观察窗口。
 //
-// 扫描本身交给 collectOrphanFiles（与管理端「孤儿磁盘」页面共用同一份实现）；
-// 这里只决定**怎么处理**：差异盘 / 母盘类孤儿只报告（可能承载用户数据，见 5.11），
-// 其余孤儿 VHDX 移入**同根**的 meta/orphan/（保证同卷移动）。
+// 取 24 小时而不是几分钟，是为了给「导入已有磁盘」留出时间：管理员会把旧服务端的
+// disks/ 整棵目录拷进来，再在管理端逐个导入；这些文件在导入成功前同样是"未登记"。
+// 观察窗口内一律不删，超过一天还没被登记/导入的才视为真正无主。需要立刻清理时，
+// 管理端「孤儿磁盘」页面仍可手动删除。
+const orphanFileGrace = 24 * time.Hour
+
+// reconcileOrphanFiles 扫描各白名单根的 disks 目录下未被数据库登记的文件，并**自动删除**。
 //
-// 日志刻意降噪（真实反馈："打出来没用啊，干脆直接给个管理页面能手动删掉这些盘得了"）：
-// 逐个文件打 WARN 会把日志刷满，而当时用户也无事可做；现在每轮只打**一条汇总 WARN**
-// 并指名去管理端页面处理，单个文件的明细降到 Debug（需要时调日志级别即可拿到）。
+// 设计变更（真实反馈："只是打日志告知并没有什么意义，在存储的范围内就是应该全权自动管理"）：
+// 以前差异盘/母盘类孤儿只报告、其余移入 meta/orphan；现在统一自动删除。前提仍然严格：
+//   - 只处理生效存储根下 disks/ 目录里的文件；
+//   - 删除前重新查库，确认此刻确实没有磁盘记录引用它；
+//   - 刚出现不到 orphanFileGrace 的文件留到下一轮再确认；
+//   - 被进程占用而删不掉的文件只告警，下一轮继续重试。
+//
+// 历史遗留的 meta/orphan/ 目录也一并清空：既然不再把文件移进去，那里只会是无主数据。
 func (a *App) reconcileOrphanFiles(ctx context.Context, rep *ReconcileReport,
 	report func(kind, ref, detail string, fixed bool), log *slog.Logger, dbPaths map[string]bool) {
 	// 本扫描的前提是"磁盘 = storages.path 目录下的 .vhdx 文件"，只对 Windows 成立；
@@ -419,48 +535,151 @@ func (a *App) reconcileOrphanFiles(ctx context.Context, rep *ReconcileReport,
 	rep.Checked += checked
 	rep.NotChecked = append(rep.NotChecked, skipped...)
 
-	raw := a.raw()
-	counts := map[string]int{}
+	if len(files) == 0 {
+		a.cleanupOrphanStagingDirs(ctx, guards, report, log)
+		return
+	}
+
+	// 用删除前的最新数据库快照再确认一次：扫描期间文件可能已经被建库/迁移重新登记。
+	freshPaths, err := a.registeredDiskPaths(ctx)
+	if err != nil {
+		log.Error("删除孤儿文件前刷新磁盘登记失败，跳过本轮", "error", err)
+		return
+	}
+	dbPaths = freshPaths
+
+	deleted, failed, pending := 0, 0, 0
 	for _, f := range files {
 		if ctx.Err() != nil {
 			break
 		}
-		counts[f.Kind]++
-		detail := "根 " + f.Root
-		log.Debug("发现未登记的磁盘文件", "path", f.Path, "kind", f.Kind, "size_bytes", f.SizeBytes)
+		if dbPaths[pathKeyLocal(f.Path)] {
+			continue
+		}
+		fi, statErr := os.Stat(f.Path)
+		if statErr != nil {
+			if os.IsNotExist(statErr) {
+				continue
+			}
+			failed++
+			report("orphan_vhdx.delete_failed", f.Path,
+				"自动删除未登记 VHDX 失败（无法读取文件）: "+f.Path, false)
+			log.Warn("读取待删除的孤儿文件失败", "path", f.Path, "error", statErr)
+			continue
+		}
+		if fi.IsDir() {
+			continue
+		}
+		if time.Since(fi.ModTime()) < orphanFileGrace {
+			pending++
+			continue
+		}
+		// sidecar 与文件同生命周期；先删它，避免文件删除后留下无主元数据。
+		removeDiskMetaFile(log, f.Path)
+		if err := os.Remove(f.Path); err != nil {
+			failed++
+			report("orphan_vhdx.delete_failed", f.Path,
+				"自动删除未登记 VHDX 失败（可能被占用），下轮重试: "+f.Path, false)
+			log.Warn("自动删除孤儿磁盘文件失败，下轮重试",
+				"path", f.Path, "kind", f.Kind, "size_bytes", f.SizeBytes, "error", err)
+			continue
+		}
+		deleted++
+		report("orphan_vhdx", f.Path,
+			"已自动删除未登记的"+orphanKindLabel(f.Kind)+"文件（根 "+f.Root+"）", true)
+		a.audit(ctx, "system", "reconcile.orphan_vhdx.delete", "file:"+f.Path,
+			"kind="+f.Kind+" size_bytes="+strconv.FormatInt(f.SizeBytes, 10), domain.AuditResultOK)
+		a.pruneEmptyDiskDirs(f.Path, f.Root, log)
+	}
+	a.cleanupOrphanStagingDirs(ctx, guards, report, log)
 
-		switch f.Kind {
-		case OrphanKindDiff, OrphanKindParent:
-			// 可能承载用户数据：只报告，由管理员在「孤儿磁盘」页面确认后手动删除。
-			kind := "orphan_diff_disk"
-			if f.Kind == OrphanKindParent {
-				kind = "orphan_parent_disk"
-			}
-			report(kind, f.Path, "存在未被登记的"+orphanKindLabel(f.Kind)+
-				"文件（可能承载用户数据，仅报告，可在"+orphanAdminPageHint+"删除；"+detail+"）", false)
-		default:
-			orphanRoot := ""
-			if g, ok := guards.GuardForPath(f.Path); ok {
-				orphanRoot, _ = g.Resolve(raw.Storage.OrphanDir)
-			}
-			if orphanRoot == "" {
-				report("orphan_vhdx", f.Path,
-					"存在未被登记的 VHDX 文件（未配置孤儿目录，仅报告，可在"+orphanAdminPageHint+"删除；"+detail+"）", false)
-				continue
-			}
-			if err := moveToOrphan(f.Path, orphanRoot); err != nil {
-				log.Warn("移动孤儿 VHDX 失败", "path", f.Path, "root", f.Root, "error", err)
-				report("orphan_vhdx", f.Path, "存在未被登记的 VHDX 文件（移动失败；"+detail+"）", false)
-				continue
-			}
-			report("orphan_vhdx", f.Path, "未被登记的 VHDX 文件已移入同根孤儿目录（"+detail+"）", true)
-			a.audit(ctx, "system", "reconcile.orphan_vhdx", "file:"+f.Path, "moved", domain.AuditResultOK)
+	if deleted > 0 || failed > 0 {
+		if failed > 0 {
+			log.Warn("自动清理孤儿磁盘文件完成（部分失败，下轮重试）",
+				"deleted", deleted, "failed", failed, "pending", pending)
+		} else {
+			log.Info("已自动清理孤儿磁盘文件", "deleted", deleted, "pending", pending)
 		}
 	}
+}
 
-	if len(files) > 0 {
-		log.Warn("发现未登记的磁盘文件（仅报告，可在"+orphanAdminPageHint+"逐个删除）",
-			"diff", counts[OrphanKindDiff], "parent", counts[OrphanKindParent], "other", counts[OrphanKindOther])
+// cleanupOrphanStagingDirs 清空历史遗留的 meta/orphan/ 目录。
+//
+// 新逻辑不再把未登记文件移进去，这个目录只剩升级前搬进去的旧数据；既然存储范围由
+// 系统全权管理，就一并回收（同样保留一分钟观察窗口，避免误删刚落进去的文件）。
+func (a *App) cleanupOrphanStagingDirs(ctx context.Context, guards domain.PathGuardSet,
+	report func(kind, ref, detail string, fixed bool), log *slog.Logger) {
+	raw := a.raw()
+	scanned := make([]string, 0, guards.Len())
+	for _, guard := range guards.Guards() {
+		if ctx.Err() != nil {
+			return
+		}
+		if isUnderAny(guard.Root, scanned) {
+			continue
+		}
+		scanned = append(scanned, guard.Root)
+		dir, err := guard.Resolve(raw.Storage.OrphanDir)
+		if err != nil || strings.TrimSpace(raw.Storage.OrphanDir) == "" {
+			continue
+		}
+		if _, statErr := os.Stat(dir); statErr != nil {
+			continue
+		}
+		_ = filepath.Walk(dir, func(p string, fi os.FileInfo, walkErr error) error {
+			if walkErr != nil || fi == nil || fi.IsDir() {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return fs.SkipAll
+			}
+			if time.Since(fi.ModTime()) < orphanFileGrace {
+				return nil
+			}
+			if err := os.Remove(p); err != nil {
+				report("orphan_vhdx.delete_failed", p,
+					"清理历史孤儿目录失败（可能被占用）: "+p, false)
+				log.Warn("清理历史孤儿目录文件失败", "path", p, "error", err)
+				return nil
+			}
+			report("orphan_vhdx", p, "已清理历史孤儿目录中的文件", true)
+			a.audit(ctx, "system", "reconcile.orphan_dir.delete", "file:"+p, "", domain.AuditResultOK)
+			return nil
+		})
+	}
+}
+
+// pruneEmptyDiskDirs 删除孤儿文件后回收空目录（只向上清到所在存储的 disks/，不删 disks 本身）。
+func (a *App) pruneEmptyDiskDirs(filePath, root string, log *slog.Logger) {
+	guard := domain.NewPathGuard(root)
+	disksRoot, ok := a.disksDirOf(guard)
+	if !ok {
+		return
+	}
+	a.pruneEmptyDirsBelow(filepath.Dir(filePath), disksRoot, log)
+}
+
+// pruneEmptyDirsBelow 从 start 开始向上删除空目录，直到 stop（不含）。
+func (a *App) pruneEmptyDirsBelow(start, stop string, log *slog.Logger) {
+	cur := filepath.Clean(start)
+	stop = filepath.Clean(stop)
+	for {
+		if cur == stop || !domain.UnderRoot(stop, cur) {
+			return
+		}
+		entries, err := os.ReadDir(cur)
+		if err != nil || len(entries) > 0 {
+			return
+		}
+		if err := os.Remove(cur); err != nil {
+			return
+		}
+		log.Debug("已删除空目录", "path", cur)
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return
+		}
+		cur = parent
 	}
 }
 
@@ -492,44 +711,6 @@ func (a *App) reconcileAllocations(ctx context.Context, rep *ReconcileReport,
 			report("allocation.dangling", al.ID, "分配指向的磁盘不存在: "+al.DiskID, false)
 		}
 	}
-}
-
-// moveToOrphan 把孤儿文件移入孤儿目录（同卷 rename；跨卷时回退复制）。
-func moveToOrphan(src, orphanRoot string) error {
-	if err := os.MkdirAll(orphanRoot, 0o755); err != nil {
-		return err
-	}
-	dst := filepath.Join(orphanRoot, filepath.Base(src))
-	if _, err := os.Stat(dst); err == nil {
-		dst = filepath.Join(orphanRoot, filepath.Base(src)+"."+strconv.FormatInt(time.Now().UnixMilli(), 10))
-	}
-	if err := os.Rename(src, dst); err == nil {
-		return nil
-	}
-	// 跨卷：复制后删除（保持幂等）。
-	if err := copyFile(src, dst); err != nil {
-		return err
-	}
-	return os.Remove(src)
-}
-
-// copyFile 复制常规文件。
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close() //nolint:errcheck
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		_ = os.Remove(dst)
-		return err
-	}
-	return out.Close()
 }
 
 // pathKeyLocal 生成大小写不敏感的路径键，用于与数据库路径比对。

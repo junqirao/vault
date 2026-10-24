@@ -20,6 +20,8 @@ export function useLayoutMode(): LayoutMode {
 
 export interface PageShellProps {
   title: ReactNode
+  /** 标题右侧的附加元素（如刷新图标），与标题同一行、紧跟标题之后。 */
+  titleAfter?: ReactNode
   subtitle?: ReactNode
   /** 标题左侧的入口（如「返回上一级」），与标题同一行、位于标题之前。 */
   leading?: ReactNode
@@ -28,7 +30,7 @@ export interface PageShellProps {
 }
 
 /** 页面外壳：统一标题/副标题/操作区与留白。应用端居中且限宽，管理端铺满宽度并带标题栏分隔。 */
-export function PageShell({ title, subtitle, leading, extra, children }: PageShellProps): JSX.Element {
+export function PageShell({ title, titleAfter, subtitle, leading, extra, children }: PageShellProps): JSX.Element {
   const admin = useLayoutMode() === 'admin'
   return (
     <div
@@ -51,9 +53,12 @@ export function PageShell({ title, subtitle, leading, extra, children }: PageShe
         <div style={{ minWidth: 0, display: 'flex', alignItems: 'center', gap: spacing.sm }}>
           {leading ? <div style={{ flexShrink: 0 }}>{leading}</div> : null}
           <div style={{ minWidth: 0 }}>
-            <Typography.Title level={4} style={{ margin: 0 }}>
-              {title}
-            </Typography.Title>
+            <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, minWidth: 0 }}>
+              <Typography.Title level={4} style={{ margin: 0 }}>
+                {title}
+              </Typography.Title>
+              {titleAfter ? <div style={{ flexShrink: 0 }}>{titleAfter}</div> : null}
+            </div>
             {subtitle ? (
               <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
                 {subtitle}

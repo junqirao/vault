@@ -5,9 +5,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"testing"
 
 	"vault/internal/apperr"
+	"vault/internal/domain"
 	"vault/internal/platform"
 )
 
@@ -115,5 +117,70 @@ func TestCreateStoragePropagatesPoolMissing(t *testing.T) {
 	}
 	if len(vols) != 0 {
 		t.Fatalf("失败后不应残留卷登记，实际 %d 条", len(vols))
+	}
+}
+
+// fakeVolumeSpaceBackend 只回答 SpaceUsageOf；其余能力由嵌入接口兜底。
+type fakeVolumeSpaceBackend struct {
+	platform.VolumeBackend
+	calls int32
+	space domain.VolumeSpace
+}
+
+func (f *fakeVolumeSpaceBackend) SpaceUsageOf(context.Context, string) (*domain.VolumeSpace, error) {
+	atomic.AddInt32(&f.calls, 1)
+	space := f.space
+	return &space, nil
+}
+
+// TestStorageListUsesCachedVolumeInfo 钉住存储列表的数据来源：
+//
+//   - RefreshVolumeCache 负责把卷信息（含 HDD/SSD）写进缓存；
+//   - List 只读缓存，不再向平台层查卷 —— Windows 上那是一次 PowerShell 启动，
+//     放在首页/存储页的请求路径里会非常慢。
+func TestStorageListUsesCachedVolumeInfo(t *testing.T) {
+	ctx := context.Background()
+	st := openAppTestStore(t)
+	space := &fakeVolumeSpaceBackend{space: domain.VolumeSpace{
+		Name:       "d:",
+		FileSystem: "NTFS",
+		FreeBytes:  30,
+		TotalBytes: 100,
+		MediaType:  domain.MediaTypeSSD,
+	}}
+	svc := &StorageService{Deps: Deps{
+		Store: st,
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Vol:   space,
+	}}
+	if err := st.CreateStorage(ctx, &domain.Storage{
+		Name: "cache-test", Path: t.TempDir(), Enabled: true,
+	}); err != nil {
+		t.Fatalf("建存储失败：%v", err)
+	}
+
+	if err := svc.RefreshVolumeCache(ctx); err != nil {
+		t.Fatalf("刷新缓存失败：%v", err)
+	}
+	before := atomic.LoadInt32(&space.calls)
+	if before == 0 {
+		t.Fatal("刷新缓存应查询一次卷信息")
+	}
+
+	views, err := svc.List(ctx)
+	if err != nil {
+		t.Fatalf("列存储失败：%v", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("应有 1 条存储，实际 %d 条", len(views))
+	}
+	if views[0].MediaType != domain.MediaTypeSSD {
+		t.Fatalf("介质类型应来自缓存 = ssd，实际 %q", views[0].MediaType)
+	}
+	if views[0].TotalBytes != 100 || views[0].FreeBytes != 30 {
+		t.Fatalf("容量应来自缓存，实际 total=%d free=%d", views[0].TotalBytes, views[0].FreeBytes)
+	}
+	if got := atomic.LoadInt32(&space.calls); got != before {
+		t.Fatalf("List 不应再查询平台层：刷新后调用 %d 次，List 后变成 %d 次", before, got)
 	}
 }

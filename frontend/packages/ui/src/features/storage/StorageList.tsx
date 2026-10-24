@@ -218,6 +218,19 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
       width: 110,
       render: (value: string) => value || '-'
     },
+    {
+      title: t('storage.media'),
+      key: 'media_type',
+      width: 90,
+      render: (_value, storage) =>
+        storage.media_type && storage.media_type !== 'unknown' ? (
+          <Tag color={storage.media_type === 'ssd' ? 'green' : 'orange'}>
+            {t(`storage.media.${storage.media_type}`)}
+          </Tag>
+        ) : (
+          '-'
+        )
+    },
     { title: t('storage.diskCount'), dataIndex: 'disk_count', key: 'disk_count', width: 90 },
     {
       title: t('common.status'),

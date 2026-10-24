@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Select, Skeleton, Space, Tabs, Typography, message } from 'antd'
-import { ArrowLeftOutlined } from '@ant-design/icons'
+import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Select, Skeleton, Space, Tabs, Tooltip, Typography, message } from 'antd'
+import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ConfirmDialog } from '../../components/ConfirmDialog'
@@ -258,6 +258,20 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
 
   // 迁移进度：进入详情时如果已经在迁移，靠 meta.move.job_id 接着跟；本次发起的任务用返回的 JobDTO。
   const moveProgress = useJobProgress(repoQuery.data?.move?.job_id ?? moveJob?.id, moveJob)
+  // 存储库状态/迁移进度走本地 SSE（event: repo），不再定时 refetch 详情。
+  const liveRepoEvent = agent.repoEvents[repoId]
+  const liveMove =
+    liveRepoEvent?.action === 'move_started' || liveRepoEvent?.action === 'move_progress'
+      ? liveRepoEvent.move
+      : undefined
+  const repoEventAction = liveRepoEvent?.action
+  useEffect(() => {
+    if (repoEventAction === 'moved' || repoEventAction === 'move_canceled' || repoEventAction === 'state_changed') {
+      refresh()
+    }
+    // refresh 只读 queryClient，不需要进依赖。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoEventAction])
   useEffect(() => {
     if (!moveJob || !isJobTerminal(moveProgress?.state)) return
     if (moveProgress?.state === 'succeeded') message.success(t('repo.move.done'))
@@ -268,16 +282,6 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     // refresh 只读 queryClient，不需要进依赖。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [moveJob, moveProgress?.state, t])
-
-  // 迁移期间 meta.move 的字节进度由任务持续写库：这里按固定节拍重取详情，
-  // 让进度条和阶段文案不需要等任务终态才更新。离开页面即停。
-  const repoMoving = repoQuery.data?.state === 'moving'
-  const refetchRepo = repoQuery.refetch
-  useEffect(() => {
-    if (!repoMoving) return
-    const timer = window.setInterval(() => void refetchRepo(), 3000)
-    return () => window.clearInterval(timer)
-  }, [repoMoving, refetchRepo])
 
   if (repoQuery.isLoading) return <LoadingState text={t('common.loading')} />
 
@@ -330,14 +334,20 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     0
   )
   const storageUsageLoading = storagesQuery.isLoading || disksQuery.isLoading
+  // 迁移进度以 SSE 最新事件优先（repo 事件里带完整 move 快照）。
+  const move = liveMove ?? repo?.move
+  const liveProgressState =
+    liveRepoEvent?.action === 'move_started' || liveRepoEvent?.action === 'move_progress'
+      ? liveRepoEvent.state
+      : undefined
+  const repoState = liveProgressState ?? repo?.state
   // 刚发起的那一瞬间 repo 快照可能还是 active：以手头的任务状态补上，界面不要有一帧"看起来没反应"。
-  const isMoving =
-    repo?.state === 'moving' || (moveJob !== null && !isJobTerminal(moveProgress?.state))
+  const isMoving = repoState === 'moving' || (moveJob !== null && !isJobTerminal(moveProgress?.state))
   const movePercent =
-    repo?.move && repo.move.total_bytes > 0
-      ? Math.min(100, Math.round((repo.move.bytes / repo.move.total_bytes) * 100))
-      : repo?.move && repo.move.files_total > 0
-        ? Math.min(100, Math.round((repo.move.files_done / repo.move.files_total) * 100))
+    move && move.total_bytes > 0
+      ? Math.min(100, Math.round((move.bytes / move.total_bytes) * 100))
+      : move && move.files_total > 0
+        ? Math.min(100, Math.round((move.files_done / move.files_total) * 100))
         : (moveProgress?.progress ?? 0)
   const targetStorages = (storagesQuery.data?.items ?? []).filter(
     (storage) => storage.enabled && storage.mounted && storage.id !== repo?.storage_id
@@ -353,6 +363,18 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     <PageShell
       title={repo?.name ?? t('repo.detail.title')}
       leading={<Button icon={<ArrowLeftOutlined />} onClick={goBack}>{t('repo.detail.back')}</Button>}
+      titleAfter={
+        <Tooltip title={t('common.refresh')}>
+          <Button
+            type="text"
+            size="small"
+            icon={<ReloadOutlined />}
+            aria-label={t('common.refresh')}
+            loading={repoQuery.isFetching}
+            onClick={refresh}
+          />
+        </Tooltip>
+      }
       extra={
         <>
           {/* 与列表卡片同一套"挂载/卸载"联动按钮：进了详情也不必退回列表才能挂载。
@@ -449,29 +471,29 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
             <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
               <span>
                 {t('repo.move.bannerHint', {
-                  from: repo?.move?.from_storage_name || '-',
-                  to: repo?.move?.to_storage_name || '-'
+                  from: move?.from_storage_name || '-',
+                  to: move?.to_storage_name || '-'
                 })}
               </span>
               <Progress percent={movePercent} size="small" status="active" />
               <Space wrap size={spacing.md}>
                 <span>
                   {t('repo.move.bytes', {
-                    done: formatBytes(repo?.move?.bytes ?? 0),
-                    total: formatBytes(repo?.move?.total_bytes ?? 0)
+                    done: formatBytes(move?.bytes ?? 0),
+                    total: formatBytes(move?.total_bytes ?? 0)
                   })}
                 </span>
                 <span>
                   {t('repo.move.files', {
-                    done: String(repo?.move?.files_done ?? 0),
-                    total: String(repo?.move?.files_total ?? 0)
+                    done: String(move?.files_done ?? 0),
+                    total: String(move?.files_total ?? 0)
                   })}
                 </span>
                 {canManage ? (
                   <Button
                     size="small"
                     danger
-                    disabled={repo?.move?.phase === 'finalizing'}
+                    disabled={move?.phase === 'finalizing'}
                     loading={cancelMoveMutation.isPending}
                     onClick={() => cancelMoveMutation.mutate()}
                   >
@@ -851,8 +873,8 @@ function RepoStorageUsage({
               marginTop: spacing.xs
             }}
           >
-            <div style={{ width: `${repoPercent}%`, background: palette.accent }} />
-            <div style={{ width: `${otherPercent}%`, background: palette.textTertiary }} />
+            <div className="vault-progress-fill" style={{ width: `${repoPercent}%`, background: palette.accent }} />
+            <div className="vault-progress-fill" style={{ width: `${otherPercent}%`, background: palette.textTertiary }} />
           </div>
           <Space size={spacing.md} wrap style={{ marginTop: spacing.xs }}>
             <UsageLegend color={palette.accent} label={t('repo.storageUsage.repo')} value={formatBytes(repoBytes)} />

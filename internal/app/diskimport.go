@@ -19,15 +19,14 @@ import (
 // 文件原地不动（不复制、不移动）。
 //
 // 场景（用户原话）："母盘万一我想迁移别的系统，我完全不知道里面是什么"。换一台服务端、
-// 把整个 disks/ 目录拷过去之后，那些文件在系统里什么都不是（管理端只在「孤儿磁盘」里
-// 显示"路径 + 大小"），既不敢删也不知道怎么用回来。因此分两步：
+// 把整个 disks/ 目录拷过去之后，那些文件在系统里什么都不是，既不敢删也不知道怎么用回来。
+// 因此分两步：
 //
 //  1. 每个母盘旁边都有一份元数据 sidecar（见 diskmeta.go），说明它是什么；
 //  2. 本文件提供"扫描候选 → 原地接管"，元数据缺失的老盘也能导入（管理员补名称与容量）。
 //
-// 与 orphan.go 的关系：两者扫同一批文件，目的相反 —— 孤儿页面处理"不要的"（删除），
-// 导入页面处理"要的"（接管）。因此判定口径必须一致（同一套根白名单、同一套 .vhdx 判定、
-// 同一份登记集合），差别只在未登记的文件该删还是该用。
+// 与 orphan.go 的关系：两者扫同一批文件，但目的不同 —— 导入页面把文件接管成存储库；
+// 对账会自动删除超过观察窗口的未登记文件。两者共用同一套根白名单、.vhdx 判定与登记集合。
 //
 // 为什么不自动导入：登记一块盘等于把它变成可分配的存储库（用户能挂载它）。
 // 扫描是"看"、导入是"用"，把"看"直接变成"用"会让一次误扫把测试盘变成生产库，
@@ -197,9 +196,9 @@ type DiskImportResult struct {
 
 // ScanDiskImports 扫描所有生效存储根，列出可导入的磁盘文件（仅超级管理员调用）。
 //
-// 与 ScanOrphanFiles 的唯一区别：它返回**全部** .vhdx（含已登记的）。导入页面的任务不是
-// "找出多余的"，而是"让管理员决定哪些文件该用起来"——已登记的必须出现并被标成
-// "已存在（跳过）"，否则管理员无法确认"我那 8 块盘是不是都搬过来了"。
+// 它返回**全部** .vhdx（含已登记的）。导入页面的任务不是"找出多余的"，而是"让管理员
+// 决定哪些文件该用起来"——已登记的必须出现并被标成"已存在（跳过）"，否则管理员无法
+// 确认"我那 8 块盘是不是都搬过来了"。
 func (a *App) ScanDiskImports(ctx context.Context) (*DiskImportScan, error) {
 	guards, err := a.storageGuards(ctx)
 	if err != nil {
@@ -500,8 +499,8 @@ func (a *App) importOneDisk(ctx context.Context, guards domain.PathGuardSet, dbP
 	if abs == "." || !filepath.IsAbs(abs) || !strings.EqualFold(filepath.Ext(abs), ".vhdx") {
 		return nil, nil, &DiskImportFailure{Path: raw, Code: DiskImportFailInvalid}
 	}
-	// 白名单校验与删除孤儿同一套（见 DeleteOrphanFile）：即使请求被手工构造，
-	// 也不可能把根外的文件登记进来 —— 否则后续挂载/删除/对账都会在路径解析上失败。
+	// 白名单校验与对账/自动清理同一套：即使请求被手工构造，也不可能把根外的文件登记进来
+	// —— 否则后续挂载/删除/对账都会在路径解析上失败。
 	guard, ok := guards.GuardForPath(abs)
 	if !ok {
 		return nil, nil, &DiskImportFailure{Path: abs, Code: DiskImportFailInvalid}

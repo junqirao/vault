@@ -4,7 +4,7 @@ import "sync"
 
 // Event 是本地 SSE 事件（见 docs/agent-api.md「事件流」）。
 //
-// 事件类型：mount / unmount / revoked / server / session / update / web_update / heartbeat / download / upload。
+// 事件类型：mount / unmount / revoked / server / session / update / web_update / heartbeat / download / upload / job / manifest / verifydiff / repo。
 type Event struct {
 	// Type SSE 事件名。
 	Type string

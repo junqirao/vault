@@ -21,13 +21,16 @@ import type {
   AgentIdentityLoginResponse,
   AgentHostState,
   AgentLog,
+  AgentMediaType,
   AgentMountMode,
   AgentMountState,
   AgentMountVolumeUsage,
+  AgentRepoEvent,
   AgentRepoMountPref,
   AgentServerState,
   AgentSessionState,
   AgentState,
+  AgentVerifyDiffProgress,
   DownloadState,
   LocalManifestResult,
   LocalManifestStartResult,
@@ -660,7 +663,12 @@ export const agentApi = {
     })
   },
 
-  /** 查询清单任务进度（扫描阶段含"当前正在看哪个文件"）。 */
+  /**
+   * 查询清单任务进度（扫描阶段含"当前正在看哪个文件"）。
+   *
+   * ⚠️ **不要轮询它**：实时进度走本地事件流 `event: manifest`（见 useAgent 的 manifests）。
+   * 本接口只用于启动失败/事件通道不可用时的兜底查询。
+   */
   manifestStatus(id: string): Promise<LocalManifestStatus> {
     return request<LocalManifestStatus>({
       method: 'GET',
@@ -758,6 +766,18 @@ export const agentApi = {
    */
   getCache(): Promise<AgentCacheStatus> {
     return request<AgentCacheStatus>({ method: 'GET', path: '/agent/cache' })
+  },
+
+  /**
+   * 查询某个目录所在**物理磁盘**的介质类型（hdd / ssd / unknown）。
+   *
+   * 设置页在用户编辑 L2 缓存目录时直接调用：尚未保存也要能看到类型并提示机械盘。
+   */
+  getMediaType(path: string): Promise<AgentMediaType> {
+    return request<AgentMediaType>({
+      method: 'GET',
+      path: `/agent/media-type?path=${encodeURIComponent(path)}`
+    })
   },
 
   /**
@@ -1006,7 +1026,8 @@ export function parseAgentEvent(type: string, data: string): AgentEvent | null {
           ref_id: typeof value.ref_id === 'string' ? value.ref_id : undefined,
           // 认不出的状态一律当 running：宁可继续等，也不能靠一条脏数据把等待判成终态。
           state: isJobState(value.state) ? value.state : 'running',
-          progress: typeof value.progress === 'number' ? value.progress : 0
+          progress: typeof value.progress === 'number' ? value.progress : 0,
+          last_error: typeof value.last_error === 'string' ? value.last_error : undefined
         }
       }
     }
@@ -1017,6 +1038,22 @@ export function parseAgentEvent(type: string, data: string): AgentEvent | null {
         allocation_id: typeof value.allocation_id === 'string' ? value.allocation_id : undefined,
         server_key: typeof value.server_key === 'string' ? value.server_key : undefined
       }
+    case 'manifest': {
+      const manifestId = typeof value.manifest_id === 'string' ? value.manifest_id : ''
+      if (manifestId === '') return null
+      return { type: 'manifest', manifest: raw as LocalManifestStatus }
+    }
+    case 'verifydiff': {
+      const jobId = typeof value.job_id === 'string' ? value.job_id : ''
+      if (jobId === '') return null
+      return { type: 'verifydiff', verifydiff: raw as AgentVerifyDiffProgress }
+    }
+    case 'repo': {
+      const repoId = typeof value.repo_id === 'string' ? value.repo_id : ''
+      const action = typeof value.action === 'string' ? value.action : ''
+      if (repoId === '' || action === '') return null
+      return { type: 'repo', repo: raw as AgentRepoEvent }
+    }
     default:
       return null
   }

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"vault/internal/apperr"
@@ -40,7 +41,33 @@ const defaultStorageMountRoot = "/var/lib/vault/storages"
 //
 // 数据来源：数据库是唯一真源；config.yaml 的 storage.whitelist_roots 仅作为
 // 首次启动的一次性种子（见 EnsureSeededFromConfig）。放置磁盘时只在"启用"存储中进行。
-type StorageService struct{ Deps }
+//
+// 卷信息（可用/总空间、文件系统、介质类型）由**服务端缓存**：Windows 上 Get-Volume
+// 要走 PowerShell，单次几十到几百毫秒，而 GET /v1/storages 是首页/存储页的高频请求。
+// 列表/详情只读缓存；缓存由后台 ticker 周期刷新（见 RefreshVolumeCache），请求内绝不
+// 同步查卷，避免把 Windows 的慢查询放大到每个客户端。
+type StorageService struct {
+	Deps
+
+	// volumeMu / volumeCache / volumeRefreshing 是卷信息缓存（按存储 ID）。
+	volumeMu         sync.RWMutex
+	volumeCache      map[string]cachedStorageVolume
+	volumeRefreshing bool
+}
+
+// cachedStorageVolume 是一份存储所在卷的只读快照。
+type cachedStorageVolume struct {
+	// Path 生成快照时的存储路径：路径被改过就视为失效，不能拿旧卷的数据充数。
+	Path       string
+	FileSystem string
+	FreeBytes  int64
+	TotalBytes int64
+	VolumeName string
+	MediaType  string
+}
+
+// storageVolumeCacheTimeout 限制一次后台刷新最长占用时间（Windows 慢查询不应无限堆积）。
+const storageVolumeCacheTimeout = 2 * time.Minute
 
 // MountedStorages 是"存储底层卷是否已就绪挂载"的进程内快照。
 //
@@ -111,6 +138,10 @@ type StorageView struct {
 	TotalBytes int64
 	// VolumeName 所在卷标识（规范化、小写，如 "d:"）。
 	VolumeName string
+	// MediaType 承载该卷的物理磁盘介质类型（hdd / ssd / unknown）。
+	//
+	// 来自服务端缓存（见 StorageService 的说明）；读不到时为空串。
+	MediaType string
 	// DiskCount / UsedBytes 该存储下的磁盘数量与占用。
 	DiskCount int
 	UsedBytes int64
@@ -171,7 +202,7 @@ func (s *StorageService) Get(ctx context.Context, id string) (*StorageView, erro
 	return &views[0], nil
 }
 
-// viewsFor 为给定存储批量补充统计（磁盘统计一次查询、卷空间逐个查询）。
+// viewsFor 为给定存储批量补充统计（磁盘统计一次查询；卷信息读服务端缓存）。
 func (s *StorageService) viewsFor(ctx context.Context, storages []domain.Storage) ([]StorageView, error) {
 	paths := make([]string, 0, len(storages))
 	for i := range storages {
@@ -191,6 +222,7 @@ func (s *StorageService) viewsFor(ctx context.Context, storages []domain.Storage
 	}
 
 	provider := s.volumeProvider()
+	needsRefresh := false
 	out := make([]StorageView, 0, len(storages))
 	for i := range storages {
 		st := storages[i]
@@ -201,17 +233,169 @@ func (s *StorageService) viewsFor(ctx context.Context, storages []domain.Storage
 		if stat, ok := stats[storagePathKey(st.Path)]; ok {
 			v.DiskCount, v.UsedBytes = stat.DiskCount, stat.UsedBytes
 		}
-		if provider != nil {
-			if space, sErr := provider.SpaceUsageOf(ctx, st.Path); sErr == nil && space != nil {
-				v.FileSystem = space.FileSystem
-				v.FreeBytes = space.FreeBytes
-				v.TotalBytes = space.TotalBytes
-				v.VolumeName = space.Name
-			}
+		if cached, ok := s.cachedVolume(st.ID, st.Path); ok {
+			v.FileSystem = cached.FileSystem
+			v.FreeBytes = cached.FreeBytes
+			v.TotalBytes = cached.TotalBytes
+			v.VolumeName = cached.VolumeName
+			v.MediaType = cached.MediaType
+		} else if provider != nil {
+			// 缓存里没有（新建/刚改路径）：先按"未知"返回，后台补一次，绝不在请求里查卷。
+			needsRefresh = true
 		}
 		out = append(out, v)
 	}
+	if needsRefresh {
+		s.refreshVolumeCacheAsync()
+	}
 	return out, nil
+}
+
+// cachedVolume 读取某个存储的卷信息快照；路径变过视为失效。
+func (s *StorageService) cachedVolume(id, path string) (cachedStorageVolume, bool) {
+	s.volumeMu.RLock()
+	defer s.volumeMu.RUnlock()
+	v, ok := s.volumeCache[id]
+	if !ok || !strings.EqualFold(filepath.Clean(v.Path), filepath.Clean(path)) {
+		return cachedStorageVolume{}, false
+	}
+	return v, true
+}
+
+// RefreshVolumeCache 立即刷新全部存储的卷信息缓存（后台 ticker 与启动预热调用）。
+//
+// 并发调用合并为一次：上一次还没跑完时直接返回，避免慢查询叠罗汉。
+func (s *StorageService) RefreshVolumeCache(ctx context.Context) error {
+	if !s.beginVolumeCacheRefresh() {
+		return nil
+	}
+	defer s.endVolumeCacheRefresh()
+	return s.refreshVolumeCache(ctx)
+}
+
+// refreshVolumeCacheAsync 在后台补一次缓存（不阻塞请求）。
+func (s *StorageService) refreshVolumeCacheAsync() {
+	if !s.beginVolumeCacheRefresh() {
+		return
+	}
+	go func() {
+		defer s.endVolumeCacheRefresh()
+		ctx, cancel := context.WithTimeout(context.Background(), storageVolumeCacheTimeout)
+		defer cancel()
+		if err := s.refreshVolumeCache(ctx); err != nil && s.Log != nil {
+			s.Log.Warn("刷新存储卷信息缓存失败", "error", err)
+		}
+	}()
+}
+
+func (s *StorageService) beginVolumeCacheRefresh() bool {
+	s.volumeMu.Lock()
+	defer s.volumeMu.Unlock()
+	if s.volumeRefreshing {
+		return false
+	}
+	s.volumeRefreshing = true
+	return true
+}
+
+func (s *StorageService) endVolumeCacheRefresh() {
+	s.volumeMu.Lock()
+	s.volumeRefreshing = false
+	s.volumeMu.Unlock()
+}
+
+// refreshVolumeCache 是全量刷新：成功项覆盖旧值；失败项保留旧快照（避免瞬时故障把
+// 界面打成 0）；已经删除的存储随之从缓存中剔除。
+func (s *StorageService) refreshVolumeCache(ctx context.Context) error {
+	storages, err := s.Store.ListStorages(ctx)
+	if err != nil {
+		return err
+	}
+	provider := s.volumeProvider()
+
+	s.volumeMu.RLock()
+	prev := make(map[string]cachedStorageVolume, len(s.volumeCache))
+	for id, v := range s.volumeCache {
+		prev[id] = v
+	}
+	s.volumeMu.RUnlock()
+
+	next := make(map[string]cachedStorageVolume, len(storages))
+	if provider != nil {
+		for i := range storages {
+			st := storages[i]
+			space, sErr := provider.SpaceUsageOf(ctx, st.Path)
+			if sErr != nil || space == nil {
+				if old, ok := prev[st.ID]; ok && strings.EqualFold(filepath.Clean(old.Path), filepath.Clean(st.Path)) {
+					next[st.ID] = old
+				}
+				if sErr != nil && s.Log != nil {
+					s.Log.Debug("查询存储卷信息失败，保留上次快照",
+						"storage_id", st.ID, "path", st.Path, "error", sErr)
+				}
+				continue
+			}
+			mediaType := space.MediaType
+			if mediaType == "" {
+				mediaType = domain.MediaTypeUnknown
+			}
+			next[st.ID] = cachedStorageVolume{
+				Path:       st.Path,
+				FileSystem: space.FileSystem,
+				FreeBytes:  space.FreeBytes,
+				TotalBytes: space.TotalBytes,
+				VolumeName: space.Name,
+				MediaType:  mediaType,
+			}
+		}
+	}
+
+	s.volumeMu.Lock()
+	s.volumeCache = next
+	s.volumeMu.Unlock()
+	return nil
+}
+
+// refreshVolumeCacheOf 立即刷新指定存储的卷信息（CRUD 后调用）。
+//
+// 写操作本来就要等平台层落完（建卷/挂载/扩容），这里顺带把这一条的缓存补上，
+// 避免管理端刚操作完却看到 0 容量等下一轮定时刷新。查询失败保持旧值。
+func (s *StorageService) refreshVolumeCacheOf(ctx context.Context, storages ...domain.Storage) {
+	provider := s.volumeProvider()
+	if provider == nil {
+		return
+	}
+	for i := range storages {
+		st := storages[i]
+		space, err := provider.SpaceUsageOf(ctx, st.Path)
+		if err != nil || space == nil {
+			continue
+		}
+		mediaType := space.MediaType
+		if mediaType == "" {
+			mediaType = domain.MediaTypeUnknown
+		}
+		s.volumeMu.Lock()
+		if s.volumeCache == nil {
+			s.volumeCache = make(map[string]cachedStorageVolume)
+		}
+		s.volumeCache[st.ID] = cachedStorageVolume{
+			Path:       st.Path,
+			FileSystem: space.FileSystem,
+			FreeBytes:  space.FreeBytes,
+			TotalBytes: space.TotalBytes,
+			VolumeName: space.Name,
+			MediaType:  mediaType,
+		}
+		s.volumeMu.Unlock()
+	}
+}
+
+// forgetCachedVolume 删除某条存储的卷信息缓存。
+func (s *StorageService) forgetCachedVolume(id string) {
+	s.volumeMu.Lock()
+	delete(s.volumeCache, id)
+	s.volumeMu.Unlock()
 }
 
 // Create 创建存储。
@@ -251,6 +435,7 @@ func (s *StorageService) Create(ctx context.Context, in CreateStorageInput) (*St
 		s.rollbackCreate(ctx, st, mode)
 		return nil, err
 	}
+	s.refreshVolumeCacheOf(ctx, *st)
 	s.audit(ctx, "", "storage.create", "storage:"+st.ID,
 		fmt.Sprintf("name=%s path=%s enabled=%t mode=%s size_bytes=%d pool_ref=%s",
 			st.Name, st.Path, st.Enabled, mode, in.SizeBytes, strings.TrimSpace(in.PoolRef)), domain.AuditResultOK)
@@ -529,6 +714,7 @@ func (s *StorageService) Update(ctx context.Context, id string, in UpdateStorage
 	if err := s.Store.UpdateStorage(ctx, st); err != nil {
 		return nil, err
 	}
+	s.refreshVolumeCacheOf(ctx, *st)
 	s.audit(ctx, "", "storage.update", "storage:"+id,
 		fmt.Sprintf("name=%s path=%s enabled=%t", st.Name, st.Path, st.Enabled), domain.AuditResultOK)
 	return s.Get(ctx, id)
@@ -577,6 +763,7 @@ func (s *StorageService) Delete(ctx context.Context, id string) error {
 	if err := s.Store.DeleteStorage(ctx, id); err != nil {
 		return err
 	}
+	s.forgetCachedVolume(id)
 	s.audit(ctx, "", "storage.delete", "storage:"+id,
 		fmt.Sprintf("name=%s kind=%s", st.Name, volumeKind(vol)), domain.AuditResultOK)
 	return nil
@@ -599,6 +786,7 @@ func (s *StorageService) Mount(ctx context.Context, id string) (*StorageView, er
 		return nil, apperr.StorageNotMounted()
 	}
 	s.setStorageMounted(id, true)
+	s.refreshVolumeCacheOf(ctx, *st)
 	s.audit(ctx, "", "storage.mount", "storage:"+id, "ref="+vol.Ref, domain.AuditResultOK)
 	return s.Get(ctx, id)
 }
@@ -616,13 +804,14 @@ func (s *StorageService) Unmount(ctx context.Context, id string) (*StorageView, 
 		return nil, err
 	}
 	s.setStorageMounted(id, false)
+	s.refreshVolumeCacheOf(ctx, *st)
 	s.audit(ctx, "", "storage.unmount", "storage:"+id, "ref="+vol.Ref, domain.AuditResultOK)
 	return s.Get(ctx, id)
 }
 
 // Resize 扩容存储底层卷（**只扩不缩**）；仅系统创建的 thin 卷支持。
 func (s *StorageService) Resize(ctx context.Context, id string, sizeBytes int64) (*StorageView, error) {
-	_, vol, err := s.requireStorageVolume(ctx, id)
+	st, vol, err := s.requireStorageVolume(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -641,6 +830,7 @@ func (s *StorageService) Resize(ctx context.Context, id string, sizeBytes int64)
 	if err := s.Store.UpdateStorageVolume(ctx, vol); err != nil {
 		return nil, err
 	}
+	s.refreshVolumeCacheOf(ctx, *st)
 	s.audit(ctx, "", "storage.resize", "storage:"+id,
 		fmt.Sprintf("ref=%s size_bytes=%d", vol.Ref, sizeBytes), domain.AuditResultOK)
 	return s.Get(ctx, id)

@@ -220,6 +220,15 @@ func (s *RepoService) Move(ctx context.Context, repoID, toStorageID, operatorID 
 		_ = s.Jobs.Cancel(ctx, j.ID)
 		return nil, err
 	}
+	s.emit("repo", map[string]any{
+		"action":       "move_started",
+		"repo_id":      repo.ID,
+		"state":        string(domain.RepoStateMoving),
+		"job_id":       j.ID,
+		"storage_id":   target.ID,
+		"storage_name": target.Name,
+		"move":         move,
+	})
 
 	s.audit(ctx, operatorID, "repo.move.start", "repo:"+repo.ID,
 		"from="+move.FromStorageName+" to="+target.Name+" job="+j.ID, domain.AuditResultOK)
@@ -393,11 +402,6 @@ func (s *RepoService) runMoveRepo(ctx context.Context, j *domain.Job, rep job.Re
 		"to="+p.ToStorageName+" files="+strconv.Itoa(len(p.Entries)), domain.AuditResultOK)
 	s.Log.Info("存储库迁移完成", "repo_id", p.RepoID,
 		"from", p.FromStorageName, "to", p.ToStorageName, "disks", len(p.Entries))
-	s.emit("repo", map[string]any{
-		"action":     "moved",
-		"repo_id":    p.RepoID,
-		"storage_id": p.ToStorageID,
-	})
 	return nil
 }
 
@@ -605,11 +609,22 @@ func (s *RepoService) finishMove(ctx context.Context, repoID string) {
 		s.Log.Warn("迁移收尾后读取存储库失败", "repo_id", repoID, "error", err)
 		return
 	}
+	var toStorageID string
+	if repo.Meta.Move != nil {
+		toStorageID = repo.Meta.Move.ToStorageID
+	}
 	repo.Meta.Move = nil
 	repo.State = domain.RepoStateActive
 	if err := s.Store.SetRepositoryMetaState(ctx, repoID, repo.Meta, repo.State); err != nil {
 		s.Log.Warn("迁移收尾后恢复存储库状态失败", "repo_id", repoID, "error", err)
+		return
 	}
+	s.emit("repo", map[string]any{
+		"action":     "moved",
+		"repo_id":    repoID,
+		"state":      string(domain.RepoStateActive),
+		"storage_id": toStorageID,
+	})
 }
 
 // afterMove 是迁移成功后的收尾：重建目标、删除源、重写盘上的元数据标签。
@@ -646,6 +661,13 @@ func (s *RepoService) afterMove(ctx context.Context, p moveRepoPayload) {
 			s.Log.Warn("迁移后删除源磁盘失败（可由孤儿磁盘清理）",
 				"ref", p.Entries[i].SourceRef, "error", err)
 		}
+	}
+	// 迁移是"复制 + 换路径"：新文件的 mtime 与源不同，而 Windows 的母盘指纹包含 mtime。
+	// 不重算的话，下一轮对账会把它误判成"母盘被绕过改写"并停用所有子盘目标。
+	// 必须在 iSCSI 目标重新发布**之后**做：目标下发可能再次触碰文件元数据。
+	if err := s.refreshParentFingerprint(ctx, repo); err != nil {
+		s.Log.Warn("迁移后重算母盘指纹失败（下一轮对账可能误报母盘被改写）",
+			"repo_id", repo.ID, "error", err)
 	}
 	// 盘上的 sidecar 跟着路径走：重新写一遍，换机器导入时仍然认得出这个库。
 	s.refreshRepoMeta(ctx, repo)
@@ -694,7 +716,13 @@ func (s *RepoService) restoreRepoAfterMove(ctx context.Context, repoID string) {
 	repo.State = domain.RepoStateActive
 	if err := s.Store.SetRepositoryMetaState(ctx, repoID, repo.Meta, repo.State); err != nil {
 		s.Log.Warn("恢复存储库迁移状态失败", "repo_id", repoID, "error", err)
+		return
 	}
+	s.emit("repo", map[string]any{
+		"action":  "move_canceled",
+		"repo_id": repoID,
+		"state":   string(domain.RepoStateActive),
+	})
 }
 
 // removeMoveDestination 删除目标侧的半成品。
@@ -736,7 +764,15 @@ func (s *RepoService) saveMoveProgress(ctx context.Context, repoID string, move 
 	repo.State = domain.RepoStateMoving
 	if err := s.Store.SetRepositoryMetaState(ctx, repoID, repo.Meta, repo.State); err != nil {
 		s.Log.Warn("写入迁移进度失败", "repo_id", repoID, "error", err)
+		return
 	}
+	// 进度变化推给界面（本地 SSE）：卡片/详情不再定时拉 /v1/repos。
+	s.emit("repo", map[string]any{
+		"action":  "move_progress",
+		"repo_id": repoID,
+		"state":   string(domain.RepoStateMoving),
+		"move":    cp,
+	})
 }
 
 // StorageOf 返回该库磁盘当前所在的存储（供详情页隐藏"当前存储"选项）。

@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Descriptions, Input, InputNumber, Progress, Select, Space, Switch, Typography } from 'antd'
+import { Alert, Button, Descriptions, Input, InputNumber, Progress, Select, Space, Switch, Tag, Typography } from 'antd'
 import { CheckCircleOutlined } from '@ant-design/icons'
 
 import { ConfirmDialog } from '../../components/ConfirmDialog'
@@ -8,7 +8,7 @@ import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
 import { agentApi, identityMatchesServer, relaunchClient, selectDirectory, serverKeyOf, supportsDirectoryPicker } from '../../api/agentClient'
-import type { AgentConfig, AgentIdentity, UpdateInfo } from '../../api/agentTypes'
+import type { AgentConfig, AgentIdentity, AgentMediaType, UpdateInfo } from '../../api/agentTypes'
 import { ApiError } from '../../api/errors'
 import { useAgent } from '../../hooks/useAgent'
 import { useAuth } from '../../hooks/useAuth'
@@ -57,6 +57,8 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   const [removeOpen, setRemoveOpen] = useState(false)
   // 待撤销的"其他服务端"证书；null 表示没有待确认的撤销。
   const [removeOther, setRemoveOther] = useState<AgentIdentity | null>(null)
+  // L2 缓存目录所在物理磁盘的介质类型；null = 未探测/探测失败（不提示）。
+  const [l2MediaType, setL2MediaType] = useState<AgentMediaType['media_type'] | null>(null)
 
   const disabled = !agent.available
   // 系统目录选择器（Electron）不可用时，L2 目录只能手填（按钮隐藏）。
@@ -117,6 +119,32 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
       cancelled = true
     }
   }, [agent.available, agent.refreshCache])
+
+  // L2 缓存目录所在磁盘类型：用户每敲一次路径都探测会把 PowerShell 打爆，做 400ms 防抖。
+  // 目录留空表示默认位置（程序数据目录），同样要探测并提示。探测失败静默忽略。
+  const l2Dir = (config?.cache_l2_dir ?? '').trim()
+  const hasConfig = config !== null
+  useEffect(() => {
+    if (!agent.available || !hasConfig) {
+      setL2MediaType(null)
+      return
+    }
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      agentApi
+        .getMediaType(l2Dir)
+        .then((value) => {
+          if (!cancelled) setL2MediaType(value.media_type)
+        })
+        .catch(() => {
+          if (!cancelled) setL2MediaType(null)
+        })
+    }, 400)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [agent.available, hasConfig, l2Dir])
 
   // 一次性取回"当前服务端那份证书"与"本机全部证书"：
   // 前者决定本页显示"已装/未装/属于其他服务端"，后者用于列出其他服务端的证书并单独撤销。
@@ -514,6 +542,24 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
             <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
               {t('settings.cache.l2DirHint')}
             </Typography.Text>
+            {l2MediaType && l2MediaType !== 'unknown' ? (
+              <Space size={spacing.xs} style={{ marginTop: spacing.xxs }}>
+                <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+                  {t('settings.cache.l2DirMedia')}
+                </Typography.Text>
+                <Tag color={l2MediaType === 'ssd' ? 'green' : 'orange'}>
+                  {l2MediaType === 'ssd' ? t('storage.media.ssd') : t('storage.media.hdd')}
+                </Tag>
+              </Space>
+            ) : null}
+            {l2MediaType === 'hdd' ? (
+              <Alert
+                type="warning"
+                showIcon
+                message={t('settings.cache.l2DirHddWarning')}
+                style={{ marginTop: spacing.xs }}
+              />
+            ) : null}
           </div>
         </Space>
       </SectionCard>

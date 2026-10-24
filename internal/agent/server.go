@@ -427,6 +427,8 @@ type serverJob struct {
 	State    string `json:"state"`
 	Progress int    `json:"progress"`
 	Failed   bool   `json:"failed"`
+	// LastError 是失败/重试原因摘要（服务端 jobDTO.last_error）。
+	LastError string `json:"last_error,omitempty"`
 }
 
 // repoListItem 是 GET /v1/repos 的最小响应形状。

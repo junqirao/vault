@@ -8,6 +8,16 @@ import (
 	"vault/internal/apperr"
 )
 
+// 存储介质类型（VolumeSpace.MediaType / StorageView.MediaType 的取值）。
+const (
+	// MediaTypeHDD 机械硬盘。
+	MediaTypeHDD = "hdd"
+	// MediaTypeSSD 固态硬盘（含 NVMe）。
+	MediaTypeSSD = "ssd"
+	// MediaTypeUnknown 平台无法识别（或路径不在物理盘上，如网络盘/内存盘）。
+	MediaTypeUnknown = "unknown"
+)
+
 // VolumeSpace 描述某个路径所在卷的空间与标识。
 type VolumeSpace struct {
 	// Name 卷标识（规范化、小写，如 "d:"）。挂载点这类非盘符卷可能不精确（见 PathGuardSet 说明）。
@@ -17,6 +27,11 @@ type VolumeSpace struct {
 	// FreeBytes / TotalBytes 卷可用空间 / 总容量。
 	FreeBytes  int64
 	TotalBytes int64
+	// MediaType 承载该卷的物理磁盘介质类型（hdd / ssd / unknown）。
+	//
+	// 卷空间与介质类型来自同一次平台查询：客户端设置 L2 缓存目录、以及存储列表显示
+	// HDD/SSD 都要用，分两次查会在 Windows 上多付一次 PowerShell 启动开销。
+	MediaType string
 }
 
 // VolumeSpaceProvider 提供"路径 → 所在卷空间"的查询能力，由 platform/volume.Manager 实现。

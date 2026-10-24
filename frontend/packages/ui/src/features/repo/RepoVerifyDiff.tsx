@@ -26,6 +26,7 @@ import type {
   VerifyDiffResultDTO
 } from '../../api/types'
 import { ErrorNotice } from '../../components/ErrorNotice'
+import { useAgent } from '../../hooks/useAgent'
 import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
@@ -77,6 +78,7 @@ export function RepoVerifyDiff({
 }): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
+  const agent = useAgent()
   const [directory, setDirectory] = useState('')
   const [mode, setMode] = useState<VerifyMode>('size')
   const [job, setJob] = useState<JobDTO | null>(null)
@@ -84,14 +86,17 @@ export function RepoVerifyDiff({
   const [error, setError] = useState<unknown>(null)
   const [starting, setStarting] = useState(false)
   const [beganAt, setBeganAt] = useState(0)
-  // 本机清单任务的实时状态（扫描/哈希阶段）。
+  // 本机清单任务的初始状态；后续进度由本地事件流 `event: manifest` 推来。
   const [local, setLocal] = useState<{ id: string; dir: string; status: LocalManifestStatus } | null>(null)
-  // 服务端进度（建盘/挂载/读取/对比阶段）。
-  const [serverProgress, setServerProgress] = useState<VerifyDiffProgressDTO | null>(null)
+  // 服务端细粒度进度的**初始快照**（只取一次）；后续进度由 `event: verifydiff` 推来。
+  const [serverProgressFallback, setServerProgressFallback] = useState<VerifyDiffProgressDTO | null>(null)
   const startingJobRef = useRef(false)
   // 已取过结果的任务 ID：防止 effect 因 t 等依赖变化重复拉取结果。
   const resultFetchedFor = useRef('')
 
+  const localStatus = local ? (agent.manifests[local.id] ?? local.status) : undefined
+  const liveServerProgress = job ? agent.verifyDiffs[job.id] : undefined
+  const serverProgress = liveServerProgress ?? serverProgressFallback
   const progress = useJobProgress(job?.id, job)
   const running = job !== null && !isJobTerminal(progress?.state)
   const busy = starting || local !== null || running
@@ -104,30 +109,30 @@ export function RepoVerifyDiff({
     return () => window.clearInterval(timer)
   }, [busy])
 
-  // 本机清单：轮询代理状态 → 完成后取结果并提交服务端任务。
+  // 本机清单：订阅 `manifest` 事件 → 成功后取结果并提交服务端任务。
+  //
+  // **不再轮询 /agent/fs/manifest/status**：代理在扫描/算哈希过程中按 100ms 节流推
+  // 快照，界面只在变化时更新。失败/完成由同一份快照驱动。
   useEffect(() => {
-    if (!local || local.status.state !== 'running') return
+    if (!local || !localStatus || localStatus.state === 'running') return
+    if (localStatus.state === 'failed') {
+      setLocal(null)
+      setError(
+        localStatus.error_code
+          ? new ApiError({
+              kind: 'business',
+              code: localStatus.error_code,
+              message: localStatus.error_message
+            })
+          : new Error(localStatus.error_message || t('repo.verifyDiff.failed'))
+      )
+      return
+    }
+    if (localStatus.state !== 'succeeded' || startingJobRef.current) return
+    startingJobRef.current = true
     let cancelled = false
-    const tick = async (): Promise<void> => {
+    void (async () => {
       try {
-        const status = await agentApi.manifestStatus(local.id)
-        if (cancelled) return
-        setLocal((prev) => (prev && prev.id === local.id ? { ...prev, status } : prev))
-        if (status.state === 'failed') {
-          setLocal(null)
-          setError(
-            status.error_code
-              ? new ApiError({
-                  kind: 'business',
-                  code: status.error_code,
-                  message: status.error_message
-                })
-              : new Error(status.error_message || t('repo.verifyDiff.failed'))
-          )
-          return
-        }
-        if (status.state !== 'succeeded' || startingJobRef.current) return
-        startingJobRef.current = true
         // 先取完整清单，再交给服务端；这两个请求都可能处理几 MB 数据。
         const manifest = await agentApi.manifestResult(local.id)
         if (cancelled) return
@@ -147,37 +152,29 @@ export function RepoVerifyDiff({
       } finally {
         startingJobRef.current = false
       }
-    }
-    void tick()
-    // 0.7s 一档：4MiB 读块下，"当前文件/已读字节"看起来是连续走的。
-    const timer = window.setInterval(() => void tick(), 700)
+    })()
     return () => {
       cancelled = true
-      window.clearInterval(timer)
     }
-    // 只按任务 ID 重建轮询：状态更新（running→succeeded）不能触发 effect 清理，
-    // 否则清理会把 cancelled 置真，正在 await 的"取清单 + 提交服务端"就会被误取消。
-  }, [api, local?.id, mode, repoId, t])
+  }, [api, local?.id, localStatus?.state, mode, repoId, t])
 
-  // 服务端：轮询细粒度进度（阶段 / 当前文件 / 已读字节）。失败不致命，退回任务百分比。
+  // 服务端进度只取一次初始快照；后续阶段/当前文件/字节数全部由 `verifydiff` 事件推送。
+  // 这样既不会在任务开始时缺一帧，也不会每秒往服务端访问日志里写一行。
   useEffect(() => {
-    if (!job || !running) return
+    if (!job) return
     let cancelled = false
-    const tick = async (): Promise<void> => {
-      try {
-        const p = await api.getVerifyDiffProgress(repoId, job.id)
-        if (!cancelled) setServerProgress(p)
-      } catch {
-        // 进度接口是"锦上添花"：拿不到就继续用 useJobProgress 的百分比。
-      }
-    }
-    void tick()
-    const timer = window.setInterval(() => void tick(), 1000)
+    void api
+      .getVerifyDiffProgress(repoId, job.id)
+      .then((p) => {
+        if (!cancelled) setServerProgressFallback(p)
+      })
+      .catch(() => {
+        // 进度接口是"锦上添花"：拿不到就继续用事件流/任务百分比。
+      })
     return () => {
       cancelled = true
-      window.clearInterval(timer)
     }
-  }, [api, job?.id, repoId, running])
+  }, [api, job?.id, repoId])
 
   // 任务终态：成功则取结果，失败/取消则显示原因。
   useEffect(() => {
@@ -219,7 +216,7 @@ export function RepoVerifyDiff({
     setJob(null)
     setResult(null)
     setError(null)
-    setServerProgress(null)
+    setServerProgressFallback(null)
     setLocal(null)
     setBeganAt(0)
     startingJobRef.current = false
@@ -319,7 +316,6 @@ export function RepoVerifyDiff({
   ]
 
   // ---- 进度展示 ----
-  const localStatus = local?.status
   const localPercent =
     localStatus && localStatus.phase === 'hash' && localStatus.total_bytes > 0
       ? Math.min(99, Math.round((localStatus.bytes / localStatus.total_bytes) * 100))

@@ -1033,7 +1033,14 @@ func (s *RepoService) setRepoPrepare(ctx context.Context, repoID string, p *doma
 	}
 	if err := s.Store.UpdateRepository(ctx, repo); err != nil {
 		s.Log.Warn("写入建库进度失败", "repo_id", repoID, "error", err)
+		return
 	}
+	s.emit("repo", map[string]any{
+		"action":  "prepare_progress",
+		"repo_id": repoID,
+		"state":   string(repo.State),
+		"prepare": repo.Meta.Prepare,
+	})
 }
 
 // FinishRepoPrepare 把预创建完成的存储库置为 active，并清掉进度快照。
@@ -1047,7 +1054,15 @@ func (s *RepoService) FinishRepoPrepare(ctx context.Context, repoID string) erro
 	}
 	repo.Meta.Prepare = nil
 	repo.State = domain.RepoStateActive
-	return s.Store.UpdateRepository(ctx, repo)
+	if err := s.Store.UpdateRepository(ctx, repo); err != nil {
+		return err
+	}
+	s.emit("repo", map[string]any{
+		"action":  "state_changed",
+		"repo_id": repoID,
+		"state":   string(domain.RepoStateActive),
+	})
+	return nil
 }
 
 // MarkRepoPrepareFailed 把预创建失败的存储库置为 error，留下可本地化的失败码。
@@ -1070,7 +1085,16 @@ func (s *RepoService) MarkRepoPrepareFailed(ctx context.Context, repoID string, 
 	// 不能进前端；而服务端也不该替用户猜语言（有中英日韩四套文案）。
 	repo.Meta.Prepare.Error = apperr.CodeOf(cause)
 	repo.State = domain.RepoStateError
-	return s.Store.UpdateRepository(ctx, repo)
+	if err := s.Store.UpdateRepository(ctx, repo); err != nil {
+		return err
+	}
+	s.emit("repo", map[string]any{
+		"action":  "state_changed",
+		"repo_id": repoID,
+		"state":   string(domain.RepoStateError),
+		"prepare": repo.Meta.Prepare,
+	})
+	return nil
 }
 
 // ReleaseAllocation 释放分配：校验无活跃租约后异步删除差异盘与分配记录。

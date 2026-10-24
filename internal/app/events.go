@@ -46,6 +46,12 @@ const (
 	MountPhaseConfiguringTarget = "configuring_target"
 )
 
+// VerifyDiffEventTopic 是上传核对细粒度进度的 SSE topic。
+//
+// 与任务进度（job）分开：job 只给百分比，核对要展示阶段/当前文件/已读字节；这些由
+// runVerifyDiff 的进度写入器 200ms 节流推送，界面不再轮询 /diff/progress。
+const VerifyDiffEventTopic = "verifydiff"
+
 // emitMountPhase 尽力而为地发布一条挂载阶段事件（topic=mount，event: mount）。
 //
 // 为什么需要：挂载在服务端是**同步重活** —— 等差异盘就绪（最多 15s）再用 PowerShell

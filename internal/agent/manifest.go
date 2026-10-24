@@ -37,6 +37,10 @@ const (
 	// manifestHashBufferBytes 是算哈希时的读块大小。4MiB 让 1000GB 级大文件也能
 	// 每秒多次上报"已读字节"，进度条不会卡在一个文件上纹丝不动。
 	manifestHashBufferBytes = 4 << 20
+
+	// manifestPublishInterval 是向本地事件流推送进度快照的最小间隔。
+	// 4MiB 一块在高速盘上会到每秒几百次；100ms 已经足够进度条丝滑，又不会淹没事件通道。
+	manifestPublishInterval = 100 * time.Millisecond
 )
 
 // fsManifestRequest 是 POST /agent/fs/manifest/start 的请求体。
@@ -97,11 +101,16 @@ type manifestTask struct {
 	root     string
 	// finishedAt 用于回收内存；零值表示还没结束。
 	finishedAt time.Time
+	// publish 把最新快照推给本地 SSE（可为 nil，测试/未装配事件通道时）。
+	publish     func(ManifestStatus)
+	lastPublish time.Time
 }
 
 type manifestManager struct {
 	mu    sync.Mutex
 	tasks map[string]*manifestTask
+	// publish 由 Agent 装配时注入：清单进度只走本地事件流，不再让界面轮询 status。
+	publish func(ManifestStatus)
 }
 
 func newManifestManager() *manifestManager {
@@ -110,7 +119,7 @@ func newManifestManager() *manifestManager {
 
 // create 登记一个新任务，并顺手回收过期的已完成任务。
 func (m *manifestManager) create(ctx context.Context, raw string, hash bool) *manifestTask {
-	t := &manifestTask{id: uuid.NewString(), raw: raw, hash: hash, ctx: ctx}
+	t := &manifestTask{id: uuid.NewString(), raw: raw, hash: hash, ctx: ctx, publish: m.publish}
 	t.snap = ManifestStatus{ManifestID: t.id, State: manifestStateRunning, Phase: manifestPhaseScan}
 	m.mu.Lock()
 	m.gcLocked()
@@ -140,9 +149,23 @@ func (m *manifestManager) gcLocked() {
 	}
 }
 
+// emitLocked 决定这次进度是否推给事件流；返回快照与是否应发布（调用方在解锁后发布）。
+func (t *manifestTask) emitLocked(force bool) (ManifestStatus, bool) {
+	if t.publish == nil {
+		return ManifestStatus{}, false
+	}
+	now := time.Now()
+	if !force && now.Sub(t.lastPublish) < manifestPublishInterval {
+		return ManifestStatus{}, false
+	}
+	t.lastPublish = now
+	return t.snap, true
+}
+
 // update 更新进度快照。
 func (t *manifestTask) update(phase string, done, total int, bytes, totalBytes int64, current string) {
 	t.mu.Lock()
+	phaseChanged := t.snap.Phase != phase
 	t.snap.Phase = phase
 	t.snap.Done = done
 	t.snap.Total = total
@@ -151,14 +174,22 @@ func (t *manifestTask) update(phase string, done, total int, bytes, totalBytes i
 		t.snap.TotalBytes = totalBytes
 	}
 	t.snap.Current = current
+	snap, ok := t.emitLocked(phaseChanged)
 	t.mu.Unlock()
+	if ok {
+		t.publish(snap)
+	}
 }
 
 func (t *manifestTask) setTotals(total int, totalBytes int64) {
 	t.mu.Lock()
 	t.snap.Total = total
 	t.snap.TotalBytes = totalBytes
+	snap, ok := t.emitLocked(true)
 	t.mu.Unlock()
+	if ok {
+		t.publish(snap)
+	}
 }
 
 func (t *manifestTask) succeed(res *scanResult, entries []fsManifestEntry) {
@@ -173,7 +204,11 @@ func (t *manifestTask) succeed(res *scanResult, entries []fsManifestEntry) {
 	t.warnings = res.Warnings
 	t.root = res.Root
 	t.finishedAt = time.Now()
+	snap, ok := t.emitLocked(true)
 	t.mu.Unlock()
+	if ok {
+		t.publish(snap)
+	}
 }
 
 func (t *manifestTask) fail(err error) {
@@ -189,7 +224,11 @@ func (t *manifestTask) fail(err error) {
 	t.snap.ErrorCode = code
 	t.snap.ErrorMessage = msg
 	t.finishedAt = time.Now()
+	snap, ok := t.emitLocked(true)
 	t.mu.Unlock()
+	if ok {
+		t.publish(snap)
+	}
 }
 
 // status 返回快照。
@@ -242,11 +281,15 @@ func (a *Agent) manifestMgr() *manifestManager {
 	defer a.mu.Unlock()
 	if a.manifests == nil {
 		a.manifests = newManifestManager()
+		// 与 newAgent 的装配保持一致：清单进度只走本地 SSE，界面不再轮询 status。
+		a.manifests.publish = func(st ManifestStatus) {
+			a.hub.Publish(Event{Type: localManifestEventType, Data: st})
+		}
 	}
 	return a.manifests
 }
 
-// handleManifestStatus 返回进度快照（界面按 0.5~1s 轮询）。
+// handleManifestStatus 返回进度快照（仅供兜底/排障；实时进度走本地事件流）。
 func (a *Agent) handleManifestStatus(w http.ResponseWriter, r *http.Request) {
 	t := a.manifestMgr().get(strings.TrimSpace(r.URL.Query().Get("id")))
 	if t == nil {

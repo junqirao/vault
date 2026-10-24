@@ -433,8 +433,10 @@ type storageDTO struct {
 	FreeBytes  int64  `json:"free_bytes"`
 	TotalBytes int64  `json:"total_bytes"`
 	VolumeName string `json:"volume_name"`
-	DiskCount  int    `json:"disk_count"`
-	UsedBytes  int64  `json:"used_bytes"`
+	// MediaType 承载该卷的物理磁盘介质类型：hdd / ssd / unknown（识别不出时）。
+	MediaType string `json:"media_type"`
+	DiskCount int    `json:"disk_count"`
+	UsedBytes int64  `json:"used_bytes"`
 	// Kind 底层卷类型（thin | lv | dir）；空 = 目录模式。
 	Kind string `json:"kind"`
 	// Mounted 底层卷是否已挂载就绪（目录模式恒为 true）。
@@ -452,7 +454,7 @@ func toStorageDTO(v app.StorageView) storageDTO {
 		ID: v.Storage.ID, Name: v.Storage.Name, Path: v.Storage.Path, Enabled: v.Storage.Enabled,
 		CreatedAt: v.Storage.CreatedAt, UpdatedAt: v.Storage.UpdatedAt,
 		FileSystem: v.FileSystem, FreeBytes: v.FreeBytes, TotalBytes: v.TotalBytes,
-		VolumeName: v.VolumeName, DiskCount: v.DiskCount, UsedBytes: v.UsedBytes,
+		VolumeName: v.VolumeName, MediaType: v.MediaType, DiskCount: v.DiskCount, UsedBytes: v.UsedBytes,
 		Mounted: v.Mounted,
 	}
 	if v.Volume != nil {

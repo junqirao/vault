@@ -8,7 +8,6 @@ import {
   DatabaseOutlined,
   DesktopOutlined,
   DownOutlined,
-  FileSearchOutlined,
   FileTextOutlined,
   HddOutlined,
   InfoCircleOutlined,
@@ -19,7 +18,6 @@ import {
 } from '@ant-design/icons'
 import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
-import { useQuery } from '@tanstack/react-query'
 import { useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 
@@ -41,7 +39,6 @@ import {
   useAgent,
   useAgentEventNotifier,
   useAgentVersion,
-  useApi,
   useAuth,
   useI18n,
   useServerConfig,
@@ -87,21 +84,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
   const [serverRetrying, setServerRetrying] = useState(false)
 
-  /**
-   * 平台能力（匿名接口，管理端才查）：目前只用它判断「孤儿磁盘」这项菜单该不该出现。
-   *
-   * 孤儿磁盘 = 存储根 disks/ 下"未登记却真实存在"的 .vhdx，这个布局只对 Windows 成立；
-   * Linux 上磁盘是 LVM thin LV（不在存储根目录里），扫描永远是空的。未取到平台信息时
-   * 按"不支持"处理——宁可在 Windows 上晚一拍出现，也不要在 Linux 上先闪出再消失。
-   */
-  const api = useApi()
-  const infoQuery = useQuery({
-    queryKey: ['system-info'],
-    queryFn: () => api.systemInfo(),
-    enabled: mode === 'admin'
-  })
-  const orphansSupported = infoQuery.data?.capabilities.platform_kind === 'windows'
-
   const appMenuItems: MenuProps['items'] = [
     { key: '/my-repos', icon: <CloudOutlined />, label: t('nav.myRepos') },
     { key: '/logs', icon: <FileTextOutlined />, label: t('nav.logs') },
@@ -111,17 +93,10 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
     { key: '/about', icon: <InfoCircleOutlined />, label: t('nav.about') }
   ]
 
-  // 紧挨「存储」：孤儿磁盘就是存储根里"未登记却真实存在"的 VHDX，属于存储侧清理入口；
-  // 非 Windows 服务端不显示（见 orphansSupported 的说明）。
-  const orphansMenuItem: MenuProps['items'] = orphansSupported
-    ? [{ key: '/admin/orphans', icon: <FileSearchOutlined />, label: t('nav.orphans') }]
-    : []
-
   const adminMenuItems: MenuProps['items'] = [
     { key: '/admin/users', icon: <TeamOutlined />, label: t('nav.users') },
     { key: '/admin/repos', icon: <AppstoreOutlined />, label: t('nav.repos') },
     { key: '/admin/storages', icon: <DatabaseOutlined />, label: t('nav.storages') },
-    ...orphansMenuItem,
     { key: '/admin/leases', icon: <HddOutlined />, label: t('nav.leases') },
     { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
     { key: '/admin/audit', icon: <AuditOutlined />, label: t('nav.audit') },

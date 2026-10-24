@@ -4,7 +4,7 @@
  * 严格对齐 docs/agent-api.md（v1 契约），字段名沿用下划线风格。
  * **绝不包含** lease 的 CHAP 密钥与会话令牌。
  */
-import type { JobState, Role } from './types'
+import type { JobState, RepoMoveDTO, RepoPrepareDTO, Role } from './types'
 
 export type AgentMountMode = 'letter' | 'directory'
 export type AgentMountStatus = 'mounting' | 'mounted' | 'unmounting' | 'error' | 'revoked'
@@ -134,6 +134,11 @@ export interface AgentMountVolumeUsage {
   checked_at?: number
   /** 取数失败的原因（"阶段:稳定错误码"）；非空时 total_bytes 为 0。 */
   error?: string
+}
+
+/** GET /agent/media-type 的响应：路径所在物理磁盘的介质类型。 */
+export interface AgentMediaType {
+  media_type: 'hdd' | 'ssd' | 'unknown'
 }
 
 export type DownloadStatus = 'running' | 'done' | 'failed' | 'canceled'
@@ -894,6 +899,40 @@ export interface AgentJobState {
   state: JobState
   /** 0~100。 */
   progress: number
+  /** 失败/重试原因摘要（终态事件通常带；旧版服务端不带）。 */
+  last_error?: string
+}
+
+/** 上传核对的服务端细粒度进度（本地事件流 `event: verifydiff`）。 */
+export interface AgentVerifyDiffProgress {
+  job_id: string
+  repo_id: string
+  state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled'
+  /** prepare | create | mount | walk | compare | done | queued */
+  phase: string
+  message?: string
+  current?: string
+  done: number
+  total: number
+  bytes: number
+  total_bytes: number
+  error?: string
+}
+
+/**
+ * 存储库状态/进度事件（本地事件流 `event: repo`）。
+ *
+ * action：move_started / move_progress / moved / move_canceled / prepare_progress / state_changed。
+ */
+export interface AgentRepoEvent {
+  action: string
+  repo_id: string
+  state?: string
+  job_id?: string
+  storage_id?: string
+  storage_name?: string
+  move?: RepoMoveDTO
+  prepare?: RepoPrepareDTO
 }
 
 /** 事件流（GET /agent/events）解析结果。 */
@@ -930,4 +969,10 @@ export type AgentEvent =
    * 自己按 job_id 筛选（见 useAgent 的 jobs 快照与 useJobProgress）。
    */
   | { type: 'job'; job: AgentJobState }
+  /** 本地清单进度（scan/hash）；界面不再轮询 /agent/fs/manifest/status。 */
+  | { type: 'manifest'; manifest: LocalManifestStatus }
+  /** 上传核对的服务端进度；界面不再轮询 /v1/repos/{id}/diff/progress。 */
+  | { type: 'verifydiff'; verifydiff: AgentVerifyDiffProgress }
+  /** 存储库状态/迁移进度；列表与详情据此更新，不再定时拉 /v1/repos。 */
+  | { type: 'repo'; repo: AgentRepoEvent }
   | { type: 'heartbeat'; at: number; allocation_id?: string; server_key?: string }

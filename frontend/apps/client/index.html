@@ -83,12 +83,35 @@
       }
 
       /*
+        进度条的例外：上面 `* { transition:none !important }` 会把 antd Progress 的宽度/描边
+        过渡一起关掉，于是上传、任务、迁移、用量等进度条每收到一次新百分比就"跳"一格，看起来
+        像两次不同的状态。进度条表达的是**同一件事在往前走**，所以给填充单独开过渡
+        （只对宽度/描边，不影响其它装饰动效）。
+
+        自定义两段式进度条（存储使用情况、存储下拉里的容量条）用 .vault-progress-* 这套类，
+        走同一条曲线，保证全站进度条节奏一致。
+      */
+      .ant-progress-line .ant-progress-bg,
+      .ant-progress-line .ant-progress-success-bg,
+      .vault-progress-fill {
+        transition: width 450ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+      }
+      .ant-progress-circle .ant-progress-circle-path {
+        transition:
+          stroke-dashoffset 450ms cubic-bezier(0.22, 0.61, 0.36, 1),
+          stroke-dasharray 450ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+      }
+      .vault-progress-clip {
+        transition: clip-path 450ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+      }
+
+      /*
         这里曾有第二处例外：「已挂载」磁盘徽标（features/repo/RepoCards.tsx）的呼吸灯。
         该徽标已按用户反馈撤掉（"图标的呼吸灯效果不要有背景…不要在图标上呼吸了，
         在名称前加个绿点就可以了"），改成库名前的 8px 静态绿点，因此这组
-        @keyframes / .vault-disk-badge--* 规则一并删除 —— 现在全站唯一的动效就是上面那条
-        卡片悬停过渡。若日后再加"承载持续状态"的动效，请连同 tokens/palette.ts
-        的说明一起改，别让注释里的"例外清单"与实现脱节。
+        @keyframes / .vault-disk-badge--* 规则一并删除 —— 现在全站的过渡动效只有
+        卡片悬停与下面「进度条填充」两处。若日后再加"承载持续状态"的动效，请连同
+        tokens/palette.ts 的说明一起改，别让注释里的"例外清单"与实现脱节。
       */
 
       /*

@@ -10,13 +10,13 @@ import {
   LeaseList,
   LogViewer,
   MyRepos,
-  OrphanDisks,
   PageShell,
   RepoCreateForm,
   RepoDetail,
   RepoList,
   StorageCreateForm,
   StorageList,
+  StorageUsagePage,
   SystemSettings,
   UploadTaskPage,
   UserList,
@@ -150,6 +150,7 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
               onOpenUpload={(uploadId) =>
                 navigate(`/uploads/${uploadId}`, { state: { from: '/my-repos' } })
               }
+              onOpenStorages={() => navigate('/storages', { state: { from: '/my-repos' } })}
             />
           }
         />
@@ -167,6 +168,11 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
           }
         />
         <Route path="logs" element={<LogViewer />} />
+        {/* 客户端只读存储页：展示每块存储的用量，没有任何管理动作（管理入口在首页卡片箭头）。 */}
+        <Route
+          path="storages"
+          element={<StorageUsagePage onBack={() => navigate('/my-repos')} onManage={() => navigate('/admin/storages')} />}
+        />
         <Route path="repos/:repoId" element={<RepoDetailRoute />} />
         {/* 上传任务页独立于存储库详情：上传中的库在服务端可能还不存在（压根没有 repoId 可用）。 */}
         <Route path="uploads/:uploadId" element={<UploadTaskRoute />} />
@@ -235,7 +241,6 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
             />
           }
         />
-        <Route path="orphans" element={<OrphanDisks />} />
         <Route path="jobs" element={<JobList />} />
         <Route path="audit" element={<AuditList />} />
         {/* 管理端看的是**服务端**日志（GET /v1/system/logs，仅超管）；

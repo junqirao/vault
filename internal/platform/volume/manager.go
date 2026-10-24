@@ -175,6 +175,7 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 		Total       int64  `json:"total"`
 		FileSystem  string `json:"file_system"`
 		DriveLetter string `json:"drive_letter"`
+		MediaType   string `json:"media_type"`
 	}
 	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeFreeSpace, params, &result); err != nil {
 		return nil, err
@@ -184,7 +185,34 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 		FileSystem: result.FileSystem,
 		FreeBytes:  result.Free,
 		TotalBytes: result.Total,
+		MediaType:  normalizeMediaType(result.MediaType),
 	}, nil
+}
+
+// MediaTypeOf 返回路径所在物理磁盘的介质类型（hdd / ssd / unknown）。
+//
+// 与 SpaceUsageOf 走同一个脚本：卷空间与介质类型本来就是同一次查询的副产品。
+func (m *Manager) MediaTypeOf(ctx context.Context, path string) (string, error) {
+	space, err := m.SpaceUsageOf(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	if space.MediaType == "" {
+		return domain.MediaTypeUnknown, nil
+	}
+	return space.MediaType, nil
+}
+
+// normalizeMediaType 把脚本输出归一为 domain.MediaType* 常量。
+func normalizeMediaType(raw string) string {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "ssd":
+		return domain.MediaTypeSSD
+	case "hdd":
+		return domain.MediaTypeHDD
+	default:
+		return domain.MediaTypeUnknown
+	}
 }
 
 // FreeSpace 返回指定路径所在卷的可用/总空间（字节）。

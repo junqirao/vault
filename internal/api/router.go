@@ -116,9 +116,8 @@ func (r *Router) routes() {
 		// 仅超级管理员——日志含内部实现细节，且只有管理员才需要对服务端排障。
 		g.Get("/v1/system/logs", r.requireSuperAdmin(r.handleSystemLogs))
 		g.With(r.requireSuperAdminMW).Get("/v1/system/reconcile", r.handleGetReconcile)
-		// 孤儿磁盘文件：对账只报告（见 5.11），这里由管理员在「孤儿磁盘」页面上逐个手动删除。
-		g.With(r.requireSuperAdminMW).Get("/v1/system/orphans", r.handleScanOrphans)
-		g.With(r.requireSuperAdminMW).Post("/v1/system/orphans/delete", r.handleDeleteOrphan)
+		// 孤儿磁盘的扫描与删除已由对账自动完成（见 app.reconcileOrphanFiles），
+		// 不再提供「孤儿磁盘」管理页面与手动删除接口。
 		// 导入已有磁盘（管理端「存储库」页的"导入"入口）：把 disks/ 下已存在的 .vhdx
 		// 原地接管成存储库（不复制、不移动），用于换机器迁移母盘。
 		// 与上面的孤儿清理是**同一批文件**的两种处置：一个删除、一个接管。

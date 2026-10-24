@@ -223,6 +223,10 @@ func New(opt Options) (*Agent, error) {
 	}
 	a.web = newWebUpdateManager(a)
 	a.engine = &mountEngine{a: a}
+	// 清单进度走本地 SSE：界面不再轮询 /agent/fs/manifest/status。
+	a.manifests.publish = func(st ManifestStatus) {
+		a.hub.Publish(Event{Type: localManifestEventType, Data: st})
+	}
 	a.cache = newCacheManager(cfg, logger)
 	// 本机挂载卷用量：按挂载点量卷空间（Windows 走 Get-Volume，见 volume.Manager.SpaceUsageOf）。
 	a.usage = newVolumeUsageCache(state.ListMounts, a.vol.SpaceUsageOf)
