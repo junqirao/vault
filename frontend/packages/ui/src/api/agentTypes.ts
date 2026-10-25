@@ -901,6 +901,14 @@ export interface StartUploadInput {
   max_diff_disks?: number
   /** 是否在建库时预创建差异盘与 iSCSI 目标（池位）。 */
   preallocate?: boolean
+  /**
+   * 存储库分组（repo.meta.group）。
+   *
+   * 与 max_diff_disks 同类：这条链路（agent → 服务端上传会话 → 异步建库）每一环都要带上它，
+   * 少一环用户在同一个表单里选的分组就会被静默丢掉（真实反馈："创建存储库时选了分组但是
+   * 没有生效"）。
+   */
+  repo_group?: string
   source_mode: 'copy' | 'move'
   /**
    * 把库建到**哪台**服务端（二选一即可）。

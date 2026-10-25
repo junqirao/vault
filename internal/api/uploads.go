@@ -61,6 +61,12 @@ type createUploadRequest struct {
 	// ClientOS 将使用该库的客户端操作系统（windows | linux，留空按 windows）：
 	// 决定建盘用的文件系统并记在盘上（见 domain.ClientOS），建完之后不能改。
 	ClientOS string `json:"client_os"`
+	// Group 存储库分组标签（repo.meta.group）：建库时写入。
+	//
+	// 与 POST /v1/repos 的 group 同义。这条链路曾整条都没有它 —— 上传建库建出来的库
+	// 分组恒为空，用户在同一个表单里选的分组被静默丢掉（真实反馈："创建存储库时选了
+	// 分组但是没有生效"）。
+	Group string `json:"group"`
 }
 
 // parsePathInt 解析路径中的整型参数。
@@ -115,6 +121,7 @@ func (r *Router) handleCreateUpload(w http.ResponseWriter, req *http.Request) {
 		MaxDiffDisks: in.MaxDiffDisks,
 		Preallocate:  preallocate,
 		ClientOS:     in.ClientOS,
+		Group:        in.Group,
 	})
 	if err != nil {
 		r.writeError(w, req, err)

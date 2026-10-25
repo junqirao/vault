@@ -168,6 +168,12 @@ type uploadStartRequest struct {
 	Preallocate bool `json:"preallocate"`
 	// SourceMode copy | move；留空默认 copy。move 仅在服务端建库成功后删除本地源目录。
 	SourceMode string `json:"source_mode"`
+	// RepoGroup 存储库分组标签（repo.meta.group）：随会话透传给服务端，建库时写入。
+	//
+	// 与 repo_mode / max_diff_disks 一样必须走完整条链路（请求 → 续传记录 → 建库请求），
+	// 少一环就会让用户在表单里选的分组静默失效（真实反馈："创建存储库时选了分组但是没有
+	// 生效"）。
+	RepoGroup string `json:"repo_group"`
 	// ServerKey / ServerURL 指明把库建到**哪台**服务端（多服务端下应带上）。
 	//
 	// 都为空时按主服务端兜底（老客户端不带服务端标识）；给了却匹配不上任何已登记服务端
@@ -517,6 +523,8 @@ type uploadResumeRecord struct {
 	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标；同样要随续传记录保留。
 	Preallocate bool   `json:"preallocate,omitempty"`
 	SourceMode  string `json:"source_mode,omitempty"`
+	// RepoGroup 存储库分组：与其它建库选项一样随续传记录留存，否则一次断线续传就把分组弄丢。
+	RepoGroup string `json:"repo_group,omitempty"`
 	// ---- 进度检查点（见 checkpoint）----
 	//
 	// 关掉应用再打开时，列表里那条"上传中（已暂停）"要能说出"上次传到哪了"：
@@ -696,6 +704,7 @@ func (a *Agent) handleUploadStart(w http.ResponseWriter, r *http.Request) {
 	req.RepoMode = mode
 	req.SourceMode = sourceMode
 	req.StorageID = strings.TrimSpace(req.StorageID)
+	req.RepoGroup = strings.TrimSpace(req.RepoGroup)
 
 	// 目标服务端：请求指定的服务端 > 主服务端（老客户端不带标识）。给了标识却匹配不上必须报错，
 	// 绝不改往别的台建库 —— 存储 ID 只对"它所属的那台服务端"有意义。
@@ -891,6 +900,7 @@ func (a *Agent) resumeRestoredUpload(task *uploadTask) error {
 		Preallocate:  rec.Preallocate,
 		SourceMode:   rec.SourceMode,
 		ServerKey:    rec.ServerKey,
+		RepoGroup:    rec.RepoGroup,
 	}
 	ctx, cancel := context.WithCancel(a.bgContext())
 	task.setCancel(cancel)
@@ -1019,6 +1029,7 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		QuotaBytes:   req.QuotaBytes,
 		MaxDiffDisks: req.MaxDiffDisks,
 		Preallocate:  req.Preallocate,
+		RepoGroup:    req.RepoGroup,
 	})
 	if err != nil {
 		return nil, err
@@ -1042,6 +1053,7 @@ func (a *Agent) ensureUploadSession(ctx context.Context, client *serverClient, t
 		MaxDiffDisks: req.MaxDiffDisks,
 		Preallocate:  req.Preallocate,
 		SourceMode:   req.SourceMode,
+		RepoGroup:    req.RepoGroup,
 	})
 	// 服务端可能并没有新建会话：它会在上传开始时清掉同名残骸，并把与本地内容一致的
 	// 未完成会话直接还给我们（本地没有记录、或记录已失效时走的就是这条路）。

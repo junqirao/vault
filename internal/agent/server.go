@@ -371,6 +371,8 @@ type createUploadRequest struct {
 	MaxDiffDisks int `json:"max_diff_disks,omitempty"`
 	// Preallocate 是否在建库时预创建差异盘与 iSCSI 目标。
 	Preallocate bool `json:"preallocate,omitempty"`
+	// RepoGroup 存储库分组标签（repo.meta.group）：建库时写入。
+	RepoGroup string `json:"group,omitempty"`
 }
 
 // uploadSession 是创建上传会话的响应。

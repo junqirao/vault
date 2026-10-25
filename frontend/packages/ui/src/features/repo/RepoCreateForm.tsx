@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Checkbox, Col, Form, Input, InputNumber, Progress, Row, Select, Space, Typography } from 'antd'
+import { Button, Checkbox, Col, Form, Input, InputNumber, Progress, Row, Segmented, Select, Space, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ErrorNotice } from '../../components/ErrorNotice'
@@ -179,6 +179,9 @@ export function RepoCreateForm({
         // 都是配置默认值 50（真实反馈："设置共享数量大于0时会变成50"）。
         max_diff_disks: preallocateCount(values),
         preallocate: values.mode === 'shared' && values.preallocate !== false,
+        // 分组同样要传：上传建库走的是另一条链路（agent → 上传会话 → 异步建库），
+        // 漏传的话本机目录建出来的库分组恒为空（真实反馈："选了分组但是没有生效"）。
+        repo_group: values.group,
         source_mode: 'copy',
         // 存储 ID 只对**它所属的那台**服务端有意义：多服务端下必须说清建到哪台。
         server_key: active?.key,
@@ -194,9 +197,9 @@ export function RepoCreateForm({
       title={t('repo.create.title')}
       extra={<Button onClick={onCancel}>{t('common.back')}</Button>}
     >
-      <SectionCard>
-        {error ? <ErrorNotice error={error} /> : null}
-        {tracked ? (
+      {error ? <ErrorNotice error={error} /> : null}
+      {tracked ? (
+        <SectionCard>
           <UploadPanel
             upload={tracked}
             canceling={cancelMutation.isPending}
@@ -205,18 +208,24 @@ export function RepoCreateForm({
               onOpenRepo && tracked.repo_id ? () => onOpenRepo(tracked.repo_id as string) : undefined
             }
           />
-        ) : (
-          <Form
-            form={form}
-            layout="vertical"
-            initialValues={{ mode: 'shared', max_diff_disks: 1, preallocate: false }}
-            onValuesChange={(changed, values) => {
-              setExclusive(values.mode === 'exclusive')
-              setPreallocate(values.preallocate !== false)
-              autoFillName(changed)
-            }}
-            style={{ maxWidth: 880 }}
-          >
+        </SectionCard>
+      ) : (
+        <Form
+          form={form}
+          layout="vertical"
+          initialValues={{ mode: 'shared', max_diff_disks: 1, preallocate: false }}
+          onValuesChange={(changed, values) => {
+            setExclusive(values.mode === 'exclusive')
+            setPreallocate(values.preallocate !== false)
+            autoFillName(changed)
+          }}
+          style={{ maxWidth: 880 }}
+        >
+          {/* 分三段，按用户真正的思考顺序排：先想清楚"建个什么库"（名字 / 类型 / 归属），
+              再决定"放在哪、多大"（存储 / 容量 / 预分配），最后才是"要不要导入数据"。
+              平铺成一片两列网格时，这三件事的边界全靠字段名猜 —— 分卡之后一眼能看出
+              "哪些是必须填的、哪些是可选的、哪一块会影响提交路径"。 */}
+          <SectionCard title={t('repo.create.section.basic')}>
             <Row gutter={16}>
               <Col span={12}>
                 <Form.Item name="name" label={t('field.name')} rules={[{ required: true }]}>
@@ -224,13 +233,25 @@ export function RepoCreateForm({
                 </Form.Item>
               </Col>
               <Col span={12}>
-                <Form.Item name="mode" label={t('field.mode')} rules={[{ required: true }]}>
-                  <Select<RepoMode>
+                <Form.Item
+                  name="mode"
+                  label={t('field.mode')}
+                  rules={[{ required: true }]}
+                  // 两种模式的差别不是"一个词"，而是一整句话：写在控件下方，比另加提示框省事。
+                  extra={t(exclusive ? 'repo.create.modeHint.exclusive' : 'repo.create.modeHint.shared')}
+                >
+                  <Segmented<RepoMode>
+                    block
                     options={[
                       { value: 'shared', label: t('repo.mode.shared') },
                       { value: 'exclusive', label: t('repo.mode.exclusive') }
                     ]}
                   />
+                </Form.Item>
+              </Col>
+              <Col span={12}>
+                <Form.Item name="group" label={t('field.group')}>
+                  <RepoGroupSelect />
                 </Form.Item>
               </Col>
               {isSuperAdmin ? (
@@ -247,11 +268,11 @@ export function RepoCreateForm({
                   </Form.Item>
                 </Col>
               ) : null}
-              <Col span={12}>
-                <Form.Item name="group" label={t('field.group')}>
-                  <RepoGroupSelect />
-                </Form.Item>
-              </Col>
+            </Row>
+          </SectionCard>
+
+          <SectionCard title={t('repo.create.section.storage')}>
+            <Row gutter={16}>
               <Col span={12}>
                 <Form.Item
                   name="storage_id"
@@ -287,50 +308,62 @@ export function RepoCreateForm({
                 「预分配」= 服务端的"共享数量 / max_diff_disks > 0"：勾选后建库时同时
                 预创建差异盘与 iSCSI 目标（池位），等待分配；不勾选则分配时才派生差异盘、
                 挂载时现场下发目标。独享库没有差异盘，整块盘直接交给用户，因此不显示。
+                勾选框与它的数量是一条信息：勾上后数量紧跟其下，不再单独占一格。
               */}
               {!exclusive ? (
-                <>
-                  <Col span={12}>
-                    <Form.Item
-                      name="preallocate"
-                      valuePropName="checked"
-                    >
-                      <Checkbox>{t('field.preallocate')}</Checkbox>
-                    </Form.Item>
-                  </Col>
+                <Col span={24}>
+                  <Form.Item
+                    name="preallocate"
+                    valuePropName="checked"
+                    extra={t('repo.create.preallocateHint')}
+                    style={{ marginBottom: preallocate ? spacing.sm : 0 }}
+                  >
+                    <Checkbox>{t('field.preallocate')}</Checkbox>
+                  </Form.Item>
                   {preallocate ? (
-                    <Col span={12}>
-                      <Form.Item
-                        name="max_diff_disks"
-                        label={t('field.preallocateCount')}
-                        rules={[{ required: true }]}
-                      >
-                        <InputNumber min={1} style={{ width: '100%' }} />
-                      </Form.Item>
-                    </Col>
+                    <Row gutter={16}>
+                      <Col span={12}>
+                        <Form.Item
+                          name="max_diff_disks"
+                          label={t('field.preallocateCount')}
+                          rules={[{ required: true }]}
+                          extra={t('repo.create.preallocateCountHint')}
+                          style={{ marginBottom: 0 }}
+                        >
+                          <InputNumber min={1} style={{ width: '100%' }} />
+                        </Form.Item>
+                      </Col>
+                    </Row>
                   ) : null}
-                </>
+                </Col>
               ) : null}
-              <Col span={12}>
-                <Form.Item name="source_dir" label={t('field.sourceDirOptional')}>
-                  <SourceDirPicker onValidityChange={setSourceDirValid} />
-                </Form.Item>
-              </Col>
             </Row>
-            <Space style={{ marginTop: spacing.xs }}>
-              <Button
-                type="primary"
-                loading={mutation.isPending || uploadMutation.isPending}
-                disabled={!sourceDirValid}
-                onClick={() => void submit()}
-              >
-                {t('common.create')}
-              </Button>
-              <Button onClick={onCancel}>{t('common.cancel')}</Button>
-            </Space>
-          </Form>
-        )}
-      </SectionCard>
+          </SectionCard>
+
+          <SectionCard title={t('repo.create.section.source')}>
+            <Form.Item
+              name="source_dir"
+              label={t('field.sourceDirOptional')}
+              extra={t('repo.create.sourceHint')}
+              style={{ marginBottom: 0 }}
+            >
+              <SourceDirPicker onValidityChange={setSourceDirValid} />
+            </Form.Item>
+          </SectionCard>
+
+          <Space style={{ marginTop: spacing.md }}>
+            <Button
+              type="primary"
+              loading={mutation.isPending || uploadMutation.isPending}
+              disabled={!sourceDirValid}
+              onClick={() => void submit()}
+            >
+              {t('common.create')}
+            </Button>
+            <Button onClick={onCancel}>{t('common.cancel')}</Button>
+          </Space>
+        </Form>
+      )}
     </PageShell>
   )
 }

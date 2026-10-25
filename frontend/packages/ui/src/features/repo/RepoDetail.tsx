@@ -18,7 +18,7 @@ import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
 
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { formatBytes, formatTime, repoUsage, userDiffUsage } from '../../utils/format'
+import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
@@ -27,7 +27,7 @@ import { RepoVerifyDiff } from './RepoVerifyDiff'
 import { RepoMountActions, useRepoMount } from './RepoMount'
 import { RepoGroupSelect } from './RepoGroupSelect'
 import { RepoMountSettingsPanel } from './RepoMountSettings'
-import { diffUsageAsVolume, RepoUsageTooltip } from './RepoUsageTip'
+import { diffUsageAsVolume, RepoUsageTooltip, useRepoDiffUsage } from './RepoUsageTip'
 
 export interface RepoDetailProps {
   repoId: string
@@ -107,15 +107,13 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     refetchInterval: repoQuery.data?.mode === 'shared' ? 60_000 : false
   })
 
-  // 共享库的「已用」要落到"**分给我的**那块差异盘"：分配记录给出 user → disk_id 的映射。
-  // 光看 disks 只能看到全库的差异盘（每块各属一个用户），加总会让分母变成 N × 容量
-  // （真实反馈：两块差异盘时显示成了 40 MB / 49.9 GB）。
-  const allocationsQuery = useQuery({
-    queryKey: ['repo-allocations', repoId],
-    queryFn: () => api.listAllocations(repoId),
-    enabled: repoQuery.data?.mode === 'shared',
-    refetchInterval: 60_000
-  })
+  // 共享库的「已用」与列表卡片**共用同一套取数逻辑**（见 RepoUsageTip 的 useRepoDiffUsage）：
+  // 先用分配记录找到"我"这块差异盘的 disk_id，再取它的 physical_bytes。详情页此前另写了一份
+  // queries，与卡片各自演化容易漂移 —— 这两处必须永远显示同一个数。
+  // hook 必须在下面的 early return 之前调用。**不分角色**都要查：详情页与卡片必须显示同一个数，
+  // 超管从客户端进详情时同样要看差异盘（真实反馈：卡片对了、详情里仍不对 —— 详情曾按
+  // isSuperAdmin 走服务端口径）。
+  const diff = useRepoDiffUsage(repoQuery.data, Boolean(repoQuery.data), currentUserId)
 
   // 概览里的「已用」也要是本机实测值（见下面 repoUsage 的说明）：页面在时按 10s 轮询。
   useAgentUsagePolling(true)
@@ -318,13 +316,10 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   // 而差异盘自己其实只吃了几十 MB（真实反馈："差异盘其实只有几十 M 但是硬是展示的母盘的
   // 用量"，截图里磁盘页签：母盘 22.8 GB / 差异盘 36 MB）。所以共享库不看本机实测，
   // 也不在差异盘数据没回来时回退它 —— 那会先闪一个 23 GB 的错误数字。
-  // 独享库与管理端不用它：前者那块盘就是母盘，后者看的是"分配出去多大"的服务端口径。
+  // **不分角色**：共享库一律报差异盘，否则超管身份进详情会看到另一套数（真实反馈："外面
+  // 卡片的 hover 是对的，但是里面这个不对"）。独享库仍用本机实测 / 服务端口径。
   const isShared = repo?.mode === 'shared'
-  const diffUsage =
-    !isSuperAdmin && isShared
-      ? userDiffUsage(disksQuery.data?.items, allocationsQuery.data?.items, currentUserId)
-      : undefined
-  const effectiveUsage = !isSuperAdmin && isShared ? diffUsageAsVolume(diffUsage) : mountUsage
+  const effectiveUsage = isShared ? diffUsageAsVolume(diff.usage) : mountUsage
   const {
     percent: usagePercent,
     usedText: usageUsedText,
@@ -338,9 +333,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   // 刚挂上、实测用量还在取数 / 差异盘用量还在查：把 `-` 与条都换成转圈（见 useAgent 的
   // repoUsageLoading）。只在客户端那条路上成立 —— 管理端显示的是服务端口径，本机实测值
   // 到位后只是换个口径，不该拿转圈盖住一个已经有效的数字。
-  const usageLoading =
-    (!isSuperAdmin && !isShared && repoUsageLoading(agent.usagePending, repo?.id, usageMeasured)) ||
-    (!isSuperAdmin && isShared && (disksQuery.isPending || allocationsQuery.isPending))
+  const usageLoading = isShared
+    ? diff.loading
+    : !isSuperAdmin && repoUsageLoading(agent.usagePending, repo?.id, usageMeasured)
 
   const openEdit = (target: RepoDTO): void => {
     editForm.setFieldsValue({

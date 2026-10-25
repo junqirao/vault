@@ -71,6 +71,12 @@ type CreateUploadInput struct {
 	//
 	// 决定建盘用的文件系统（见 domain.ClientOS），随清单持久化，建盘时生效。
 	ClientOS string
+	// Group 存储库分组标签（repo.meta.group），随清单持久化、建库时写入。
+	//
+	// 与 RepoService.Create 的 Group 同义。这条链路曾经整条都没有它：上传建库建出来的
+	// 库分组恒为空，用户在同一个表单里选的分组被静默丢掉（真实反馈："创建存储库时选了
+	// 分组但是没有生效"）。
+	Group string
 }
 
 // UploadSession 是创建上传会话的响应。
@@ -255,6 +261,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 	if err != nil {
 		return nil, err
 	}
+	group := strings.TrimSpace(in.Group)
 	manifestJSON, err := marshalManifest(uploadManifestRecord{
 		Root:         in.Manifest.Root,
 		Files:        entries,
@@ -264,6 +271,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 		MaxDiffDisks: share,
 		Preallocate:  preallocate,
 		ClientOS:     string(clientOS),
+		Group:        group,
 	})
 	if err != nil {
 		return nil, err
@@ -282,7 +290,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 	size := s.sizing().CalculateVHDXSize(totalBytes, 0)
 	if plan.reusable != nil {
 		return s.resumeUploadSession(ctx, plan, repoMode, storageID, in.QuotaBytes,
-			share, preallocate, clientOS, size)
+			share, preallocate, clientOS, size, group)
 	}
 	guard, err := s.pickUploadGuard(ctx, storageID, size)
 	if err != nil {
@@ -602,7 +610,7 @@ func (s *UploadService) purgeRemnantRepo(ctx context.Context, repo *domain.Repos
 // 已逐文件校验通过的文件数也一并带上，免得界面上的进度从 0 重数。
 func (s *UploadService) resumeUploadSession(ctx context.Context, plan *uploadNamePlan, repoMode, storageID string,
 	quotaBytes int64, maxDiffDisks int, preallocate bool, clientOS domain.ClientOS,
-	size int64) (*UploadSession, error) {
+	size int64, group string) (*UploadSession, error) {
 	u := plan.reusable
 	guard, err := s.guardForUpload(ctx, u)
 	if err != nil {
@@ -617,7 +625,7 @@ func (s *UploadService) resumeUploadSession(ctx context.Context, plan *uploadNam
 		return nil, err
 	}
 	manifestJSON, err := manifestWithOptions(rec, repoMode, storageID, quotaBytes,
-		maxDiffDisks, preallocate, clientOS)
+		maxDiffDisks, preallocate, clientOS, group)
 	if err != nil {
 		return nil, err
 	}
@@ -1472,9 +1480,11 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 			repo = existing
 			// 预分配是本次上传的选项：覆盖重建一个已有库时，池化标记要跟着这次勾选走
 			// （否则"上次没勾、这次勾了"会永远不建池，反过来会继续走回池语义）。
+			// 分组同理：同名库被重新上传重建时，分组应以本次表单选中的为准。
 			wantPool := mode == domain.RepoModeShared && rec.Preallocate
-			if repo.Meta.Pool != wantPool {
+			if repo.Meta.Pool != wantPool || repo.Meta.Group != rec.Group {
 				repo.Meta.Pool = wantPool
+				repo.Meta.Group = rec.Group
 				if err := tx.UpdateRepository(ctx, repo); err != nil {
 					return err
 				}
@@ -1520,7 +1530,10 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 				// 此时挂载只会得到 disk.not_ready。走到这里数据已经收完，长活是写盘
 				// —— 界面不能显示成"上传中"（见 runUploadComplete 的说明）。
 				State: domain.RepoStateImporting,
-				Meta:  domain.RepoMeta{Pool: mode == domain.RepoModeShared && rec.Preallocate},
+				Meta: domain.RepoMeta{
+					Pool:  mode == domain.RepoModeShared && rec.Preallocate,
+					Group: rec.Group,
+				},
 			}
 			if mode == domain.RepoModeShared {
 				cond := domain.ParentIdle
@@ -2160,6 +2173,10 @@ type uploadManifestRecord struct {
 	// ClientOS 将使用该库的客户端操作系统，决定建盘格式（见 domain.ClientOS）。
 	// 留空按默认（windows → NTFS）。
 	ClientOS string `json:"client_os,omitempty"`
+	// Group 存储库分组标签（repo.meta.group）：建库时写入。
+	//
+	// 与其它建库选项一样必须随清单存下来（建库是异步任务，读不到创建时的请求）。
+	Group string `json:"group,omitempty"`
 }
 
 // marshalManifest 把规范化后的清单记录序列化存储。
@@ -2177,7 +2194,8 @@ func marshalManifest(rec uploadManifestRecord) (string, error) {
 // 把已经上传的数据对到别的文件上（第一个块的字节会落进第二个文件）。复用旧会话时
 // 只有选项跟着本次请求走，文件列表一个字都不能动。
 func manifestWithOptions(rec *uploadManifestRecord, repoMode, storageID string,
-	quotaBytes int64, maxDiffDisks int, preallocate bool, clientOS domain.ClientOS) (string, error) {
+	quotaBytes int64, maxDiffDisks int, preallocate bool, clientOS domain.ClientOS,
+	group string) (string, error) {
 	if rec == nil {
 		return "", apperr.InvalidParam("manifest")
 	}
@@ -2188,6 +2206,7 @@ func manifestWithOptions(rec *uploadManifestRecord, repoMode, storageID string,
 	next.MaxDiffDisks = maxDiffDisks
 	next.Preallocate = preallocate
 	next.ClientOS = string(clientOS)
+	next.Group = group
 	return marshalManifest(next)
 }
 
