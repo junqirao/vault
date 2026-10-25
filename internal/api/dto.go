@@ -118,8 +118,13 @@ type repoDTO struct {
 	// 库没有"配额"概念，新建库根本不写这个字段（恒为 0），老前端就是拿它算百分比，
 	// 于是进度条永远是空的 —— 卡片上看不出用了多少。它是读时从母盘派生的
 	// （见 domain.Repository.CapacityBytes），读不到盘记录时为 0，前端回退成不显示分母。
-	CapacityBytes int64          `json:"capacity_bytes"`
-	UsedBytes     int64          `json:"used_bytes"`
+	CapacityBytes int64 `json:"capacity_bytes"`
+	// ParentUsedBytes 母盘（独享库则是自己那块盘）的物理占用：VHDX 文件实际占了多少字节。
+	//
+	// 卡片上默认显示的是**本机实测**用量，这个数只放在悬浮说明里回答"服务端这边占了多大"。
+	// 与 UsedBytes 不同：后者是"已分配出去的差异盘按标称容量计费"，母盘不在其中。
+	ParentUsedBytes int64          `json:"parent_used_bytes"`
+	UsedBytes       int64          `json:"used_bytes"`
 	State         string         `json:"state"`
 	Group         string         `json:"group,omitempty"`
 	ClientConfig  map[string]any `json:"client_config,omitempty"`
@@ -181,7 +186,8 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 		ParentVersion: r.ParentVersion,
 		ShareCount:    r.MaxDiffDisks, MaxDiffDisks: r.MaxDiffDisks,
 		QuotaBytes: r.QuotaBytes, CapacityBytes: r.CapacityBytes,
-		UsedBytes: r.UsedBytes, State: string(r.State),
+		ParentUsedBytes: r.ParentUsedBytes,
+		UsedBytes:       r.UsedBytes, State: string(r.State),
 		Group: r.Meta.Group, ClientConfig: r.Meta.ClientConfig,
 		Note: r.Meta.Note, Pool: r.Meta.Pool,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,

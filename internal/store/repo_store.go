@@ -46,13 +46,25 @@ const repoCapacitySQL = `COALESCE(
 		  WHERE s.repo_id = r.id AND s.kind = '` + string(domain.DiskKindStandalone) + `'),
 		0)`
 
+// repoParentUsedSQL 是"母盘物理占用"的派生表达式（见 domain.Repository.ParentUsedBytes）。
+//
+// 与 repoCapacitySQL 同一套取盘口径：共享库看它当前的母盘（parent_disk_id），
+// 独享库没有母盘，看它自己那块 standalone 盘。取 physical_bytes（VHDX 实际占用）而不是
+// size_bytes（标称容量）：后者已经由 capacity_bytes 表达了，再报一遍等于两条一样的数字。
+const repoParentUsedSQL = `COALESCE(
+		(SELECT p.physical_bytes FROM disks p WHERE p.id = r.parent_disk_id),
+		(SELECT MAX(s.physical_bytes) FROM disks s
+		  WHERE s.repo_id = r.id AND s.kind = '` + string(domain.DiskKindStandalone) + `'),
+		0)`
+
 // repoReadCols 是"读存储库"的列清单：repoCols + 派生的 capacity_bytes。
 //
 // 不能并入 repoCols：那份列表同时用作 INSERT 的列清单（见 CreateRepository）。
 // 引用它的查询必须把 repositories 别名为 r（repoCapacitySQL 依赖这个别名）。
 const repoReadCols = `r.id, r.name, r.mode, r.owner_id, r.parent_disk_id, r.parent_version,
 	r.parent_condition, r.max_diff_disks, r.quota_bytes, r.used_bytes,
-	r.state, r.meta, r.created_at, r.updated_at, ` + repoCapacitySQL + ` AS capacity_bytes`
+	r.state, r.meta, r.created_at, r.updated_at, ` + repoCapacitySQL + ` AS capacity_bytes, ` +
+	repoParentUsedSQL + ` AS parent_used_bytes`
 
 // repoRow 是 repositories 表的扁平映射，用于解决 meta 的 JSON 编解码。
 type repoRow struct {
@@ -67,8 +79,10 @@ type repoRow struct {
 	QuotaBytes      int64   `db:"quota_bytes"`
 	UsedBytes       int64   `db:"used_bytes"`
 	// CapacityBytes 是读时派生的库容量（见 repoCapacitySQL），不是表里的列。
-	CapacityBytes int64  `db:"capacity_bytes"`
-	State         string `db:"state"`
+	CapacityBytes int64 `db:"capacity_bytes"`
+	// ParentUsedBytes 是读时派生的母盘物理占用（见 repoParentUsedSQL），不是表里的列。
+	ParentUsedBytes int64  `db:"parent_used_bytes"`
+	State           string `db:"state"`
 	Meta          string `db:"meta"`
 	CreatedAt     int64  `db:"created_at"`
 	UpdatedAt     int64  `db:"updated_at"`
@@ -84,8 +98,9 @@ func (r repoRow) toDomain() *domain.Repository {
 		ParentVersion: r.ParentVersion,
 		MaxDiffDisks:  r.MaxDiffDisks,
 		QuotaBytes:    r.QuotaBytes,
-		CapacityBytes: r.CapacityBytes,
-		UsedBytes:     r.UsedBytes,
+		CapacityBytes:   r.CapacityBytes,
+		ParentUsedBytes: r.ParentUsedBytes,
+		UsedBytes:       r.UsedBytes,
 		State:         domain.RepoState(r.State),
 		CreatedAt:     r.CreatedAt,
 		UpdatedAt:     r.UpdatedAt,

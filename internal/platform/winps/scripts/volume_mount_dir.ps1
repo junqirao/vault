@@ -274,6 +274,27 @@ try {
         }
     }
 
+    # 目录模式：先摘掉本分区上**遗留的盘符**。
+    # Add-PartitionAccessPath 只是在分区上"再加一个"挂载点：以前按盘符挂过的分区，盘符会
+    # 一直留在"此电脑"里 —— 用户改了配置"挂载到目录"，看到的却还是盘符（真实反馈：
+    # "都配置成了挂载到目录，但是挂载出来的全是盘符"）。
+    # 目标路径若正好落在这个盘符下（父目录在本卷里），摘掉盘符会让路径不可达，跳过：
+    # 那种自指情况由上面的"僵尸挂载点"分支负责。
+    $removedLetters = @()
+    foreach ($ap in @($partition.AccessPaths)) {
+        $letterPath = [string]$ap
+        if ($letterPath -notmatch '^[A-Za-z]:\\?$') { continue }
+        $letterRoot = $letterPath.Substring(0, 2) + '\'
+        if ($full.StartsWith($letterRoot, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        try {
+            Remove-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $partition.PartitionNumber `
+                -AccessPath $letterPath -ErrorAction Stop
+            $removedLetters += $letterRoot.TrimEnd('\')
+        } catch {
+            # 单个盘符摘不掉不该让整个目录挂载失败（可能被占用）：在结果里如实回报。
+        }
+    }
+
     # 幂等复用已在最前面判过（那时 $partition 的 AccessPaths 还是最新的）。
     Add-PartitionAccessPath -DiskNumber $DiskNumber -PartitionNumber $partition.PartitionNumber -AccessPath $full -ErrorAction Stop
 
@@ -297,6 +318,7 @@ try {
         partition_number   = [int]$partition.PartitionNumber
         created            = $created
         cleaned_mount_path = $zombie
+        removed_letters    = @($removedLetters)
     } | ConvertTo-Json -Compress -Depth 5
 } catch {
     [pscustomobject]@{

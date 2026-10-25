@@ -384,8 +384,17 @@ export interface AgentRepoMountPref {
   /**
    * 仅分组配置有意义：为 true 时用这套分组配置覆盖组内每个库自己的挂载配置；
    * 为 false（默认）时组内库各用各的配置，分组配置只作为默认值保留。
+   *
+   * 勾选后，组内库的配置弹窗会置灰并如实显示这套值（生效的就是这里）。
    */
   use_for_repos?: boolean
+  /**
+   * 仅分组配置有意义：这套配置**作用于哪些库**（库 ID 列表）。
+   *
+   * 缺省/空数组 = 组内全部库（界面上默认全选）；非空 = 只有列出的库遵循分组配置，
+   * 其余库仍用各自 repo_mounts 里的配置。
+   */
+  use_repos?: string[]
 }
 
 /** GET /agent/config 与 PATCH /agent/config。 */

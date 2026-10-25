@@ -150,6 +150,9 @@ func (m *Manager) MountToDirectory(ctx context.Context, diskNumber int, dir stri
 	var result struct {
 		Action  string `json:"action"`
 		Created bool   `json:"created"`
+		// 目录模式下脚本会顺手摘掉本分区上遗留的盘符（以前按盘符挂过的库，改配置成目录后
+		// 盘符不该还留在"此电脑"里）。摘不掉的不影响挂载，但要在日志里留下线索。
+		RemovedLetters []string `json:"removed_letters"`
 	}
 	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeMountDir, params, &result); err != nil {
 		if mapped := mappedReasonError(err, map[string]*apperr.Error{
@@ -167,6 +170,11 @@ func (m *Manager) MountToDirectory(ctx context.Context, diskNumber int, dir stri
 		// 修复过就告警一次：这台机器此前残留过卷挂载点，出问题时这是第一线索。
 		m.logger.Warn("挂载点下方是本磁盘残留的挂载点，已清理后重新挂载",
 			"disk_number", diskNumber, "path", dir)
+	}
+	if len(result.RemovedLetters) > 0 {
+		// 盘符摘掉了要留痕：用户可能正疑惑"我原来的 E: 去哪了"，这也是排查线索。
+		m.logger.Info("目录挂载前已摘除本分区遗留的盘符",
+			"disk_number", diskNumber, "path", dir, "letters", result.RemovedLetters)
 	}
 	m.logger.Info("已挂载到目录",
 		"disk_number", diskNumber, "path", dir, "action", result.Action, "created", result.Created)

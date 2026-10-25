@@ -34,8 +34,8 @@ type RepoMountPref struct {
 	// MountMode letter | directory；空串表示跟随 DefaultMountMode。
 	MountMode string `json:"mount_mode,omitempty"`
 	// MountDir 目录模式的**父目录**（绝对路径，或相对 DefaultMountDir 的相对路径，由用户
-	// 在「存储库 → 挂载设置」里填）；实际挂载点是它下面一层 `<服务端名称>_<存储库名称>`
-	// 子目录（见 mountDirLeaf）。空串表示直接用默认挂载根。
+	// 在「存储库 → 挂载设置」里填）；实际挂载点是它下面一层**与存储库同名**的子目录
+	// （见 mountDirLeaf）。空串表示直接用默认挂载根。
 	MountDir string `json:"mount_dir,omitempty"`
 	// AutoMount 是否在该库所在客户端启动（拿到会话）后自动挂载它。
 	//
@@ -69,6 +69,57 @@ type RepoMountPref struct {
 	//
 	// 放在 RepoMountPref 里而不是单独类型，是为了让分组与单库共用同一套字段与归一/校验逻辑。
 	UseForRepos bool `json:"use_for_repos,omitempty"`
+	// UseRepos 只在**分组配置**里有意义：勾了「使用分组配置」后，这套配置**作用于哪些库**。
+	//
+	// 空 = 组内全部库（界面上默认全选）；非空 = 只有列出的库套用分组配置，其余库仍用
+	// 各自的配置。放在这里而不是另开字段，是为了让"分组配置"只有一条来源（ID 是库的稳定标识，
+	// 改库名不会让已勾选的库失效）。
+	UseRepos []string `json:"use_repos,omitempty"`
+}
+
+// AppliesToRepo 判断这份分组配置是否作用于某个库。
+//
+// UseRepos 为空表示"组内全选"（默认，也是老配置的语义）；否则只认列表里的库。
+// 库 ID 拿不到时按"未勾选"处理：宁可退回库自己的配置，也不要把没勾选的库按分组配置挂错。
+func (p RepoMountPref) AppliesToRepo(repoID string) bool {
+	if len(p.UseRepos) == 0 {
+		return true
+	}
+	repoID = strings.TrimSpace(repoID)
+	if repoID == "" {
+		return false
+	}
+	for _, id := range p.UseRepos {
+		if strings.EqualFold(strings.TrimSpace(id), repoID) {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeRepoIDList 清洗勾选的库 ID 列表：去空白、去空项、去重（保持原顺序）。
+func normalizeRepoIDList(ids []string) []string {
+	if len(ids) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(ids))
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		trimmed := strings.TrimSpace(id)
+		if trimmed == "" {
+			continue
+		}
+		key := strings.ToLower(trimmed)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, trimmed)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // UnmarshalJSON 解析单库偏好，并记录 cache_enabled 是否显式出现过。
@@ -332,6 +383,7 @@ func normalizeMountPref(pref RepoMountPref) RepoMountPref {
 		pref.MountMode = ""
 	}
 	pref.MountDir = strings.TrimSpace(pref.MountDir)
+	pref.UseRepos = normalizeRepoIDList(pref.UseRepos)
 	// 缓存默认开启：旧配置缺这个键时补成 true；显式 false 原样保留。
 	if !pref.cacheEnabledSet {
 		pref.CacheEnabled = true
@@ -429,6 +481,9 @@ func (s *ConfigStore) SetRepoMountPref(repoID string, pref RepoMountPref) (Confi
 		pref.MountMode = ""
 	}
 	pref.MountDir = strings.TrimSpace(pref.MountDir)
+	// 分组专属字段在单库配置里没有意义：别把请求里顺手带来的值存进库条目。
+	pref.UseForRepos = false
+	pref.UseRepos = nil
 	// 这是整条偏好的显式写入：即使是 false，也代表用户这次确实选了"关闭"。
 	pref.cacheEnabledSet = true
 
@@ -463,6 +518,7 @@ func (s *ConfigStore) SetGroupMountPref(group string, pref RepoMountPref) (Confi
 		pref.MountMode = ""
 	}
 	pref.MountDir = strings.TrimSpace(pref.MountDir)
+	pref.UseRepos = normalizeRepoIDList(pref.UseRepos)
 	pref.cacheEnabledSet = true
 
 	s.mu.Lock()

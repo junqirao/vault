@@ -92,6 +92,51 @@ export function repoUsage(
   }
 }
 
+/**
+ * 共享库的差异盘用量：把磁盘列表里 `kind=diff` 的盘按**物理占用**聚合。
+ *
+ * 为什么不能拿 `repo.used_bytes` 当"用了多少"：那是配额口径——已分配差异盘按**标称容量**
+ * 计费，一块 1000 MB 的差异盘哪怕只写了 10 MB 也记 1000 MB。进度条用它就会直接顶到 100%，
+ * 用户看到"这块盘快满了"会莫名焦虑（真实反馈），而实际上还空得很。
+ * 差异盘真正吃掉多少空间，只有 `physical_bytes` 知道（thin 差异盘刚派生时接近 0）。
+ *
+ * 没有差异盘（独享库、还没建盘、查询未回）返回 undefined，调用方退回原口径。
+ */
+export function diffDiskUsage(
+  disks?: { kind: string; physical_bytes?: number; size_bytes?: number }[]
+): { used: number; total: number } | undefined {
+  let used = 0
+  let total = 0
+  for (const disk of disks ?? []) {
+    if (disk.kind !== 'diff') continue
+    used += disk.physical_bytes ?? 0
+    total += disk.size_bytes ?? 0
+  }
+  return total > 0 ? { used, total } : undefined
+}
+
+/**
+ * **分给我的那块**差异盘用量：先用分配记录找到 `user_id = 我` 的那条，再按它的 `disk_id`
+ * 定位差异盘。
+ *
+ * 为什么不能把库里的差异盘加总（真实反馈：库里两块差异盘时显示成了 `40 MB / 49.9 GB`）：
+ * 共享库的每块差异盘属于**一个用户**，分母相加会变成"2 份容量"（49.9 GB = 2 × 24.9 GB），
+ * 用户根本对不上自己那块盘（磁盘页签里写的是 36 MB / 24.9 GB）。
+ * 服务端 `physical_bytes` 每 5 分钟采样一次，前端按 60s 轮询即可跟上。
+ */
+export function userDiffUsage(
+  disks?: { id: string; kind: string; physical_bytes?: number; size_bytes?: number }[],
+  allocations?: { disk_id: string; user_id: string; state: string }[],
+  userId?: string
+): { used: number; total: number } | undefined {
+  if (!userId) return undefined
+  const mine = (allocations ?? []).find((alloc) => alloc.user_id === userId && alloc.state !== 'released')
+  if (!mine) return undefined
+  const disk = (disks ?? []).find((item) => item.id === mine.disk_id)
+  if (!disk || disk.kind !== 'diff') return undefined
+  return { used: disk.physical_bytes ?? 0, total: disk.size_bytes ?? 0 }
+}
+
 /** 容量输入框统一使用的单位后缀（存量值仍是字节，只在表单里换算成 M 展示/录入）。 */
 export const CAPACITY_UNIT = 'M'
 

@@ -435,7 +435,7 @@ client_compat:
 
 | 挂载形态 | 规则 |
 | --- | --- |
-| **目录模式** | 用户填的是**父目录**，实际挂载点是 `<父目录>\<server-alias>_<repo-name>`：一层目录名同时带上服务端与库名，多服务端同名库天然分开且自解释（服务端下发的相对 `mount_path` 也归一到同一命名，绝对路径仍原样使用） |
+| **目录模式** | 用户填的是**父目录**，实际挂载点是 `<父目录>\<repo-name>`：目录名就是库名（真实反馈："挂载目录时，目录名应是存储库的名"；早先 `<server-alias>_<repo-name>` 那套已废弃，多服务端时用户找文件要猜前缀）。同名库撞车由 `uniqueMountDir` 加 `-2`/`-3` 后缀避让；服务端下发的相对 `mount_path` 也归一到同一命名，绝对路径仍原样使用。挂到已存在盘符的分区时先摘掉遗留盘符，否则"此电脑"里还留着旧盘符 |
 | **盘符模式** | 客户端统一维护盘符分配表，检测冲突；冲突时按"服务端配置顺序 + 库名"确定性分配，或让用户指定。**盘符本身没法用库名命名**，于是把存储库名称写到**卷标**上（`Set-Volume -NewFileSystemLabel`；超过 NTFS 上限 32 字符截断、非法字符替换为 `-`），资源管理器里该盘就显示库名（真实诉求："盘符或目录名应该等于存储库的名称"） |
 
 **服务端别名（alias）规则**
@@ -1158,8 +1158,9 @@ IQN         = iqn.2026-01.com.vault:{target_name}
       - letter 模式：Add-PartitionAccessPath -AssignDriveLetter（若盘已有盘符则复用）
         → 随后 Set-Volume -NewFileSystemLabel '<repo-name>' 把库名写到卷标（best effort：
           失败/超时只记警告，绝不因此判定挂载失败）
-      - directory 模式：确认为空目录 → Add-PartitionAccessPath -AccessPath 'C:\Vault\<server-alias>_<repo>'
-        - ★ 目录名必须带服务端别名命名空间（`<server-alias>_<repo-name>`），避免多服务端同名库冲突（见 3.4.5）
+      - directory 模式：先摘掉本分区遗留的盘符（`removed_letters`）→ 确认为空目录 →
+        Add-PartitionAccessPath -AccessPath 'C:\Vault\<repo>'
+        - ★ 目录名就是**存储库名称**；同名库由 `uniqueMountDir` 加 `-2`/`-3` 后缀避让（见 3.4.5）
         - 用户配置的目录是**父目录**，代理在它下面自动加这一层；服务端下发的相对 `mount_path`
           也归一到这一层（绝对路径仍原样使用），同一个库不会有两种目录名
         - 父目录末段已经是这一层时不再追加（重挂/恢复传回来的是上次的最终挂载点，

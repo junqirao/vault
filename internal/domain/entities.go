@@ -233,6 +233,14 @@ type Repository struct {
 	// 免得库里再存一份容量、之后随母盘维护/重建漂移。读不到盘记录时为 0，
 	// 调用方（前端卡片）据此回退成"不显示分母"。
 	CapacityBytes int64 `db:"capacity_bytes" json:"capacity_bytes"`
+	// ParentUsedBytes 母盘（独享库则是它自己那块盘）的**物理占用**：VHDX 文件实际吃掉多少字节。
+	//
+	// 与 UsedBytes 是两件事，也是两个口径：UsedBytes 是"已分配出去的盘按标称容量计费"，
+	// 母盘不在其中；这个字段报的是母盘文件本身的大小（由监控任务定期采样，
+	// 见 disk.physical_bytes）。界面把它放在用量悬浮说明里，用来回答"服务端这边到底占了多大"。
+	//
+	// 同样**不落 repositories 表**，读时从 disks 派生；读不到盘记录时为 0。
+	ParentUsedBytes int64 `db:"parent_used_bytes" json:"parent_used_bytes"`
 	// UsedBytes 已用量：本库名下**差异盘**的记账占用之和（见 store.repoUsageSQL）。
 	//
 	// 注意口径：母盘不在其中 —— 它的容量只在建库时作为"容量占用"校验一次，不记账。

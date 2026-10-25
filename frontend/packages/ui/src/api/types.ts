@@ -114,6 +114,13 @@ export interface RepoDTO {
   quota_bytes: number
   /** 库容量：建库时设定的容量（那块盘的 VHDX 标称容量），服务端读时派生。 */
   capacity_bytes: number
+  /**
+   * 母盘（独享库则是自己那块盘）的**物理占用**：VHDX 文件实际占了多少字节，服务端读时派生。
+   *
+   * 与 `used_bytes` 是两个口径：后者是"已分配出去的差异盘按标称容量计费"，母盘不在其中。
+   * 界面只在用量的悬浮说明里报它（见 RepoUsageTip），不上卡片主行。老服务端不带这个字段。
+   */
+  parent_used_bytes?: number
   used_bytes: number
   state: RepoState
   group?: string

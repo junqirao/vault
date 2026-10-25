@@ -789,7 +789,8 @@ GET   /agent/config
      download_connections, language, start_at_login:bool, update_channel, server_alias,
      cache_l1_bytes:int, cache_l2_bytes:int, cache_l2_dir:string,
      repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}},
-     group_mounts:{<group>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool, use_for_repos:bool}}}
+     group_mounts:{<group>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool,
+                            use_for_repos:bool, use_repos:[<repo_id>]}}}
 PATCH /agent/config
   ↓ 上述字段的任意子集（不含 repo_mounts / group_mounts / default_mount_mode / default_mount_dir）
   ↑ {config:{...}}
@@ -797,16 +798,23 @@ POST  /agent/repo-mounts/{repo_id}
   ↓ {mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}
   ↑ {config:{...}}
 POST  /agent/group-mounts
-  ↓ {group, mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool, use_for_repos:bool}
+  ↓ {group, mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool,
+     use_for_repos:bool, use_repos:[<repo_id>]}
   ↑ {config:{...}}
 ```
 
 `group_mounts` 是**按存储库分组名**保存的本地挂载配置（分组名来自服务端
-`repo.meta.group`）。**只有按分组批量挂载**（`POST /agent/mount` 带
-`use_group_config=true`，即卡片上的「挂载分组」）且 `use_for_repos=true` 时，组内库才用
-这套配置**覆盖**各自的 `repo_mounts`；单库挂载（卡片/详情页挂载、自动挂载、启动恢复）
-**一律用该库自己的配置**，即使请求里带着 `repo_group`。`use_for_repos=false` 时组内库
-各用各的配置，分组配置只作为默认值保留。
+`repo.meta.group`）。`use_for_repos=true`（界面上「使用分组配置」）时，`use_repos` 里的库
+用这套配置**覆盖**各自的 `repo_mounts`；`use_repos` 缺省/为空表示**组内全选**（默认，
+以后加入该组的库也跟随）；`use_for_repos=false` 时组内库各用各的配置。
+
+判定**与"从哪儿发起挂载"无关**：单库挂载（卡片/详情页挂载）、按分组批量挂载
+（`POST /agent/mount`）、自动挂载、启动恢复、重新挂载都是同一套口径 —— 否则库的配置
+界面显示"已置灰、遵循分组"，实际单库挂载却走了库自己那份用户看不见的配置。
+请求里的 `use_group_config` 已废弃（仍在协议里兼容老客户端，不再参与判定）。
+
+用户把形态从盘符改成目录后，重新挂载/启动恢复也按**当前配置**执行（记录里的旧形态只在
+配置没表态时兜底）；既有挂载记录的形态/挂载点与当前配置不一致时，会先卸载再按新配置挂载。
 
 `repo_mounts` 是**每个存储库各自独立**的挂载偏好（形态 / 目录 / 启动后自动挂载），
 没有条目的库跟随 `default_mount_mode`、`default_mount_dir` 与 `auto_mount` 的兜底默认值；
@@ -832,13 +840,17 @@ POST  /agent/group-mounts
   `alias` 字段）：全局那一个名字已不足以标识"是哪一台"，继续沿用会让两台服务端的不同库
   挤进同一个命名空间（同名目录）。
 - `mount_dir` 是目录模式下的**父目录**（绝对路径，或相对 `default_mount_dir` 的相对路径）：
-  真正的挂载点是它下面一层 `<服务端别名>_<存储库名称>` 子目录，界面上把算好的最终路径
-  如实显示给用户。`<服务端别名>` 的取用顺序：**该台下发的 `alias`** → 全局 `server_alias`
-  （**仅当本机至多登记了一台服务端时**）→ 服务端名称。服务端下发的 `mount_path`：
-  **绝对路径**（管理员的显式指定）原样使用；**相对路径**（服务端自动拼的
-  `<服务端名称>\<库名>`）也归一到同一命名，同一个库不会因为"从哪挂"得到两种目录名。
-  父目录末段已经就是那一层时不再追加（重挂/恢复会把上次的最终挂载点当请求传回来，
-  否则每重挂一次就多套一层目录）。
+  真正的挂载点是它下面一层**与存储库同名**的子目录（`<存储库名称>`），界面上把算好的
+  最终路径如实显示给用户。服务端名称/别名**不再**进目录名（`<服务端名称>_<库名>` 那套
+  已废弃：多服务端时每个人的目录名都和库名对不上）。同名库（不同服务端/分组）撞车时，
+  后挂的库自动加 `-2`、`-3` 后缀，避免挂到另一个库的数据上；同库重挂/恢复仍复用原目录。
+  服务端下发的 `mount_path`：**绝对路径**（管理员的显式指定）原样使用；**相对路径**
+  （服务端自动拼的 `<服务端名称>\<库名>`）归一到库名这一种命名，同一个库不会因为
+  "从哪挂"得到两种目录名。父目录末段已经就是那一层、或请求里带的是旧盘符（`E:`）时
+  不再追加（重挂/恢复会把上次的最终挂载点当请求传回来，否则每重挂一次就多套一层目录）。
+- 目录模式挂载到已存在盘符的分区时，脚本会先摘掉该分区**遗留的盘符**（老版本按盘符挂过）：
+  `Add-PartitionAccessPath` 只是"再加一个挂载点"，不摘盘符的话用户在"此电脑"里看到的
+  还是盘符。父目录若正好落在该盘符下则跳过，避免把路径弄不可达。
 - 语义与全局 `auto_mount` 的区别：全局开关只管"恢复本机上次留下的挂载记录"；
   某库 `auto_mount=true` 时即使本机没有记录（甚至还没有分配）也会在**该台服务端确认连上**后
   自动挂载（没有可用分配时由代理调用 `POST /v1/repos/{id}/allocations` 建一个），

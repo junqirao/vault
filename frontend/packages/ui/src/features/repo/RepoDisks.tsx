@@ -23,6 +23,9 @@ import { MountActionButtons, MountDialog, mountSessionLive } from '../mount/Moun
 
 export interface RepoDisksProps {
   repoId: string
+  /** 库名与分组：目录模式用它算挂载点预览（目录名就是库名），分组用来自动遵循分组配置。 */
+  repoName?: string
+  repoGroup?: string
   isSuperAdmin: boolean
   /**
    * 调用者能否管理这个库（超管 / 库所有者 / 被授予 manage 的成员）。
@@ -60,14 +63,22 @@ function diskMountState(allocs: AllocationDTO[]): AllocationState | null {
 }
 
 /** 存储库下的磁盘列表：磁盘 + 分配（谁在用/挂载）+ 挂载与卸载 + 回收空间与异步删除。 */
-export function RepoDisks({ repoId, isSuperAdmin, canManage, currentUserId, currentUserName }: RepoDisksProps): JSX.Element {
+export function RepoDisks({
+  repoId,
+  repoName,
+  repoGroup,
+  isSuperAdmin,
+  canManage,
+  currentUserId,
+  currentUserName
+}: RepoDisksProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const queryClient = useQueryClient()
   const [error, setError] = useState<unknown>(null)
   const [pendingDelete, setPendingDelete] = useState<DiskDTO | null>(null)
   const agent = useAgent()
-  const { servers, active } = useServerConfig()
+  const { active } = useServerConfig()
   const [copyDisk, setCopyDisk] = useState<DiskDTO | null>(null)
   const [copyForm] = Form.useForm<{ target_dir: string; file_name: string }>()
   const { config: agentConfig, downloads, refreshDownloads } = agent
@@ -201,17 +212,19 @@ export function RepoDisks({ repoId, isSuperAdmin, canManage, currentUserId, curr
     }
   }
 
-  // 目录名里的服务端名称，与代理侧同一口径：本地别名优先，其次服务端名称，最后 vault。
-  // 全局 server_alias 只在**本机只有一台**服务端时才作数 —— 多台共用同一个别名，两台下的
-  // `别名_库名` 会撞成同一个目录（代理侧同样是这个规则，见 docs/agent-api.md）。
-  const mountServerAlias =
-    (servers.length <= 1 ? agentConfig?.server_alias : '')?.trim() || (active?.serverName ?? '').trim() || 'vault'
-
   const openMountDialog = (allocation: AllocationDTO): void => {
-    // 先预填**这个库自己的**挂载设置（存储库 → 挂载设置），没配过才落回代理的兜底默认值。
+    // 先预填**本库生效的**挂载设置（存储库 → 挂载设置），没配过才落回代理的兜底默认值。
     // 挂载形态与目录已经只在库那边配置，从卡片点"挂载"时必须按它来 —— 否则用户刚在某库
     // 配好 D:\vault，点挂载却被这里的默认值顶成 C:\Vault（请求里的 mount_path 优先级更高）。
-    const pref = agentConfig?.repo_mounts?.[repoId]
+    //
+    // 分组勾了「使用分组配置」且勾选了本库时用的是分组那份：代理侧同样分组优先
+    // （见 mount.go 的 groupOverride），这里预填库配置会让对话框显示一份并不生效的值。
+    const group = (repoGroup ?? '').trim()
+    const groupPref = group !== '' ? agentConfig?.group_mounts?.[group] : undefined
+    const groupGoverns =
+      Boolean(groupPref?.use_for_repos) &&
+      ((groupPref?.use_repos?.length ?? 0) === 0 || (groupPref?.use_repos ?? []).includes(repoId))
+    const pref = groupGoverns ? groupPref : agentConfig?.repo_mounts?.[repoId]
     setMountMode(pref?.mount_mode || agentConfig?.default_mount_mode || 'letter')
     setMountPath(pref?.mount_dir || agentConfig?.default_mount_dir || '')
     setError(null)
@@ -519,9 +532,9 @@ export function RepoDisks({ repoId, isSuperAdmin, canManage, currentUserId, curr
 
       <MountDialog
         open={mountTarget !== null}
+        repoName={repoName}
         mode={mountMode}
         path={mountPath}
-        serverAlias={mountServerAlias}
         submitting={mountTarget !== null && busyId === mountTarget.id}
         onModeChange={setMountMode}
         onPathChange={setMountPath}
@@ -532,6 +545,9 @@ export function RepoDisks({ repoId, isSuperAdmin, canManage, currentUserId, curr
             agent.mount({
               allocation_id: target.id,
               repo_id: repoId,
+              // 库名/分组带上：目录模式的目录名就是库名，分组配置也要能被代理识别到。
+              repo_name: repoName,
+              repo_group: repoGroup,
               mount_mode: mountMode,
               mount_path: mountMode === 'directory' ? mountPath.trim() : undefined,
               // 归属当前活动服务端：分配 ID 只对那一台有意义，给错台会 404 agent.server_unknown。

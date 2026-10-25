@@ -12,11 +12,10 @@ export function sanitizePathSegment(name: string): string {
   return cleaned.replace(/^[ .]+/, '').replace(/[ .]+$/, '')
 }
 
-/** 目录模式下自动生成的那一级目录名：`<服务端名称>_<存储库名称>`。 */
-export function mountDirLeaf(serverAlias: string, repoName: string): string {
-  const server = sanitizePathSegment(serverAlias) || 'vault'
+/** 目录模式下自动生成的那一级目录名：**存储库名称**（与 Go 侧 mountDirLeaf 一致）。 */
+export function mountDirLeaf(repoName: string): string {
   const repo = sanitizePathSegment(repoName)
-  return repo === '' ? server : `${server}_${repo}`
+  return repo === '' ? 'vault' : repo
 }
 
 /** 取路径最后一段（兼容 Windows 反斜杠与 POSIX 斜杠）。 */
@@ -26,7 +25,7 @@ function baseName(path: string): string {
 }
 
 /** 去掉路径末尾的分隔符（对齐 Go 的 filepath.Clean 在展示层面的效果）。 */
-function trimTrailingSeparators(path: string): string {
+export function trimTrailingSeparators(path: string): string {
   const trimmed = path.trim()
   const stripped = trimmed.replace(/[\\/]+$/, '')
   if (stripped === '') return trimmed
@@ -35,13 +34,13 @@ function trimTrailingSeparators(path: string): string {
 }
 
 /**
- * 目录模式的最终挂载点：**父目录** + 一层 `<服务端名称>_<存储库名称>`。
+ * 目录模式的最终挂载点：**父目录** + 一层与存储库同名的子目录。
  *
  * 父目录末段已经是那一层时原样返回（与代理侧同为幂等）：重挂/恢复传回来的是上次的最终
  * 挂载点，界面在这里不能把它再拼一次，否则预览与实际挂载点会不一致。
  */
-export function effectiveMountDir(parentDir: string, serverAlias: string, repoName: string): string {
-  const leaf = mountDirLeaf(serverAlias, repoName)
+export function effectiveMountDir(parentDir: string, repoName: string): string {
+  const leaf = mountDirLeaf(repoName)
   const root = trimTrailingSeparators(parentDir)
   if (root === '') return ''
   if (baseName(root).toLowerCase() === leaf.toLowerCase()) return root

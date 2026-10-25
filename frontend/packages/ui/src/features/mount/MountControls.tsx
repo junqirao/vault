@@ -326,8 +326,6 @@ export function MountActionButtons({
 export interface MountDialogProps {
   open: boolean
   repoName?: string
-  /** 目录名里用的服务端名称（本地别名优先）：用于如实告知"实际挂载到哪"。 */
-  serverAlias?: string
   mode: AgentMountMode
   path: string
   submitting?: boolean
@@ -340,13 +338,12 @@ export interface MountDialogProps {
 /**
  * 挂载前确认：目录模式下允许先修改目标目录。
  *
- * 这里填的是**父目录**，实际挂载点在它下面一级 `<服务端名称>_<存储库名称>`（代理侧规则）；
+ * 这里填的是**父目录**，实际挂载点在它下面一级与**存储库同名**的子目录（代理侧规则）；
  * 弹窗里直接把算好的最终路径显示出来 —— 用户点挂载前就该知道文件会出现在哪。
  */
 export function MountDialog({
   open,
   repoName,
-  serverAlias,
   mode,
   path,
   submitting,
@@ -358,7 +355,7 @@ export function MountDialog({
   const { t } = useI18n()
   const directory = mode === 'directory'
   const invalid = directory && !path.trim()
-  const effectiveDir = directory ? effectiveMountDir(path, serverAlias ?? '', repoName ?? '') : ''
+  const effectiveDir = directory ? effectiveMountDir(path, repoName ?? '') : ''
 
   return (
     <Modal

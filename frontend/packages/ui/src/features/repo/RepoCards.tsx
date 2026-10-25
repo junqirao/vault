@@ -25,6 +25,7 @@ import {
   useRepoMount,
   type RepoMountController
 } from './RepoMount'
+import { diffUsageAsVolume, RepoUsageTooltip, useRepoDiffUsage } from './RepoUsageTip'
 import { isPlaceholderRepoId, repoStateValue, uploadPercent } from './uploadView'
 
 export interface RepoCardProps {
@@ -166,7 +167,6 @@ function RepoTagRow({
  */
 function RepoMeter({
   label,
-  hint,
   value,
   percent,
   muted,
@@ -176,8 +176,6 @@ function RepoMeter({
 }: {
   /** 左侧标签（「已用」/「进度」）。 */
   label: string
-  /** 标签的悬浮说明；不传则标签不可悬浮。 */
-  hint?: string
   /** 右侧数值（用量是「已用 / 上限」，上传是「已传 / 总量」）。 */
   value: ReactNode
   percent: number
@@ -190,17 +188,9 @@ function RepoMeter({
   return (
     <div style={style}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-        {hint ? (
-          <Tooltip title={hint}>
-            <Typography.Text type="secondary" style={{ fontSize: fontSize.sm, cursor: 'help' }}>
-              {label}
-            </Typography.Text>
-          </Tooltip>
-        ) : (
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-            {label}
-          </Typography.Text>
-        )}
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+          {label}
+        </Typography.Text>
         <Typography.Text style={{ fontSize: fontSize.sm }}>{value}</Typography.Text>
       </div>
       <UsageBar percent={percent} muted={muted} loading={loading} color={color} />
@@ -215,6 +205,10 @@ function RepoMeter({
  * 磁盘总量"（按盘标称容量计费，等于库容量），用户眼里的"用了多少"只有本机
  * 挂载着的那个卷知道。标签仍是「已用」（不给它挂「（本机）」后缀：同一列里两个口径的
  * 标签长短不一反而像两件事），口径差异由悬浮说明交代。
+ *
+ * **hover 才给服务端口径的明细**（真实反馈："进度条应展示本地用量，hover 时才在 tooltips 中
+ * 展示母盘用量进度条，以及一些相关的用量信息"）：母盘占用、服务端已分配容量都收进
+ * RepoUsageTip，卡片这一行只有用户每天要看的本机用量。
  *
  * **未挂载就只报上限**（真实反馈："未挂载的情况下不展示已用存储的量，那个进度条置灰就行了"、
  * "已用那里只展示一个上限就可以了"）：那一刻没有任何本机实测值，而服务端回退值又恰恰是
@@ -233,12 +227,15 @@ function RepoMeter({
  */
 function RepoUsage({
   repo,
+  currentUserId,
   usage,
   loading = false,
   upload,
   style
 }: {
   repo: RepoDTO
+  /** 当前用户：共享库要按分配记录找到"我的那块"差异盘，不能把整库的差异盘加总。 */
+  currentUserId: string
   /** 本机实测用量（未挂载 / 取不到时为空）。 */
   usage?: AgentMountVolumeUsage
   /** 实测用量正在取数（见 RepoMountController 的 usageLoading）：`-` 与条都改成转圈。 */
@@ -248,19 +245,35 @@ function RepoUsage({
   style?: CSSProperties
 }): JSX.Element {
   const { t } = useI18n()
+  // 共享库**一律**报差异盘用量，挂载与否都一样（真实反馈 + 截图："差异盘其实只有几十 M
+  // 但是硬是展示的母盘的用量"）：本机挂载着的那个卷是整块盘（母盘的内容也看得见），它的
+  // "已用"是 23 GB 这种全盘数据量，跟差异盘自己吃掉的 36 MB 完全是两回事。
+  // 所以共享库不看本机实测，只用服务端的 `physical_bytes`（见 useRepoDiffUsage）。
+  // hook 必须在下面的 early return 之前调用；moving / 上传中不查（那一格画的是别的东西）。
+  const isShared = repo.mode === 'shared'
+  const diff = useRepoDiffUsage(repo, repo.state !== 'moving' && !upload, currentUserId)
   if (repo.state === 'moving' && repo.move) return <RepoMoveProgress repo={repo} style={style} />
   if (upload) return <RepoProgress upload={upload} style={style} />
-  const { percent, usedText, totalText, measured } = repoUsage(repo, usage, true)
+  // 共享库没有差异盘数据时**不**回退本机实测（那会瞬间闪出 23 GB 的错误数字），
+  // 保持空值让这一格转圈，等差异盘数据到位。独享库不受影响，仍用本机实测。
+  const effectiveUsage = isShared ? diffUsageAsVolume(diff.usage) : usage
+  const { percent, usedText, totalText, measured } = repoUsage(repo, effectiveUsage, true)
+  // 差异盘用量还在取：与"本机实测正在取"同样处理（`-` 与条都转圈），不要先闪一下 `-`。
+  const busy = loading || (isShared && diff.loading)
+  // 母盘用量、服务端已分配容量这些"服务端口径"的数字收进悬浮说明（见 RepoUsageTooltip）：
+  // 卡片这一行只留用户每天要看的用量，hover 再看那份明细。
   return (
-    <RepoMeter
-      label={t('repo.used')}
-      hint={measured ? t('repo.usedLocalHint') : undefined}
-      value={<UsageValueText usedText={usedText} totalText={totalText} loading={loading} />}
-      percent={percent}
-      muted={!measured}
-      loading={loading}
-      style={style}
-    />
+    <RepoUsageTooltip repo={repo} usage={effectiveUsage} loading={busy}>
+      <div style={style}>
+        <RepoMeter
+          label={t('repo.used')}
+          value={<UsageValueText usedText={usedText} totalText={totalText} loading={busy} />}
+          percent={percent}
+          muted={!measured}
+          loading={busy}
+        />
+      </div>
+    </RepoUsageTooltip>
   )
 }
 
@@ -897,6 +910,7 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
           位置、宽度、形状都不变，所以卡片高度不会跳。 */}
       <RepoUsage
         repo={repo}
+        currentUserId={currentUserId}
         usage={mountController.usage}
         loading={mountController.usageLoading}
         upload={upload}
@@ -974,6 +988,7 @@ function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onCon
             落在同一条竖线上。 */}
         <RepoUsage
           repo={repo}
+          currentUserId={currentUserId}
           usage={mountController.usage}
           loading={mountController.usageLoading}
           upload={upload}

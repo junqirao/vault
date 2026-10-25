@@ -66,6 +66,19 @@ export interface UsageBarProps {
    * 否则一行里会跳出与库健康度无关的告警色（真实反馈："进度条不变色，都蓝色就行"）。
    */
   color?: string
+  /**
+   * 条厚度，默认 16（刚好容得下内嵌的百分数）。
+   *
+   * 悬浮明细里用 6：那里每行右边已经写着「已用 / 上限」，条只当比例尺用，
+   * 16px 的厚条 + 条内百分数会让气泡又高又挤（真实反馈："hover 里的不要那么大"）。
+   */
+  height?: number
+  /**
+   * 是否把百分数叠在条正中，默认 true。
+   *
+   * 关掉的前提是**数值已经在行内写清楚了**（悬浮明细就是这种），否则条上就没数了。
+   */
+  showPercent?: boolean
   style?: CSSProperties
 }
 
@@ -96,7 +109,15 @@ export interface UsageBarProps {
  *   - 置灰（muted，未挂载本机）：只剩这条灰轨道本身，把位置占住；
  *   - 取数中（loading，刚挂上、还在量）：灰轨道 + 一个转圈。
  */
-export function UsageBar({ percent, muted = false, loading = false, color, style }: UsageBarProps): JSX.Element {
+export function UsageBar({
+  percent,
+  muted = false,
+  loading = false,
+  color,
+  height = 16,
+  showPercent = true,
+  style
+}: UsageBarProps): JSX.Element {
   // 取数中与置灰一样：不填、不写数 —— 这一刻没有数字可填，填 0 或写 "0%" 都会被读成
   // "一个字节没用"（而 loading 只在"本来要写 `-`"时才会为真，见 props 的说明）。
   const blank = muted || loading
@@ -105,22 +126,23 @@ export function UsageBar({ percent, muted = false, loading = false, color, style
   const strokeColor = blank ? palette.neutralFill : (color ?? usageColor(clamped))
   return (
     <div style={{ position: 'relative', lineHeight: 0, marginTop: spacing.xxs, ...style }}>
-      {/* size 只给 height：line 形态下传单个数字是"宽高都设成它"（条会变成 16px 长的方块），
+      {/* size 只给 height：line 形态下传单个数字是"宽高都设成它"（条会变成方块），
           传对象才是"只改粗细"，正好 = 条的厚度。 */}
       <Progress
         percent={clamped}
         showInfo={false}
-        size={{ height: 16 }}
+        size={{ height }}
         strokeColor={strokeColor}
         trailColor={palette.neutralFill}
         style={{ marginBottom: 0, fontSize: 0, lineHeight: 0 }}
       />
       {loading ? (
         // 转圈用深灰：条的底纹是浅灰，白色或彩色的转圈都会糊在底上。
+        // 细条（悬浮明细里的 6px）放不下 12px 的字，缩到 8：溢出一点也比盖住整条好。
         <span style={overlayStyle}>
-          <LoadingOutlined spin style={{ fontSize: fontSize.xs, color: palette.textTertiary }} />
+          <LoadingOutlined spin style={{ fontSize: height >= 14 ? fontSize.xs : 8, color: palette.textTertiary }} />
         </span>
-      ) : muted ? null : (
+      ) : muted || !showPercent ? null : (
         <span
           style={{
             ...overlayStyle,

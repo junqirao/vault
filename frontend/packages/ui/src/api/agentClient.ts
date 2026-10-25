@@ -838,8 +838,8 @@ export const agentApi = {
   /**
    * 写入**某个存储库分组**的挂载配置（分组名放请求体）。
    *
-   * 与 setRepoMountPref 同一套字段，额外带 `use_for_repos`：为 true 时组内库挂载
-   * 都用这套配置覆盖自己的配置。
+   * 与 setRepoMountPref 同一套字段，额外带 `use_for_repos`（是否覆盖组内库自己的配置）
+   * 与 `use_repos`（作用于哪些库，空 = 组内全选）。
    */
   setGroupMountPref(group: string, pref: AgentRepoMountPref): Promise<{ config: AgentConfig }> {
     return request({

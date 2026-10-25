@@ -673,7 +673,8 @@ function GroupMetric({
       >
         {value}
       </Typography.Text>
-      <UsageBar percent={percent} color={color} loading={loading} style={{ width: 64, marginTop: 0 }} />
+      {/* 64 → 77（+20%）：分组卡片里这根条之前太短，几乎看不出占比差异 */}
+      <UsageBar percent={percent} color={color} loading={loading} style={{ width: 77, marginTop: 0 }} />
     </div>
   )
 }
@@ -696,8 +697,16 @@ function RepoGroupCard({
   const repos = bucket.items.map((entry) => entry.repo)
   const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
   const mounts = agent.state?.mounts ?? []
-  const mountedCount = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined).length
+  const mountedRepos = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined)
+  const mountedCount = mountedRepos.length
   const activeCount = repos.filter((repo) => repo.state === 'active').length
+
+  // 「已挂载」报**空间**而不是个数（反馈："已挂载 1/3 展示空间，而不是数量，直接展示已挂载空间大小"）：
+  // 这一格要回答的是"我这台机器上现在挂着多大一块盘"，1/3 这种计数看不出体量。
+  // 容量取 capacity_bytes（VHDX 标称容量，见 RepoDTO）：挂载后本机那个卷就是这个大小，
+  // 与旁边「已使用空间」在同一量纲上，两条条也才能对比。
+  const mountedCapacity = mountedRepos.reduce((sum, repo) => sum + (repo.capacity_bytes || 0), 0)
+  const totalCapacity = repos.reduce((sum, repo) => sum + (repo.capacity_bytes || 0), 0)
 
   // 差异盘占用按盘聚合：repo.used_bytes 是"已分配容量"的计费口径，
   // 只有 listRepoDisks 的 diff 盘 physical_bytes 才是真正吃掉的空间。
@@ -725,7 +734,8 @@ function RepoGroupCard({
   // 操作开始后按固定的 kind 出文案：挂载过程中 mountedCount 会增长，
   // 不能再用它判断"这一次到底是在挂载还是卸载"。
   const activeKind = kind ?? (mountedCount > 0 ? 'unmount' : 'mount')
-  const mountedPercent = repos.length > 0 ? Math.round((mountedCount / repos.length) * 100) : 0
+  // 条的比例同样按容量算（分母 = 分组内全部库的容量）：全组都挂上就是 100%。
+  const mountedPercent = totalCapacity > 0 ? Math.min(100, Math.round((mountedCapacity / totalCapacity) * 100)) : 0
   const diffPercent = diffUsage.total > 0 ? Math.min(100, Math.round((diffUsage.used / diffUsage.total) * 100)) : 0
 
   return (
@@ -776,9 +786,11 @@ function RepoGroupCard({
 
       <GroupMetric
         label={t('repo.group.mountedStorage')}
-        value={`${mountedCount} / ${repos.length}`}
+        // 直接报已挂载的容量（口径见上面的 mountedCapacity），不再报「1 / 3」这种计数：
+        // 个数留在悬浮说明里（标题下面的文案已经写了仓库数与可用数），这一行留给体量。
+        value={formatBytes(mountedCapacity)}
         percent={mountedPercent}
-        // 已挂载数量不是"用量"，不随占比变色：一路主色蓝。
+        // 已挂载容量不是"用量"，不随占比变色：一路主色蓝。
         color={palette.accent}
       />
       <GroupMetric
@@ -1240,9 +1252,18 @@ export function RepoList({
       {settingsRepo ? (
         <RepoMountSettingsModal repo={settingsRepo} open onClose={() => setSettingsRepo(null)} />
       ) : null}
-      {/* 分组挂载设置：一次只开一个分组（含"使用分组配置"开关）。 */}
+      {/* 分组挂载设置：一次只开一个分组（含"使用分组配置"与作用的库勾选）。 */}
       {settingsGroup !== null ? (
-        <GroupMountSettingsModal group={settingsGroup} open onClose={() => setSettingsGroup(null)} />
+        <GroupMountSettingsModal
+          group={settingsGroup}
+          // 组内的库：勾选列表默认全选。上传占位条目不是真库，别混进去。
+          repos={entries
+            .filter((entry) => !isPlaceholderRepoId(entry.repo.id))
+            .filter((entry) => (entry.repo.group ?? '').trim() === settingsGroup)
+            .map((entry) => entry.repo)}
+          open
+          onClose={() => setSettingsGroup(null)}
+        />
       ) : null}
       {isSuperAdmin ? (
         <DataTable<RepoDTO>

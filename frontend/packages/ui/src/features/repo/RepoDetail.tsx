@@ -18,7 +18,7 @@ import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
 import { useI18n } from '../../i18n'
 
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { formatBytes, formatTime, repoUsage } from '../../utils/format'
+import { formatBytes, formatTime, repoUsage, userDiffUsage } from '../../utils/format'
 import { parentConditionLabel, repoModeLabel } from '../../utils/labels'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
@@ -27,6 +27,7 @@ import { RepoVerifyDiff } from './RepoVerifyDiff'
 import { RepoMountActions, useRepoMount } from './RepoMount'
 import { RepoGroupSelect } from './RepoGroupSelect'
 import { RepoMountSettingsPanel } from './RepoMountSettings'
+import { diffUsageAsVolume, RepoUsageTooltip } from './RepoUsageTip'
 
 export interface RepoDetailProps {
   repoId: string
@@ -100,7 +101,20 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const disksQuery = useQuery({
     queryKey: ['repo-disks', repoId],
     queryFn: () => api.listRepoDisks(repoId),
-    enabled: Boolean(repoQuery.data)
+    enabled: Boolean(repoQuery.data),
+    // 共享库的「已用」取差异盘的 physical_bytes（服务端每 5 分钟采样），按 60s 轮询跟上；
+    // 独享库的用量走本机实测（10s 那条），这里不必刷。
+    refetchInterval: repoQuery.data?.mode === 'shared' ? 60_000 : false
+  })
+
+  // 共享库的「已用」要落到"**分给我的**那块差异盘"：分配记录给出 user → disk_id 的映射。
+  // 光看 disks 只能看到全库的差异盘（每块各属一个用户），加总会让分母变成 N × 容量
+  // （真实反馈：两块差异盘时显示成了 40 MB / 49.9 GB）。
+  const allocationsQuery = useQuery({
+    queryKey: ['repo-allocations', repoId],
+    queryFn: () => api.listAllocations(repoId),
+    enabled: repoQuery.data?.mode === 'shared',
+    refetchInterval: 60_000
   })
 
   // 概览里的「已用」也要是本机实测值（见下面 repoUsage 的说明）：页面在时按 10s 轮询。
@@ -299,20 +313,34 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   // 用量口径与卡片一致（分母 = 库容量，见 repoUsage）。本机挂着这个库时用本机**实测**的
   // 卷用量：服务端的 used_bytes 是已分配磁盘总量（按盘标称容量计费，等于库容量）。
   const mountUsage = pickMountUsage(agent.usage, repo?.id)
+  // 共享库**一律**报差异盘用量，与卡片同一套逻辑（见 RepoCards 的 RepoUsage）：
+  // 本机挂载着的那个卷是整块盘，母盘的内容也在里面，"已用"是 23 GB 这种全盘数据量，
+  // 而差异盘自己其实只吃了几十 MB（真实反馈："差异盘其实只有几十 M 但是硬是展示的母盘的
+  // 用量"，截图里磁盘页签：母盘 22.8 GB / 差异盘 36 MB）。所以共享库不看本机实测，
+  // 也不在差异盘数据没回来时回退它 —— 那会先闪一个 23 GB 的错误数字。
+  // 独享库与管理端不用它：前者那块盘就是母盘，后者看的是"分配出去多大"的服务端口径。
+  const isShared = repo?.mode === 'shared'
+  const diffUsage =
+    !isSuperAdmin && isShared
+      ? userDiffUsage(disksQuery.data?.items, allocationsQuery.data?.items, currentUserId)
+      : undefined
+  const effectiveUsage = !isSuperAdmin && isShared ? diffUsageAsVolume(diffUsage) : mountUsage
   const {
     percent: usagePercent,
     usedText: usageUsedText,
     totalText: usageTotalText,
     measured: usageMeasured
-  } = repoUsage(repo, mountUsage, !isSuperAdmin)
+  } = repoUsage(repo, effectiveUsage, !isSuperAdmin)
   // 未挂载时客户端不报用量、条置灰（见 RepoCards 的 RepoUsage）：那一刻服务端回退值是
   // 等于库容量的"已分配容量"，用量写 `-`；上限照报，仍是"已用 / 上限"那一行文案。
   // 管理端是例外：运维看的正是"这个库分配出去多大"，那个绝对数在这里是有效信息（与表格同口径）。
   const usageMuted = !isSuperAdmin && !usageMeasured
-  // 刚挂上、实测用量还在取数：把 `-` 与条都换成转圈（见 useAgent 的 repoUsageLoading）。
-  // 只在客户端那条路上成立 —— 管理端显示的是服务端口径，本机实测值到位后只是换个口径，
-  // 不该拿转圈盖住一个已经有效的数字。
-  const usageLoading = !isSuperAdmin && repoUsageLoading(agent.usagePending, repo?.id, usageMeasured)
+  // 刚挂上、实测用量还在取数 / 差异盘用量还在查：把 `-` 与条都换成转圈（见 useAgent 的
+  // repoUsageLoading）。只在客户端那条路上成立 —— 管理端显示的是服务端口径，本机实测值
+  // 到位后只是换个口径，不该拿转圈盖住一个已经有效的数字。
+  const usageLoading =
+    (!isSuperAdmin && !isShared && repoUsageLoading(agent.usagePending, repo?.id, usageMeasured)) ||
+    (!isSuperAdmin && isShared && (disksQuery.isPending || allocationsQuery.isPending))
 
   const openEdit = (target: RepoDTO): void => {
     editForm.setFieldsValue({
@@ -602,12 +630,26 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                       （计入用户已用配额）。所以这里只展示占用了多少，不再提供配额输入。
                       口径与卡片、管理端表格一致（分母 = 库容量，见 repoUsage）。 */}
                   <Descriptions.Item label={t('repo.used')}>
-                    <div style={{ minWidth: 160 }}>
-                      <div>
-                        <UsageValueText usedText={usageUsedText} totalText={usageTotalText} loading={usageLoading} />
+                    {/* 与卡片同一个悬浮说明（见 RepoUsageTooltip）：这里也只报这一行那个用量
+                        （共享库 = 差异盘），其余服务端口径的数字在 hover 时给出，两处看到的必须是
+                        同一份明细 —— 所以传的是 effectiveUsage，不是本机实测的 mountUsage。 */}
+                    {repo ? (
+                      <RepoUsageTooltip repo={repo} usage={effectiveUsage} loading={usageLoading}>
+                        <div style={{ minWidth: 160 }}>
+                          <div>
+                            <UsageValueText usedText={usageUsedText} totalText={usageTotalText} loading={usageLoading} />
+                          </div>
+                          <UsageBar percent={usagePercent} muted={usageMuted} loading={usageLoading} />
+                        </div>
+                      </RepoUsageTooltip>
+                    ) : (
+                      <div style={{ minWidth: 160 }}>
+                        <div>
+                          <UsageValueText usedText={usageUsedText} totalText={usageTotalText} loading={usageLoading} />
+                        </div>
+                        <UsageBar percent={usagePercent} muted={usageMuted} loading={usageLoading} />
                       </div>
-                      <UsageBar percent={usagePercent} muted={usageMuted} loading={usageLoading} />
-                    </div>
+                    )}
                   </Descriptions.Item>
                   <Descriptions.Item label={t('field.maxDiffDisks')}>{repo?.max_diff_disks ?? '-'}</Descriptions.Item>
                   <Descriptions.Item label={t('common.createdAt')}>{formatTime(repo?.created_at)}</Descriptions.Item>
@@ -642,6 +684,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
             children: (
               <RepoDisks
                 repoId={repoId}
+                repoName={repo?.name}
+                repoGroup={repo?.group}
                 isSuperAdmin={isSuperAdmin}
                 canManage={canManage}
                 currentUserId={currentUserId}

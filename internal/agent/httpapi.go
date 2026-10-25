@@ -677,8 +677,8 @@ func (a *Agent) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 // repoMountPrefRequest 是单个存储库挂载偏好的写入请求。
 type repoMountPrefRequest struct {
 	MountMode string `json:"mount_mode"`
-	// MountDir 目录模式的**父目录**：实际挂载点是它下面一层 `<服务端名称>_<存储库名称>`
-	// 子目录（见 mountDirLeaf），界面在挂载设置里如实告知用户这一点。
+	// MountDir 目录模式的**父目录**：实际挂载点是它下面一层**与存储库同名**的子目录
+	// （见 mountDirLeaf），界面在挂载设置里如实告知用户这一点。
 	MountDir  string `json:"mount_dir"`
 	AutoMount bool   `json:"auto_mount"`
 	// CacheEnabled 是否为该库启用本地 iSCSI 读缓存代理（默认开启，用户可关闭）。
@@ -701,6 +701,8 @@ type groupMountPrefRequest struct {
 	repoMountPrefRequest
 	// UseForRepos 为 true 时，这套分组配置覆盖组内每个库自己的挂载配置。
 	UseForRepos bool `json:"use_for_repos"`
+	// UseRepos 是这套分组配置**作用到的库**（空 = 组内全选，界面默认全选）。
+	UseRepos []string `json:"use_repos"`
 }
 
 // handleSetGroupMountPref 写入某个分组的挂载配置（与单库配置互不影响）。
@@ -721,6 +723,7 @@ func (a *Agent) handleSetGroupMountPref(w http.ResponseWriter, r *http.Request) 
 		CacheEnabled: cacheEnabled,
 		DirectMode:   in.DirectMode,
 		UseForRepos:  in.UseForRepos,
+		UseRepos:     in.UseRepos,
 	})
 	if err != nil {
 		a.writeError(w, err)

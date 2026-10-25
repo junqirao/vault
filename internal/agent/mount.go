@@ -62,12 +62,14 @@ type MountRequest struct {
 	// RepoGroup 可选：存储库分组名。服务端 MountSpec 也会下发（见 RepoGroup 字段），
 	// 这里主要用于前端在服务端还没响应前就带上分组、以及旧服务端的兜底。
 	//
-	// 注意：它**只用于展示/记录**，不会让单库挂载套用分组配置 —— 见 UseGroupConfig。
+	// 分组配置是否覆盖本库**不看**请求，而看分组配置自己（use_for_repos + use_repos）：
+	// 勾了「使用分组配置」的库，单库挂载/自动挂载/启动恢复都一样遵循分组配置。
 	RepoGroup string `json:"repo_group,omitempty"`
-	// UseGroupConfig 表示本次是**按分组批量挂载**（卡片上的「挂载分组」）。
+	// UseGroupConfig 是旧客户端「挂载分组」带上的标记，**已不再参与判定**。
 	//
-	// 只有它为 true 且该分组开了"使用分组配置"时，分组配置才覆盖组内库自己的配置；
-	// 单库挂载（卡片/详情页的挂载按钮、自动挂载、启动恢复）一律用该库自己的配置。
+	// 保留字段只为兼容老客户端的请求体：分组配置生效与否完全由服务端可见的
+	// group_mounts[group]（use_for_repos / use_repos）决定，否则"界面显示置灰遵循分组"
+	// 与实际挂载会两套口径。见 groupOverride。
 	UseGroupConfig bool `json:"use_group_config,omitempty"`
 	// ServerKey / ServerURL 指明本次挂载归属的服务端（多服务端下二选一必填）。
 	//
@@ -127,13 +129,13 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	if existing, _, ok := e.a.store.GetMount(allocationID); ok && existing.State == MountStateMounted {
 		active, verified := e.a.probeMountSession(ctx, allocationID)
 		if mounted := mountIdempotent(existing, active, verified); mounted {
-			if e.mountCacheSatisfied(req, existing) {
+			if e.mountCacheSatisfied(req, existing) && e.mountModeSatisfied(req, existing) {
 				if latest, _, ok := e.a.store.GetMount(allocationID); ok {
 					return &latest, nil
 				}
 				return &existing, nil
 			}
-			// 代理/缓存/直连设置与既有记录不一致（用户刚在设置里改了）：**先卸载再按新设置挂载**。
+			// 代理/缓存/直连/形态设置与既有记录不一致（用户刚在设置里改了）：**先卸载再按新设置挂载**。
 			//
 			// 为什么不能就地重挂：生效门户换了一侧（直连服务端 ↔ 本机代理），旧会话的磁盘仍在线、
 			// 挂载点仍占用 —— 而 v2 两侧 IQN 同名、只有门户不同，残留会话会让 Connect 的幂等判定
@@ -1058,7 +1060,7 @@ func sleepOrDone(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// remount 先卸载再按原参数重新挂载。
+// remount 先卸载再按**当前配置**重新挂载。
 func (e *mountEngine) remount(ctx context.Context, allocationID string) (*MountState, error) {
 	allocationID = strings.TrimSpace(allocationID)
 	if allocationID == "" {
@@ -1071,16 +1073,48 @@ func (e *mountEngine) remount(ctx context.Context, allocationID string) (*MountS
 	if err := e.unmount(ctx, allocationID); err != nil {
 		return nil, err
 	}
-	return e.mount(ctx, MountRequest{
+	req := MountRequest{
 		AllocationID: allocationID,
-		MountMode:    ms.MountMode,
-		MountPath:    ms.MountPath,
 		RepoID:       ms.RepoID,
 		RepoName:     ms.RepoName,
+		RepoGroup:    ms.RepoGroup,
 		// 归属原样带回：重挂必须打在原来那台上。
 		ServerKey: ms.ServerKey,
 		ServerURL: ms.ServerURL,
-	}, false)
+	}
+	return e.mount(ctx, e.withRecordedConfig(req, ms), false)
+}
+
+// withRecordedConfig 把**当前生效配置**合并进一条"重挂/恢复"请求。
+//
+// 形态与父目录以配置为准，记录里的旧值只在配置没表态时兜底。为什么必须这样（真实反馈：
+// "我都配置成了挂载到目录，但是挂载出来的全是盘符"）：请求里的 mount_mode/mount_path 在
+// resolveMode/explicitMountDir 里排在最前，把旧记录原样塞进请求，等于让"上次怎么挂的"
+// 永远压过"用户刚在设置里改的配置"，改配置再点挂载/重挂都不会生效。
+func (e *mountEngine) withRecordedConfig(req MountRequest, ms MountState) MountRequest {
+	req.MountMode = ""
+	req.MountPath = ""
+	mode := e.explicitMode(req, nil)
+	dir := e.explicitMountDir(req, nil)
+	recordMode := normalizeMountMode(ms.MountMode)
+	if mode == "" {
+		// 配置没表态：沿用上次的形态。
+		mode = recordMode
+	}
+	// 上次也是目录模式、且配置没指定父目录：沿用上次的挂载点。它本身就是一个最终挂载点
+	// （末段等于库名），resolveMountDir 会原样返回 —— 不加这条，重挂会从 D:\自定义\库名
+	// 悄悄漂回默认挂载根。
+	if mode == mountModeDirectory && dir == "" && recordMode == mountModeDirectory {
+		dir = strings.TrimSpace(ms.MountPath)
+	}
+	if mode == "" {
+		mode = mountModeLetter
+	}
+	req.MountMode = mode
+	if mode == mountModeDirectory && dir != "" && !isDriveRootPath(dir) {
+		req.MountPath = dir
+	}
+	return req
 }
 
 // resolveMountServerKey 解析本次挂载归属的服务端键。
@@ -1133,7 +1167,7 @@ func (e *mountEngine) restore(ctx context.Context, req MountRequest) (*MountStat
 // 命名的诉求（真实反馈："盘符或者是目录名应该等于存储库的名称"）：
 //   - 盘符模式：Windows 只肯给一个盘符（E:、F:…），没有"用库名做盘符"这回事，
 //     于是把库名写到**卷标**上 —— 资源管理器里该盘就显示存储库名称；
-//   - 目录模式：目录名就是 `<服务端名称>_<存储库名称>`（见 resolveMountDir 与 3.4.5）。
+//   - 目录模式：目录名就是**存储库名称**（见 resolveMountDir 与 mountDirLeaf）。
 func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, req MountRequest, spec *MountSpec, serverKey string) (string, error) {
 	if mode != mountModeDirectory {
 		letter, err := e.a.vol.MountToDriveLetter(ctx, diskNumber)
@@ -1143,7 +1177,7 @@ func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, 
 		e.labelVolume(ctx, diskNumber, repoNameOf(req, spec))
 		return letter, nil
 	}
-	dir, err := e.resolveMountDir(req, spec, serverKey)
+	dir, err := e.resolveMountDir(req, spec)
 	if err != nil {
 		return "", err
 	}
@@ -1234,34 +1268,28 @@ func repoGroupOf(req MountRequest, spec *MountSpec) string {
 // resolveMountDir 计算目录模式的绝对挂载路径。
 //
 // 规则（界面在挂载设置里如实告知同一条规则，两处必须一致）：
-//  1. **本地指定的目录是父目录**：请求 mount_path（挂载对话框）> 每库配置 mount_dir。
-//     真正的挂载点是它下面一层自动生成的 `<服务端名称>_<存储库名称>` 子目录 ——
-//     多个库共用一个父目录也不会互相挤占，且目录名自解释（哪个服务端的哪个库）。
+//  1. **本地指定的目录是父目录**：分组配置（勾了使用分组配置时）> 请求 mount_path（挂载
+//     对话框）> 每库配置 mount_dir。真正的挂载点是它下面一层**与存储库同名**的子目录 ——
+//     多个库共用一个父目录也不会互相挤占，且目录名就是库名（用户找文件时按库名就能认出来）。
 //  2. 本地没指定时，落到服务端下发的 mount_path：**绝对路径**是服务端管理员的显式指定，
 //     原样使用；**相对路径**（服务端自动拼的 `<服务端名称>\<库名>`）也归一到上面那条命名
-//     —— 否则同一个库会因为"从哪挂"得到两种目录名（srv\lib 与 srv_lib），
+//     —— 否则同一个库会因为"从哪挂"得到两种目录名（srv\lib 与 lib），
 //     界面按一种口径提示、实际却挂到另一种（真实反馈就是这么来的）。
-//  3. 都没有时退化为 `<挂载根>\<服务端名称>_<存储库名称>`。
+//  3. 都没有时退化为 `<挂载根>\<存储库名称>`。
 //
-// 幂等：父目录末段已经等于 `<服务端名称>_<存储库名称>` 时原样返回。重挂与恢复
-// （remount / restore）会把**上次的最终挂载点**当请求传回来（见 recordedMountRequest），
-// 没有这条兜底，每重挂一次就会多套一层目录（D:\Vault\a_b\a_b\a_b…）。
-func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec, serverKey string) (string, error) {
+// 幂等：父目录末段已经等于那一层库名目录时原样返回。重挂与恢复（remount / restore）会把
+// **上次的最终挂载点**当请求传回来（见 recordedMountRequest），没有这条兜底，每重挂一次
+// 就会多套一层目录（D:\Vault\lib\lib\lib…）。
+func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec) (string, error) {
 	base := strings.TrimSpace(e.a.cfg.Get().DefaultMountDir)
-	leaf := mountDirLeaf(e.serverAlias(spec, serverKey), repoNameOf(req, spec), req.AllocationID)
+	leaf := mountDirLeaf(repoNameOf(req, spec), req.AllocationID)
 
 	// 分组覆盖优先：它的语义就是"覆盖组内库自己的配置"，也包括自动挂载带进来的旧路径。
-	local := ""
-	if gp, ok := e.groupOverride(req, spec); ok {
-		local = strings.TrimSpace(gp.MountDir)
-	}
-	if local == "" {
-		local = strings.TrimSpace(req.MountPath)
-	}
-	if local == "" {
-		if pref, ok := e.repoPref(req.RepoID); ok {
-			local = strings.TrimSpace(pref.MountDir)
-		}
+	local := e.explicitMountDir(req, spec)
+	// 老记录/旧配置可能把盘符当挂载点传进来（"E:"、"E:\"）。目录模式下拿它当父目录
+	// 会算出 `C:\Vault\E:` 这种鬼东西，直接按"没指定"处理，落到默认挂载根。
+	if isDriveRootPath(local) {
+		local = ""
 	}
 	if local != "" {
 		root := local
@@ -1275,39 +1303,92 @@ func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec, serverK
 		// 已经就是最终挂载点（重挂/恢复把上次的结果传回来了）：不再加层。
 		// 比较不区分大小写：Windows 文件系统不区分。
 		if strings.EqualFold(filepath.Base(root), leaf) {
-			return root, nil
+			return e.uniqueMountDir(root, req.AllocationID), nil
 		}
-		return filepath.Join(root, leaf), nil
+		return e.uniqueMountDir(filepath.Join(root, leaf), req.AllocationID), nil
 	}
 
 	if spec != nil {
-		if raw := strings.TrimSpace(spec.MountPath); raw != "" && filepath.IsAbs(raw) {
-			return filepath.Clean(raw), nil
+		if raw := strings.TrimSpace(spec.MountPath); raw != "" && filepath.IsAbs(raw) && !isDriveRootPath(raw) {
+			return e.uniqueMountDir(filepath.Clean(raw), req.AllocationID), nil
 		}
 	}
 	if base == "" {
 		return "", apperr.InvalidParam("default_mount_dir")
 	}
-	return filepath.Join(base, leaf), nil
+	return e.uniqueMountDir(filepath.Join(base, leaf), req.AllocationID), nil
 }
 
-// mountDirLeaf 返回目录模式下自动生成的那一级目录名：`<服务端名称>_<存储库名称>`。
+// mountDirLeaf 返回目录模式下自动生成的那一级目录名：**存储库名称**。
 //
-// 两段都过 sanitizePathSegment：库名/别名可能含 `\` `/` 等字符，直接拼接会让路径跑到
-// 挂载根之外（路径穿越）。库名缺失时退到分配 ID（至少不会让所有库挤进同一个目录）。
-func mountDirLeaf(serverAlias, repoName, allocationID string) string {
-	server := sanitizePathSegment(serverAlias)
-	if server == "" {
-		server = "vault"
-	}
+// 命名沿用真实反馈（"挂载目录时，目录名应是存储库的名"）：以前是
+// `<服务端名称>_<存储库名称>`，多服务端时每个人的目录名都和库名对不上、找文件要猜前缀。
+// 同名库撞车的情况交给 uniqueMountDir 加后缀处理，不再靠服务端前缀区分。
+//
+// 过 sanitizePathSegment：库名可能含 `\` `/` 等字符，直接拼接会让路径跑到挂载根之外
+// （路径穿越）。库名缺失时退到分配 ID（至少不会让所有库挤进同一个目录）。
+func mountDirLeaf(repoName, allocationID string) string {
 	repo := sanitizePathSegment(repoName)
 	if repo == "" {
 		repo = sanitizePathSegment(allocationID)
 	}
 	if repo == "" {
-		return server
+		return "vault"
 	}
-	return server + "_" + repo
+	return repo
+}
+
+// uniqueMountDir 解决"同名库算出同一个目录"：目录名现在就是库名，两台服务端（或两个分组）
+// 里有同名库时，第二个库不能挂到第一个库的数据上（脚本会以 dir_not_empty 报错，用户也很难
+// 看懂）。被**别的库**占着就依次加 `-2`、`-3` 后缀。
+//
+// 同库重挂/恢复不算占用：它本来就该复用上一次的挂载点，否则每重挂一次目录名就多一个后缀。
+func (e *mountEngine) uniqueMountDir(dir, allocationID string) string {
+	if strings.TrimSpace(dir) == "" || e.a.store == nil {
+		return dir
+	}
+	used := make(map[string]struct{})
+	for _, m := range e.a.store.ListMounts() {
+		if allocationID != "" && strings.EqualFold(m.AllocationID, allocationID) {
+			continue
+		}
+		switch m.State {
+		case MountStateMounted, MountStateMounting:
+		default:
+			continue
+		}
+		if p := strings.TrimSpace(m.MountPath); p != "" {
+			used[strings.ToLower(p)] = struct{}{}
+		}
+	}
+	if _, taken := used[strings.ToLower(dir)]; !taken {
+		return dir
+	}
+	for i := 2; i <= 99; i++ {
+		candidate := fmt.Sprintf("%s-%d", dir, i)
+		if _, taken := used[strings.ToLower(candidate)]; !taken {
+			return candidate
+		}
+	}
+	return dir
+}
+
+// isDriveRootPath 判断 s 是不是一个光秃秃的盘符挂载点（`E:` / `E:\`）。
+//
+// 只认"一个字母 + 冒号（+ 分隔符）"：`E:\Vault` 这种是正常目录，不能误判。
+func isDriveRootPath(s string) bool {
+	s = strings.TrimSpace(s)
+	if len(s) != 2 && len(s) != 3 {
+		return false
+	}
+	if s[1] != ':' {
+		return false
+	}
+	c := s[0]
+	if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
+		return false
+	}
+	return len(s) == 2 || s[2] == '\\' || s[2] == '/'
 }
 
 // sanitizePathSegment 把库名这类用户输入规整为可安全用作**单层**目录名的片段。
@@ -1410,12 +1491,11 @@ func (e *mountEngine) groupPref(group string) (RepoMountPref, bool) {
 
 // groupOverride 返回本次挂载是否要套用"使用分组配置"的分组，以及那份配置。
 //
-// 只有**按分组批量挂载**（req.UseGroupConfig）才会套用：单库挂载即使带着分组名，
-// 也必须用该库自己的配置（真实反馈："没有优先用存储库本身的配置，而是优先用了分组的"）。
+// 判据只有两条：该库所属分组勾了「使用分组配置」，且**这个库被勾选**跟随分组
+// （use_repos 为空 = 组内全选）。和"从哪儿发起挂载"无关 —— 单库挂载、挂载分组、
+// 自动挂载、启动恢复必须同一套口径：否则库的配置界面显示"已置灰、遵循分组"，
+// 单库挂载却走了库自己的（隐藏的、用户看不见的）配置。
 func (e *mountEngine) groupOverride(req MountRequest, spec *MountSpec) (RepoMountPref, bool) {
-	if !req.UseGroupConfig {
-		return RepoMountPref{}, false
-	}
 	group := strings.TrimSpace(req.RepoGroup)
 	if group == "" && spec != nil {
 		group = strings.TrimSpace(spec.RepoGroup)
@@ -1427,12 +1507,15 @@ func (e *mountEngine) groupOverride(req MountRequest, spec *MountSpec) (RepoMoun
 	if !ok || !gp.UseForRepos {
 		return RepoMountPref{}, false
 	}
+	if !gp.AppliesToRepo(req.RepoID) {
+		return RepoMountPref{}, false
+	}
 	return gp, true
 }
 
 // mountPrefFor 返回本次挂载实际生效的偏好。
 //
-// 解析顺序：分组配置（且该分组开了"使用分组配置"）优先覆盖单库配置；否则用单库配置；
+// 解析顺序：分组配置（该分组开了"使用分组配置"且勾选了本库）优先覆盖单库配置；否则用单库配置；
 // 都没有则由调用方按零值/全局默认处理。分组名优先取请求（前端可直接带上），
 // 其次取服务端下发的 MountSpec。
 func (e *mountEngine) mountPrefFor(req MountRequest, spec *MountSpec) (RepoMountPref, bool) {
@@ -1460,12 +1543,41 @@ func (e *mountEngine) mountCacheSatisfied(req MountRequest, ms MountState) bool 
 	return ms.CacheEnabled == pref.cacheEnabledOrDefault()
 }
 
-// resolveMode 确定本次挂载模式：分组覆盖 > 请求 > 每库配置 > 服务端下发 > 本地默认。
+// mountModeSatisfied 判断既有挂载记录的**形态/挂载点**是否还符合当前配置。
 //
-// 分组配置（且开了"使用分组配置"）排在最前：它的语义就是"覆盖组内库自己的配置"，
-// 包括覆盖自动挂载时带进来的旧值。每库配置排在服务端下发之前：它是用户在这台机器上
-// **确认过**的选择（弹窗里存下来的）；服务端 client_config 里的 mount_mode 只是缺省建议。
-func (e *mountEngine) resolveMode(req MountRequest, spec *MountSpec) string {
+// 真实反馈："都配置成了挂载到目录，但是挂载出来的全是盘符" —— 记录已经是 mounted 时，
+// 幂等判断只看代理/直连就直接返回了旧记录，用户在设置里把形态改成目录也永远不会生效。
+// 这里只比对**配置明确表态**过的形态，不拿本地默认值去翻既有形态：库里没配过形态时，
+// 上次怎么挂的（比如服务端指定的目录）就继续怎么挂。
+func (e *mountEngine) mountModeSatisfied(req MountRequest, ms MountState) bool {
+	current := normalizeMountMode(ms.MountMode)
+	mode := e.explicitMode(req, nil)
+	if mode == "" {
+		mode = current
+	}
+	if mode != current {
+		return false
+	}
+	if mode != mountModeDirectory {
+		return true
+	}
+	// 目录模式下父目录改了也是"配置变了"：否则用户换了父目录，点挂载还是老位置。
+	if e.explicitMountDir(req, nil) == "" {
+		return true
+	}
+	want, err := e.resolveMountDir(req, nil)
+	if err != nil {
+		// 算不出来（父目录非法等）就别去动已经挂好的盘，让真正的挂载流程统一报错。
+		return true
+	}
+	return strings.EqualFold(want, strings.TrimSpace(ms.MountPath))
+}
+
+// explicitMode 返回**配置里明确表态**的挂载形态（分组 > 请求 > 每库配置），没表态时返回空串。
+//
+// "明确表态"与 resolveMode 末两级的默认值（服务端下发、本地默认）区分开：
+// 前者可以推翻既有挂载，后者不能（见 mountModeSatisfied）。
+func (e *mountEngine) explicitMode(req MountRequest, spec *MountSpec) string {
 	if gp, ok := e.groupOverride(req, spec); ok {
 		if mode := normalizeMountMode(gp.MountMode); mode != "" {
 			return mode
@@ -1475,9 +1587,35 @@ func (e *mountEngine) resolveMode(req MountRequest, spec *MountSpec) string {
 		return mode
 	}
 	if pref, ok := e.repoPref(req.RepoID); ok {
-		if mode := normalizeMountMode(pref.MountMode); mode != "" {
-			return mode
+		return normalizeMountMode(pref.MountMode)
+	}
+	return ""
+}
+
+// explicitMountDir 返回**配置里明确表态**的目录模式父目录（分组 > 请求 > 每库配置）。
+func (e *mountEngine) explicitMountDir(req MountRequest, spec *MountSpec) string {
+	if gp, ok := e.groupOverride(req, spec); ok {
+		if dir := strings.TrimSpace(gp.MountDir); dir != "" {
+			return dir
 		}
+	}
+	if dir := strings.TrimSpace(req.MountPath); dir != "" {
+		return dir
+	}
+	if pref, ok := e.repoPref(req.RepoID); ok {
+		return strings.TrimSpace(pref.MountDir)
+	}
+	return ""
+}
+
+// resolveMode 确定本次挂载模式：分组覆盖 > 请求 > 每库配置 > 服务端下发 > 本地默认。
+//
+// 分组配置（且开了"使用分组配置"、且勾选了本库）排在最前：它的语义就是"覆盖组内库自己的
+// 配置"，包括覆盖自动挂载/重挂时带进来的旧值。每库配置排在服务端下发之前：它是用户在这台
+// 机器上**确认过**的选择（弹窗里存下来的）；服务端 client_config 里的 mount_mode 只是缺省建议。
+func (e *mountEngine) resolveMode(req MountRequest, spec *MountSpec) string {
+	if mode := e.explicitMode(req, spec); mode != "" {
+		return mode
 	}
 	if spec != nil {
 		if mode := normalizeMountMode(spec.MountMode); mode != "" {
