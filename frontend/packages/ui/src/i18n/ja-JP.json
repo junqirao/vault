@@ -4,7 +4,7 @@
   "app.loading": "読み込み中…",
   "about.title": "Vault について",
   "about.versionSection": "バージョン",
-  "about.clientVersion": "クライアントバージョン",
+  "about.clientVersion": "内部バージョン",
   "about.localServiceVersion": "ローカルサービスバージョン",
   "about.serverVersion": "サーバーバージョン",
   "about.platform": "実行プラットフォーム",

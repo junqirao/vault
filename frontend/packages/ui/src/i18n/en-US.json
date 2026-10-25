@@ -4,7 +4,7 @@
   "app.loading": "Loading…",
   "about.title": "About Vault",
   "about.versionSection": "Versions",
-  "about.clientVersion": "Client version",
+  "about.clientVersion": "Internal version",
   "about.localServiceVersion": "Local service version",
   "about.serverVersion": "Server version",
   "about.platform": "Platform",

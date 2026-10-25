@@ -46,6 +46,13 @@ pki/
 # Go
 *.test
 *.out
+# 性能剖析产物：docs 里的 `-cpuprofile cpu` 会在仓库根生成名为 cpu 的 profile
+/cpu
+/*.pprof
+
+# Python
+__pycache__/
+*.pyc
 
 # 编辑器/系统
 .vscode/

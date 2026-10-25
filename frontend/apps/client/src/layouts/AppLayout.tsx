@@ -21,8 +21,8 @@ import type { MenuProps } from 'antd'
 import { useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 
-// 侧边栏品牌处展示的版本号取自 package.json（构建期注入），与发布包版本同源。
-import { CLIENT_VERSION } from '../config'
+// 侧边栏品牌处展示对外的发布版本（内部构建号只在「关于」里展示）。
+import { RELEASE_CHANNEL, RELEASE_VERSION } from '../config'
 // 与本地条目比对服务端地址用同一口径：代理回传的 url 与本地 baseUrl 可能差一个尾斜杠。
 import { normalizeUrl, rememberManualServerSwitch } from '../store/appStore'
 
@@ -83,6 +83,10 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
   const latency = useServerLatency(active?.baseUrl)
   // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
   const [serverRetrying, setServerRetrying] = useState(false)
+
+  // 渠道标签：stable 不展示；beta / rc / alpha 以标签形式跟在版本号后面。
+  const releaseTag = RELEASE_CHANNEL && RELEASE_CHANNEL !== 'stable' ? RELEASE_CHANNEL.toUpperCase() : null
+  const releaseTagColor = RELEASE_CHANNEL === 'alpha' ? 'red' : RELEASE_CHANNEL === 'beta' ? 'orange' : 'blue'
 
   const appMenuItems: MenuProps['items'] = [
     { key: '/my-repos', icon: <CloudOutlined />, label: t('nav.myRepos') },
@@ -359,13 +363,29 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
           <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
             <div style={{ padding: `${spacing.md}px ${spacing.lg}px ${spacing.sm}px` }}>
               <Space direction="vertical" size={0}>
-                <Space align="baseline" size={6}>
+                <Space align="center" size={6}>
                   <Typography.Text strong style={{ fontSize: 16 }}>
                     {t('app.name')}
                   </Typography.Text>
-                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    v{CLIENT_VERSION}
-                  </Typography.Text>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      v{RELEASE_VERSION}
+                    </Typography.Text>
+                    {releaseTag ? (
+                      <Tag
+                        color={releaseTagColor}
+                        style={{
+                          marginInlineEnd: 0,
+                          fontSize: 10,
+                          lineHeight: '16px',
+                          paddingInline: 5,
+                          fontWeight: 600
+                        }}
+                      >
+                        {releaseTag}
+                      </Tag>
+                    ) : null}
+                  </span>
                 </Space>
                 {mode === 'admin' ? (
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>

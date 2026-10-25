@@ -4,7 +4,7 @@
   "app.loading": "불러오는 중…",
   "about.title": "Vault 정보",
   "about.versionSection": "버전",
-  "about.clientVersion": "클라이언트 버전",
+  "about.clientVersion": "내부 버전",
   "about.localServiceVersion": "로컬 서비스 버전",
   "about.serverVersion": "서버 버전",
   "about.platform": "실행 플랫폼",

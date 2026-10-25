@@ -3,6 +3,12 @@
 /** 构建期由 vite 注入的应用版本（真源为 package.json 的 version，见 vite.config.mts）。 */
 declare const __APP_VERSION__: string
 
+/** 构建期由 vite 注入的对外发布版本（真源为仓库根目录 RELEASE.json）。 */
+declare const __RELEASE_VERSION__: string
+
+/** 构建期由 vite 注入的发布渠道（stable / beta / rc / alpha）。 */
+declare const __RELEASE_CHANNEL__: string
+
 /**
  * 本地代理状态（由主进程提供，见 electron/agent.ts）。
  *

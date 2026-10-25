@@ -1,225 +1,228 @@
 <div align="center">
 
+**English** | [简体中文](README.zh-CN.md)
+
 # Vault
 
-**一份软件，多人共享。HDD 上的 iSCSI 热读，接近本地盘。**
+**One install, many users. Accelerate iSCSI with local SSD for read-heavy workloads.**
 
-自托管的虚拟磁盘与 iSCSI 存储平台：母盘 + 差异盘共享、客户端一键挂载、旁路读缓存加速。
+A self-hosted virtual disk and iSCSI storage platform: shared parent disks with per-user differencing disks, one-click client mounting, and a bypass read cache.
 
 [![Go](https://img.shields.io/badge/Go-1.25-00ADD8?logo=go&logoColor=white)](https://go.dev)
 ![CGO](https://img.shields.io/badge/CGO-disabled-22C55E)
 ![Server](https://img.shields.io/badge/server-Windows%20%7C%20Linux-4B5563)
 ![Client](https://img.shields.io/badge/client-Windows-0078D4?logo=windows&logoColor=white)
 
-[快速开始](#快速开始) · [核心能力](#核心能力) · [iSCSI 旁路加速](#iscsi-旁路加速) · [架构](#架构) · [文档](#文档)
+[Quick start](#quick-start) · [Core features](#core-features) · [iSCSI bypass acceleration](#iscsi-bypass-acceleration) · [Architecture](#architecture) · [Documentation](#documentation)
 
 </div>
 
-Vault 把虚拟磁盘、iSCSI 目标、用户授权、租约、配额和客户端挂载收进一个应用。共享模式下只保留一份母盘，多个用户各自拿到独立差异盘；客户端在本机加一层透明的 iSCSI 读缓存，把远端 HDD 上的热数据放到内存和 SSD。
+Vault brings virtual disks, iSCSI targets, user authorization, leases, quotas, and client mounting into one application. In shared mode there is only one parent disk, while each user gets an independent differencing disk. The client adds a transparent iSCSI read cache locally, keeping hot data from the remote HDD in memory and on SSD.
 
-它适合这些场景：
+It fits scenarios like:
 
-- 同一套软件或游戏要装在很多台机器上，不想每台都复制一份完整磁盘。
-- 想集中管理磁盘、iSCSI、账号和挂载，而不是分别操作 VHDX、Windows iSCSI Target、CHAP 和客户端脚本。
-- 服务端只有 HDD，iSCSI 的随机读又慢又受网络影响，希望热数据读起来像本地盘。
+- The same software or game must be installed on many machines, and you do not want to copy a full disk to every one.
+- You want to manage disks, iSCSI, accounts, and mounts in one place instead of juggling VHDX files, Windows iSCSI Target, CHAP, and client scripts separately.
+- The server only has HDDs, iSCSI random reads are slow and network-sensitive, and you want hot data to read like a local disk.
 
-## 核心能力
+## Core features
 
-- **共享存储库**：一份母盘作为基线，每个用户分配一块差异盘。软件只装一次，每人只写自己的改动。
-- **从目录到可挂载盘**：支持从服务端目录、客户端本地目录创建，分块上传可断点续传，上传后可以逐文件核对。
-- **一个客户端完成管理和使用**：普通用户看到自己的存储库和挂载，超级管理员在同一个应用里管理用户、存储、任务、审计和服务端配置；支持多服务端与自动更新。
-- **HDD iSCSI 旁路加速**：未命中时保持接近直连的速度，命中后直接读本机内存或 SSD，不再走网络和 HDD。
-- **服务端 SSD 缓存**：Linux 上可以把 SSD 作为 LVM thin pool 的 `dm-cache`，在块层加速 HDD。
-- **可控的在线状态**：以客户端租约心跳为准，支持撤销租约和强制下线；证书登录、审计和自动更新一并提供。
+- **Shared repositories**: one parent disk as the baseline, with a differencing disk per user. Install the software once and each user only writes their own changes.
+- **From directory to mountable disk**: create from a server-side directory or a client-side local directory, upload in chunks with resumable transfers, and verify files one by one afterwards.
+- **Manage and use from one client**: regular users see their repositories and mounts; super admins manage users, storage, jobs, audit, and server configuration in the same app. Multiple servers and automatic updates are supported.
+- **HDD iSCSI bypass acceleration**: misses stay close to direct-connect speed, while hits read from local memory or SSD without touching the network or HDD.
+- **Server-side SSD cache**: on Linux, an SSD can serve as the `dm-cache` for an LVM thin pool, accelerating the HDD at the block layer.
+- **Controllable online state**: client lease heartbeats are authoritative; leases can be revoked and sessions forced offline. Certificate login, audit, and automatic updates are included.
 
-## iSCSI 旁路加速
+## iSCSI bypass acceleration
 
-这是 Vault 最核心的设计。
+This is the core design of Vault.
 
-大多数“带缓存的 iSCSI 代理”会自己实现 Target 接住发起端，再自己实现 Initiator 连后端，所有流量都经过自研的会话状态机。缓存能生效，但登录协商、命令窗口、Data-In 分段、R2T 和序号记账中的任何一环出问题，整条链都会变慢。
+Most "cached iSCSI proxies" implement their own target to accept the initiator and their own initiator to reach the backend, so all traffic passes through a custom session state machine. Caching works, but any flaw in login negotiation, command windows, Data-In segmentation, R2T, or sequence accounting slows down the whole chain.
 
-Vault 不终止会话。发起端仍然和后端目标做完整的登录、CHAP 和参数协商，代理只在 TCP 连接旁边观察和转发：
+Vault does not terminate the session. The initiator still performs the full login, CHAP, and parameter negotiation with the backend target; the proxy only observes and forwards beside the TCP connection:
 
 ```text
-Windows 应用 / 资源管理器
+Windows application / Explorer
         │
-        │ iSCSI，连接 127.0.0.1:<随机端口>
+        │ iSCSI to 127.0.0.1:<random port>
         ▼
-Vault-Agent 本地缓存代理
+Vault-Agent local cache proxy
         │
-        │ iSCSI，连接服务端真实目标（真实 IQN，CHAP 端到端）
+        │ iSCSI to the real server target (real IQN, end-to-end CHAP)
         ▼
 Vault-Server → LIO / Windows iSCSI Target → thin LV / VHDX → HDD
 ```
 
-### 数据怎么走
+### How data flows
 
-| 场景 | 代理做什么 | 用户得到什么 |
+| Scenario | What the proxy does | What the user gets |
 | --- | --- | --- |
-| 登录 / 协商 / 写 / 未命中读 | 原样转发字节流 | 性能接近直连，CHAP 端到端完成 |
-| 读完整命中 L1 或 L2 | 吞掉命令，本地生成 Data-In 代答 | 不走网络，也不读 HDD |
-| 读部分命中 | 整条命令转发，顺带回填缓存 | 不拆分协议，下一次才可能整条命中 |
-| 协商出 digest / 多连接 / ERL>0 | 该会话永久降级为纯字节透传 | 缓存不生效，但连接和挂载正常 |
+| Login / negotiation / writes / read misses | Forward the byte stream unchanged | Near direct-connect performance, end-to-end CHAP |
+| Full read hit in L1 or L2 | Swallow the command and generate Data-In locally | No network, no HDD read |
+| Partial read hit | Forward the whole command and fill the cache along the way | No protocol splitting; a full hit becomes possible next time |
+| Negotiated digest / multiple connections / ERL>0 | Permanently degrade that session to raw byte passthrough | No caching, but connections and mounts work normally |
 
-转发不是“一帧一次系统调用”：连续到达的 PDU 会攒进批缓冲，只读缓冲里没有下一个字节时一次写出，因此不会为了凑批而等待；大帧走 gather 写。代理只在旁路读取少量头字段，不重建 PDU。
+Forwarding is not "one syscall per frame": consecutive PDUs accumulate in a batch buffer, and are written out once when the buffer has no next byte, so it never waits just to fill a batch; large frames use gather writes. The proxy only peeks at a few header fields on the side and never rebuilds PDUs.
 
-命中代答的核心是序号修正。代理本地答了一条后端从未见过的命令，两端对 CmdSN / StatSN 的计数会错位，因此代理维护“本地代答次数”偏移量：
+The key to local responses is sequence correction. When the proxy answers a command locally that the backend has never seen, the two sides' CmdSN / StatSN counters drift, so the proxy maintains an offset for the number of local responses:
 
-- 后端 → 发起端：`StatSN`、`ExpCmdSN`、`MaxCmdSN` 加上偏移量；
-- 发起端 → 后端：`CmdSN`、`ExpStatSN` 减去偏移量；
-- 登录阶段偏移量为 0，登录 PDU 完全不动。
+- Backend → initiator: add the offset to `StatSN`, `ExpCmdSN`, and `MaxCmdSN`.
+- Initiator → backend: subtract the offset from `CmdSN` and `ExpStatSN`.
+- During login the offset is 0, and login PDUs are left completely untouched.
 
-这不是重排，也不是缓存响应：被代答的命令根本没有发给后端，后端不会产生需要拦截的响应。
+This is neither reordering nor a cached response: a locally answered command is never sent to the backend, so the backend never produces a response that would need interception.
 
-### 为什么能快
+### Why it is fast
 
-**读未命中时**，命令照常发给后端，代理只旁路观察返回的 Data-In，按 `BufOffset` 把数据收进收集缓冲，完成后异步交给缓存。读命令不会为了缓存而等待，也不会产生第二次后端读。
+**On a read miss**, the command goes to the backend as usual; the proxy only observes the returned Data-In, collects data by `BufOffset`, and hands it to the cache asynchronously when complete. Read commands never wait for the cache and never cause a second backend read.
 
-**读命中时**，数据来自两级缓存：
+**On a read hit**, data comes from two cache tiers:
 
-| 层级 | 位置 | 作用 |
+| Tier | Location | Role |
 | --- | --- | --- |
-| L1 | 客户端内存 | 最热的数据，直接从内存返回 |
-| L2 | 客户端本地 SSD / NVMe 文件 | 温热数据，命中后从本地盘返回，并提升到 L1 |
+| L1 | Client memory | Hottest data, returned directly from memory |
+| L2 | Local client SSD / NVMe file | Warm data, returned from the local disk on hit and promoted to L1 |
 
-L1 使用 64 KiB 块、4 KiB 扇区，按扇区记录有效位，淘汰使用 S3-FIFO，避免一次性顺序扫描冲掉热区。L2 是固定大小的本地缓存文件，索引跨重启保留；L1 在正常停止或卸载时写快照，下次启动可以装回内存。
+L1 uses 64 KiB blocks and 4 KiB sectors, tracks validity per sector, and evicts with S3-FIFO so a one-off sequential scan does not flush the hot set. L2 is a fixed-size local cache file whose index survives restarts; L1 writes a snapshot on clean shutdown or unmount and can be loaded back into memory on the next start.
 
-### 面向 HDD 的 L2 布局
+### L2 layout for HDDs
 
-如果 L2 按到达顺序分配槽位，缓存用久了会把同一个 1 MiB 读拆成很多互不相关的 64 KiB 本地读，热区数据也会被写到文件各处，最后本地 SSD 也在做随机 IO。
+If L2 allocates slots in arrival order, a long-running cache splits the same 1 MiB read into many unrelated 64 KiB local reads, and hot data gets scattered across the file until even the local SSD is doing random I/O.
 
-Vault 的 L2 采用**区域归位布局**：把 LBA 空间按区域划分，同一区域内的相邻块在缓存文件里也物理相邻。
+Vault's L2 uses a **region-homing layout**: the LBA space is divided into regions, and adjacent blocks in the same region are physically adjacent in the cache file.
 
 ```text
-LBA 区域 R（默认 128 个块，8 MiB）
-  块 i 的物理位置 = 该区域的固定起点 + i
+LBA region R (128 blocks, 8 MiB by default)
+  physical location of block i = fixed start of the region + i
 ```
 
-命中一段连续的 LBA，就是一段连续的物理字节，一次读可以合并成一个大传输，默认上限 1 MiB；同一区域被反复访问时位置保持稳定，不会因为环形分配被不断打散。代价是区域内的空槽不能挪给别的区域，热区只占区域一小部分时会浪费一些容量。
+Hitting a contiguous LBA range means reading a contiguous physical byte range, so one read can merge into a large transfer with a default cap of 1 MiB. A region that is accessed repeatedly keeps a stable position instead of being scattered by ring allocation. The cost is that free slots in a region cannot be lent to another region, so a hot set occupying only a small part of a region wastes some capacity.
 
-配合顺序扫描准入：连续的大顺序流只透传、不填充，避免全盘扫描冲掉真正的热区。扫描本身的带宽仍然走直连。
+This works with sequential-scan admission: long sequential streams are passed through without filling the cache, so a full-disk scan cannot flush the real hot set. The scan itself still gets direct-connect bandwidth.
 
-### 写路径与一致性
+### Write path and consistency
 
-Vault 的读缓存不接收写数据。写命令的规则是：
-
-```text
-写命令 → 解析覆盖范围 → 失效对应缓存 → 原样转发后端 → 返回结果
-```
-
-- L1 的失效是同步的，保证“写完立刻读”不会读到旧值。
-- L2 的失效放到后台，读路径用门控拦住尚未完成失效的旧扇区，不拖慢每一次写。
-- 不存在脏块，不存在 writeback，不存在“掉电后还有没写回的数据”。
-- 无法解析范围的命令会让缓存整盘失效一次，宁可冷掉，也不返回旧数据。
-- 缓存命名空间绑定后端 IQN、VPD 序列号/WWID、容量和逻辑块大小，换盘后的旧缓存不会被装回来。
-- L2 先写数据再写提交记录，记录带 CRC；崩溃后先验证，验证不通过就当未命中。
-
-### 配额与降级
-
-缓存预算是这台客户端所有库共享的总上限，默认 L1 = 512 MiB、L2 = 4 GiB，按库容量占比分摊。每个库默认开启缓存，可以单独关闭；L2 设为 0 表示只保留内存缓存。
-
-客户端展示当前占用、配额、读命中率、读写 IOPS、峰值吞吐和近 5 分钟曲线。清空缓存不需要卸载或重登。
-
-代理注册失败（端口占用、配额不足等）时回退直连；如果本机门户已经启用但后端连不上，挂载会显示连接阶段错误和后端门户可达性诊断，不会把缓存故障伪装成挂载成功。
-
-### 与服务端 dm-cache 的关系
-
-Linux 服务端可以把 SSD 作为 LVM thin pool 的 `dm-cache`，在块层缓存 HDD 数据。它和客户端旁路缓存解决的是两段不同的问题：
-
-- 服务端 `dm-cache`：减少 HDD 读，但数据仍要经过网络。
-- 客户端旁路缓存：命中后连网络都不用走，按每台机器的热区独立生效。
-
-两者可以同时使用。Windows 服务端没有等价的 `dm-cache` 能力，HDD 加速主要依靠客户端旁路缓存。
-
-## 共享存储库
-
-Vault 对用户暴露的概念不是 VHDX 或 iSCSI target，而是存储库：
+Vault's read cache does not accept write data. Write commands follow this rule:
 
 ```text
-存储库 = 母盘/独享盘 + 差异盘 + iSCSI 目标 + 分配 + 鉴权 + 配额 + 客户端挂载参数
+write command → parse the covered range → invalidate the matching cache → forward to the backend unchanged → return the result
 ```
 
-| 模式 | 结构 | 适合 |
+- L1 invalidation is synchronous, so "write then immediately read" never returns stale data.
+- L2 invalidation runs in the background; the read path gates sectors whose invalidation has not completed, so every write is not slowed down.
+- There are no dirty blocks, no writeback, and no "data still waiting to be written back after a power loss".
+- A command whose range cannot be parsed invalidates the entire disk cache once; we prefer a cold cache over stale data.
+- The cache namespace is bound to the backend IQN, VPD serial/WWID, capacity, and logical block size, so an old cache is never restored after a disk swap.
+- L2 writes data before the commit record, and the record carries a CRC; after a crash the record is verified first, and a failed verification is treated as a miss.
+
+### Quotas and fallback
+
+The cache budget is a shared upper bound for all repositories on this client: L1 = 512 MiB and L2 = 4 GiB by default, split by repository capacity share. Caching is enabled per repository by default and can be disabled individually; setting L2 to 0 keeps only the memory cache.
+
+The client shows current usage, quota, read hit rate, read/write IOPS, peak throughput, and the last 5 minutes of charts. Clearing the cache does not require unmounting or logging in again.
+
+If proxy registration fails (port in use, insufficient quota, and so on), Vault falls back to a direct connection. If the local portal is enabled but the backend is unreachable, mounting reports a connection-stage error and a backend portal reachability diagnosis instead of pretending the cache failure was a successful mount.
+
+### Relationship to server-side dm-cache
+
+A Linux server can use an SSD as the `dm-cache` for an LVM thin pool, caching HDD data at the block layer. It and the client bypass cache solve two different parts of the problem:
+
+- Server `dm-cache`: reduces HDD reads, but data still crosses the network.
+- Client bypass cache: a hit does not even touch the network, and it works independently per machine's hot set.
+
+The two can be used together. A Windows server has no equivalent `dm-cache` capability, so HDD acceleration relies mainly on the client bypass cache.
+
+## Shared repositories
+
+Vault exposes repositories to users rather than VHDX files or iSCSI targets:
+
+```text
+repository = parent disk/dedicated disk + differencing disk + iSCSI target + allocation + authorization + quota + client mount parameters
+```
+
+| Mode | Structure | Best for |
 | --- | --- | --- |
-| 共享库 | 一份母盘 + 多块差异盘，每个用户一块 | 同一套软件/游戏给多人使用 |
-| 独享库 | 单块磁盘 + 单 iSCSI 目标 | 一个人独占一块盘 |
+| Shared repository | One parent disk + multiple differencing disks, one per user | The same software/game used by several people |
+| Dedicated repository | One disk + one iSCSI target | One person exclusively using one disk |
 
-共享库在建库时可以预创建差异盘池和对应的 iSCSI 目标，分配时直接占用，不需要现场建盘。用户读到的是“母盘 + 自己的差异盘”的合并视图，写入只落在自己的差异盘。释放时，池化库会把差异盘重置回池，下一位用户拿到干净盘。
+When creating a shared repository, you can pre-create a differencing disk pool and the matching iSCSI targets, so an allocation takes an existing disk instead of building one on the spot. Users see the merged view of "parent disk + their own differencing disk", and writes only go to their differencing disk. On release, a pooled repository resets the differencing disk back into the pool so the next user gets a clean disk.
 
-更新母盘时进入维护态：禁止新的分配和挂载，清理旧版本差异盘，更新母盘内容。退出维护会递增母盘版本，之后分配按新版本生成差异盘。维护态的母盘文件管理在服务端完成，不需要把母盘挂到客户端。
+Updating the parent disk enters maintenance mode: new allocations and mounts are blocked, old-version differencing disks are cleaned up, and the parent disk content is updated. Leaving maintenance increments the parent version; later allocations create differencing disks from the new version. Parent disk file management in maintenance mode happens on the server, so the parent never has to be mounted on a client.
 
-## 使用流程
+## Workflow
 
-1. **建库**：选择空盘、服务端目录，或从客户端本地目录上传；共享库设置共享数量。
-2. **分配**：选择用户，系统分配差异盘和独立的 iSCSI 目标，并下发挂载参数。
-3. **挂载**：客户端登录后选择盘符或目录，自动完成 iSCSI 连接和磁盘上线。
-4. **日常使用**：支持自动挂载、分组配置、挂载后脚本；需要更新母盘时进入维护态。
+1. **Create a repository**: choose an empty disk, a server directory, or upload from a client local directory; set the share count for a shared repository.
+2. **Allocate**: pick a user; the system allocates a differencing disk and an independent iSCSI target and delivers the mount parameters.
+3. **Mount**: after signing in, the client chooses a drive letter or directory and completes the iSCSI connection and disk online steps automatically.
+4. **Daily use**: auto-mount, group configuration, and post-mount scripts are supported; enter maintenance mode when the parent disk needs an update.
 
-## 架构
+## Architecture
 
 ```text
-┌──────────────────────── Windows 客户端 ────────────────────────┐
-│  Electron 界面（用户视图 / 管理视图）                          │
+┌──────────────────────── Windows client ────────────────────────┐
+│  Electron UI (user view / admin view)                          │
 │                                                                │
 │  Vault-Agent                                                   │
-│    ├─ 挂载、卸载、租约心跳、自动挂载、自动更新                 │
-│    └─ iSCSI 旁路读缓存（仅监听 127.0.0.1）                     │
-│         ├─ 默认：TCP 字节透传                                  │
-│         ├─ 读全命中：本地生成 Data-In 代答                     │
-│         └─ 读未命中：透传 + 旁路回填                           │
+│    ├─ mount, unmount, lease heartbeat, auto-mount, update      │
+│    └─ iSCSI bypass read cache (127.0.0.1 only)                 │
+│         ├─ default: raw TCP passthrough                        │
+│         ├─ full read hit: local Data-In response               │
+│         └─ read miss: passthrough + bypass fill                │
 └───────────────┬───────────────────────────┬────────────────────┘
-                │ HTTPS + SSE（控制面）      │ iSCSI（数据面）
+                │ HTTPS + SSE (control)     │ iSCSI (data)
 ┌───────────────▼───────────────────────────▼────────────────────┐
 │ Vault-Server                                                   │
-│   存储库 / 分配 / 租约 / 任务 / 用户 / 证书 / 审计             │
+│   repositories / allocations / leases / jobs / users /         │
+│   certificates / audit                                         │
 │                                                                │
-│   平台后端（由构建产物选择）                                    │
-│     Windows：VHDX + Windows iSCSI Target                       │
-│     Linux  ：LVM thin LV + LIO                                 │
+│   Platform backend (selected at build time)                    │
+│     Windows: VHDX + Windows iSCSI Target                       │
+│     Linux  : LVM thin LV + LIO                                 │
 │                                                                │
-│   数据盘：HDD（Linux 可选 SSD 作为 dm-cache）                   │
+│   Data disks: HDD (Linux can use SSD as dm-cache)              │
 └────────────────────────────────────────────────────────────────┘
 ```
 
-### 平台支持
+### Platform support
 
 | | Windows | Linux |
 | --- | --- | --- |
-| 服务端虚拟磁盘 | VHDX（VirtDisk API） | LVM thin LV |
-| 差异盘 | VHDX 差异盘 | thin 快照 |
-| iSCSI 目标 | Windows iSCSI Target | LIO（configfs + targetcli） |
-| 会话枚举 / 强制登出 | 不支持，以客户端租约为准 | LIO 支持，作为交叉校验 |
-| 服务端 SSD 缓存 | — | dm-cache |
-| 客户端 | Windows 10/11 | 尚未实现 |
+| Server virtual disk | VHDX (VirtDisk API) | LVM thin LV |
+| Differencing disk | VHDX differencing disk | thin snapshot |
+| iSCSI target | Windows iSCSI Target | LIO (configfs + targetcli) |
+| Session enumeration / forced logout | Not supported; client leases are authoritative | LIO supports it and it is used for cross-checking |
+| Server-side SSD cache | — | dm-cache |
+| Client | Windows 10/11 | Not implemented yet |
 
-## 快速开始
+## Quick start
 
-### 依赖
+### Requirements
 
 - Go 1.25+
-- Node.js 20+、pnpm
+- Node.js 20+, pnpm
 - Python 3.10+
-- 客户端：Windows 10/11，启用 Microsoft iSCSI Initiator
+- Client: Windows 10/11 with Microsoft iSCSI Initiator enabled
 
-### 构建
+### Build
 
 ```bash
-python build.py                 # 前端 + 服务端 + 客户端
-python build.py --skip-frontend # 只构建 Go 二进制
-python build.py --package-all   # Windows / Linux 服务端包 + 客户端安装包
+python build.py                 # frontend + server + client
+python build.py --skip-frontend # Go binaries only
+python build.py --package-all   # Windows / Linux server packages + client installer
 ```
 
-构建产物在 `dist/`。
+Build artifacts are written to `dist/`.
 
-### 启动服务端
+### Start the server
 
-Windows Server 需要安装并启动 **iSCSI Target Server** 角色（`FS-iSCSITarget-Server`）。
+Windows Server requires the **iSCSI Target Server** role (`FS-iSCSITarget-Server`) to be installed and started.
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-最小配置示例：
+Minimal configuration example:
 
 ```yaml
 http:
@@ -234,7 +237,7 @@ platform:
   kind: "auto"
 ```
 
-路径按当前平台填写：Windows 使用 `D:\VaultData`，Linux 使用 `/var/lib/vault` 这类绝对路径。
+Use absolute paths for the current platform: `D:\VaultData` on Windows, or something like `/var/lib/vault` on Linux.
 
 ```bash
 # Windows
@@ -244,27 +247,27 @@ Vault-Server.exe -config .\config.yaml
 ./vault-server -config ./config.yaml
 ```
 
-Linux 首次部署先准备 LVM2、`targetcli`、LIO 内核模块和 `configfs`：
+On first deployment on Linux, prepare LVM2, `targetcli`, the LIO kernel modules, and `configfs`:
 
 ```bash
 sudo ./scripts/setup.sh
 ./vault-server doctor
 ```
 
-### 连接客户端
+### Connect the client
 
-安装构建出的客户端，输入服务端地址，核对 TLS 指纹并登录。服务端还没有超级管理员时，客户端会引导完成初始化；之后即可创建存储库、分配用户并挂载。
+Install the built client, enter the server address, verify the TLS fingerprint, and sign in. If the server has no super admin yet, the client guides you through initialization; after that you can create repositories, allocate users, and mount.
 
-服务端只提供 REST API 和 SSE，不提供网页管理入口，管理和使用都在客户端完成。
+The server exposes only REST APIs and SSE, with no web admin UI. Administration and daily use both happen in the client.
 
-## 开发
+## Development
 
 ```bash
-# iSCSI 代理与缓存
+# iSCSI proxy and cache
 go test ./internal/iscsiproxy/...
 go test ./internal/iscsicache/...
 
-# 前端
+# frontend
 cd frontend
 pnpm install
 pnpm typecheck
@@ -272,57 +275,71 @@ pnpm build
 ```
 
 <details>
-<summary>项目结构</summary>
+<summary>Project layout</summary>
 
 ```text
 cmd/
-  vault-server/            服务端入口
-  vault-agent/             客户端本地代理入口（含缓存代理）
-  vault-iscsi-cache/       独立的缓存代理验证入口
+  vault-server/            server entry point
+  vault-agent/             client local agent entry point (including the cache proxy)
+  vault-iscsi-cache/       standalone cache proxy verification entry point
 
 internal/
-  iscsiproxy/              iSCSI 旁路透传、命中代答、序号改写、tee 回填
+  iscsiproxy/              iSCSI bypass passthrough, hit responses, sequence rewriting, tee fill
   iscsicache/
-    cache/                 L1/L2 读缓存、S3-FIFO、失效、L1 快照
-    l2/                    L2 文件布局、stamp、索引、区域归位
-    identity/              后端盘身份命名空间
-    iscsi/                 PDU / SCSI 编解码
+    cache/                 L1/L2 read cache, S3-FIFO, invalidation, L1 snapshots
+    l2/                    L2 file layout, stamps, index, region homing
+    identity/              backend disk identity namespace
+    iscsi/                 PDU / SCSI codecs
   platform/
-    winvhd/ winps/         Windows VHDX 与 PowerShell 后端
+    winvhd/ winps/         Windows VHDX and PowerShell backend
     linuxlvm/              LVM thin / dm-cache
-    liotarget/             LIO iSCSI 目标
-  app/ api/ domain/ store/ 业务服务、HTTP API、领域模型、数据库
-  agent/                   客户端挂载、租约、自动更新、缓存管理
+    liotarget/             LIO iSCSI target
+  app/ api/ domain/ store/ business services, HTTP API, domain models, database
+  agent/                   client mounting, leases, auto-update, cache management
 
 frontend/
-  apps/client/             Electron 客户端
-  packages/ui/             用户界面与管理界面共用组件
+  apps/client/             Electron client
+  packages/ui/             shared components for the user and admin UIs
 ```
 
 </details>
 
-## 文档
+## Release
 
-| 文档 | 内容 |
+The public release version lives in [`RELEASE.json`](RELEASE.json) (`version` + `channel`), while the internal build number in `VERSION` still drives auto-update and compatibility checks. The sidebar shows the public version with a channel tag; the About page shows the internal build number.
+
+```bash
+python release.py                        # build and stage release/v0.1.0-beta/
+python release.py --version 0.2.0 --channel beta
+python release.py --skip-build           # stage existing dist/package artifacts only
+python release.py --with-linux           # also include the Linux server tarball
+```
+
+The output directory contains the two zips, `SHA256SUMS.txt`, and a ready-to-edit `RELEASE_NOTES.md`. Upload them to GitHub Releases manually, or run the printed `gh release create` command. The script never publishes by itself.
+
+For a real release, signing keys must already exist (`keys/update-private.pem` + `keys/update-public.txt`) or be passed with `--key`; the script refuses to generate a temporary key unless `--allow-keygen` is given.
+
+## Documentation
+
+| Document | Contents |
 | --- | --- |
-| [产品设计](docs/design.md) | 目标、角色、存储库与客户端设计 |
-| [实施文档](docs/implementation.md) | 架构、数据模型、平台实现与边界 |
-| [客户端代理 API](docs/agent-api.md) | 本地挂载、缓存、状态与事件接口 |
-| [iSCSI 缓存设计](docs/iscsi-cache/iscsi_cache_v2_design.md) | 旁路代理、序号修正、故障降级 |
-| [L2 区域归位布局](docs/iscsi-cache/l2_region_layout_design.md) | 把 L2 命中变成顺序读 |
-| [Windows iSCSI/VHDX 边界](docs/windows-iscsi-vhdx-api.md) | Windows 平台能力与限制 |
+| [Product design](docs/design.md) | Goals, roles, repositories, and client design |
+| [Implementation](docs/implementation.md) | Architecture, data model, platform implementation, and boundaries |
+| [Client agent API](docs/agent-api.md) | Local mounting, cache, state, and event APIs |
+| [iSCSI cache design](docs/iscsi-cache/iscsi_cache_v2_design.md) | Bypass proxy, sequence correction, failure fallback |
+| [L2 region layout](docs/iscsi-cache/l2_region_layout_design.md) | Turning L2 hits into sequential reads |
+| [Windows iSCSI/VHDX boundaries](docs/windows-iscsi-vhdx-api.md) | Windows platform capabilities and limits |
 
-## 当前边界
+## Current limitations
 
-- 客户端目前只提供 Windows 版本；Linux 服务端已支持，Linux 客户端尚未实现。
-- 缓存只加速读；写始终直达后端，不提供 writeback。
-- 首次读、冷数据、一次性大顺序扫描不会被加速。
-- 一个分配按单客户端挂载设计；多客户端同时写同一 LUN 不在缓存一致性保证范围内。
-- 缓存不可用时优先回退直连；如果已经选中本机门户但后端连不上，会按连接错误显示，并给出后端门户的可达性诊断。
+- The client is currently Windows-only; Linux servers are supported, but a Linux client has not been implemented.
+- Caching accelerates reads only; writes always go directly to the backend, with no writeback.
+- First reads, cold data, and one-off large sequential scans are not accelerated.
+- An allocation is designed for a single client mount; concurrent writes to the same LUN from multiple clients are outside the cache coherence guarantee.
+- When the cache is unavailable, Vault prefers falling back to a direct connection. If the local portal is selected but the backend is unreachable, it reports a connection error and a backend portal reachability diagnosis.
 
-## 许可证
+## License
 
-本项目采用 [PolyForm Noncommercial License 1.0.0](LICENSE)：个人学习、研究、实验，以及慈善、教育、公共研究、公共安全/健康、环保和政府机构等非商业用途可以免费使用。
+This project is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). Personal study, research, experimentation, and noncommercial use by charitable, educational, public research, public safety/health, environmental protection, and government institutions are free of charge.
 
-**任何商业用途都需要单独的商业授权**，包括但不限于商业产品集成、企业内部商业运营、对外提供付费或带商业目的的服务。商业授权请联系项目维护者：[github.com/junqirao/vault](https://github.com/junqirao/vault)。
-
+**Any commercial use requires a separate commercial license**, including but not limited to integration into commercial products, internal commercial operations, and paid or otherwise commercially motivated services. For commercial licensing, contact the maintainer at [github.com/junqirao/vault](https://github.com/junqirao/vault).

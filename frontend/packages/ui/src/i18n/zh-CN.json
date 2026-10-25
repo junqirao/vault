@@ -4,7 +4,7 @@
   "app.loading": "正在加载…",
   "about.title": "关于 Vault",
   "about.versionSection": "版本",
-  "about.clientVersion": "客户端版本",
+  "about.clientVersion": "内部版本",
   "about.localServiceVersion": "本地服务版本",
   "about.serverVersion": "服务端版本",
   "about.platform": "运行平台",
