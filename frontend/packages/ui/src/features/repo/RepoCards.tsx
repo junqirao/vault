@@ -674,17 +674,20 @@ function RepoShortcutButton({
 /**
  * 建库进度：把服务端"预创建"的三个阶段摊给用户看（建母盘 → 派生差异盘 → 建 iSCSI 目标）。
  *
- * 只在 state=creating 且拿到进度时有意义：建库是个几十秒到几分钟的异步过程，
- * 只显示"建库中"三个字，用户无法区分"在建"和"卡住了"。
+ * 建库是个几十秒到几分钟的异步过程，只显示"建库中"三个字，用户无法区分"在建"和"卡住了"。
  *
- * **本机正在上传这一份时不走这里**：那一刻卡片上要的是上传进度，它报在「已用」那一格里
- * （见 RepoUsage 的 upload 分支 / RepoProgress）。一行里只留一条进度，不叠两条；
- * 看别人的库建到哪一步的人没有上传任务，仍然是这一条。
+ * 两种库都会走到这里：
+ * - state=creating：别人在界面上新建的库（建库任务自己在推进）；
+ * - state=importing：本机上传出来的库，收尾时服务端同样在派生池位、下发目标。
+ *
+ * **上传的字节阶段不走这里**：那一刻卡片上要的是上传进度，它报在「已用」那一格里
+ * （见 RepoUsage 的 upload 分支 / RepoProgress）。一行里只留一条进度，不叠两条。
  */
 function RepoPrepareProgress({ repo }: { repo: RepoDTO }): JSX.Element | null {
   const { t } = useI18n()
   const prepare = repo.prepare
-  if (repo.state !== 'creating' || !prepare) return null
+  if (!prepare) return null
+  if (repo.state !== 'creating' && repo.state !== 'importing') return null
   const percent = prepare.total > 0 ? Math.min(100, Math.round((prepare.done / prepare.total) * 100)) : 0
 
   return (
@@ -917,9 +920,9 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
         style={{ marginTop: spacing.md }}
       />
 
-      {/* 建库进度条只在**没有**本机上传时出现：上传中的库，进度已经由上面那一格在报了，
-          再画一条就是同一件事说两遍，还会把这张卡撑得比别的卡高。 */}
-      {upload ? null : <RepoPrepareProgress repo={repo} />}
+      {/* 字节在传的时候进度已经由上面那一格在报，不叠第二条；一旦进入收尾（completing），
+          字节早已 100%，这一条才接手说明"池位建到第几个"。 */}
+      {upload && upload.state !== 'completing' ? null : <RepoPrepareProgress repo={repo} />}
 
       <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.sm }} />
 
@@ -975,10 +978,9 @@ function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onCon
               <RepoTagRow repo={repo} controller={mountController} upload={upload} />
             </span>
           </div>
-          {/* 建库进度条只在**没有**本机上传时出现（与卡片同一处判断）：上传中的库，进度由右边
-              那一格在报。左栏于是始终只有"名称行 + 次要信息行"，上传中的行与别的行等高，
-              名字、条、次要信息三样都横向对齐。 */}
-          {upload ? null : <RepoPrepareProgress repo={repo} />}
+          {/* 与卡片同一处判断：字节传输中由右边那一格报进度；收尾阶段才由这条接上，
+              说明池位建到第几个。 */}
+          {upload && upload.state !== 'completing' ? null : <RepoPrepareProgress repo={repo} />}
           <RepoMetaLine repo={repo} controller={mountController} style={{ marginTop: spacing.xxs }} />
         </div>
 

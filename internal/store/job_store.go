@@ -283,7 +283,7 @@ func (s *Store) ListJobs(ctx context.Context, state domain.JobState, limit, offs
 // ---------- uploads ----------
 
 const uploadCols = `id, user_id, repo_name, mode, total_files, total_bytes, received_bytes,
-	staging_dir, manifest, state, created_at, updated_at`
+	staging_dir, repo_id, disk_id, mount_root, manifest, state, created_at, updated_at`
 
 // CreateUpload 创建上传会话。
 func (s *Store) CreateUpload(ctx context.Context, u *domain.Upload) error {
@@ -302,7 +302,8 @@ func (s *Store) CreateUpload(ctx context.Context, u *domain.Upload) error {
 	_, err := s.q.NamedExecContext(ctx,
 		`INSERT INTO uploads (`+uploadCols+`)
 		 VALUES (:id, :user_id, :repo_name, :mode, :total_files, :total_bytes, :received_bytes,
-		         :staging_dir, :manifest, :state, :created_at, :updated_at)`,
+		         :staging_dir, :repo_id, :disk_id, :mount_root, :manifest, :state,
+		         :created_at, :updated_at)`,
 		map[string]any{
 			"id":             u.ID,
 			"user_id":        u.UserID,
@@ -312,6 +313,9 @@ func (s *Store) CreateUpload(ctx context.Context, u *domain.Upload) error {
 			"total_bytes":    u.TotalBytes,
 			"received_bytes": u.ReceivedBytes,
 			"staging_dir":    u.StagingDir,
+			"repo_id":        u.RepoID,
+			"disk_id":        u.DiskID,
+			"mount_root":     u.MountRoot,
 			"manifest":       u.Manifest,
 			"state":          u.State,
 			"created_at":     u.CreatedAt,
@@ -334,6 +338,9 @@ func (s *Store) GetUpload(ctx context.Context, id string) (*domain.Upload, error
 		TotalBytes    int64  `db:"total_bytes"`
 		ReceivedBytes int64  `db:"received_bytes"`
 		StagingDir    string `db:"staging_dir"`
+		RepoID        string `db:"repo_id"`
+		DiskID        string `db:"disk_id"`
+		MountRoot     string `db:"mount_root"`
 		Manifest      string `db:"manifest"`
 		State         string `db:"state"`
 		CreatedAt     int64  `db:"created_at"`
@@ -347,8 +354,24 @@ func (s *Store) GetUpload(ctx context.Context, id string) (*domain.Upload, error
 		ID: row.ID, UserID: row.UserID, RepoName: row.RepoName, Mode: row.Mode,
 		TotalFiles: row.TotalFiles, TotalBytes: row.TotalBytes, ReceivedBytes: row.ReceivedBytes,
 		StagingDir: row.StagingDir, Manifest: row.Manifest, State: row.State,
+		RepoID: row.RepoID, DiskID: row.DiskID, MountRoot: row.MountRoot,
 		CreatedAt: row.CreatedAt, UpdatedAt: row.UpdatedAt,
 	}, nil
+}
+
+// SetUploadTarget 记下本次上传正在写的母盘与挂载根。
+//
+// 这三列是"直接写母盘"的锚点：写完才发分块（PutChunk 靠 MountRoot 定位目标文件），
+// 所以必须在返回会话之前落库 —— 否则服务端一重启就找不到盘挂在哪了。
+func (s *Store) SetUploadTarget(ctx context.Context, id, repoID, diskID, mountRoot string) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE uploads SET repo_id = ?, disk_id = ?, mount_root = ?, updated_at = ?
+		            WHERE id = ?`),
+		repoID, diskID, mountRoot, nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新上传目标失败: %w", err)
+	}
+	return mustAffect(res, apperr.UploadNotFound().WithArg("id", id))
 }
 
 // UpdateUploadState 更新上传会话状态。
@@ -406,6 +429,9 @@ func (s *Store) ListUploadsByUser(ctx context.Context, userID, state string) ([]
 		TotalBytes    int64  `db:"total_bytes"`
 		ReceivedBytes int64  `db:"received_bytes"`
 		StagingDir    string `db:"staging_dir"`
+		RepoID        string `db:"repo_id"`
+		DiskID        string `db:"disk_id"`
+		MountRoot     string `db:"mount_root"`
 		Manifest      string `db:"manifest"`
 		State         string `db:"state"`
 		CreatedAt     int64  `db:"created_at"`
@@ -420,6 +446,7 @@ func (s *Store) ListUploadsByUser(ctx context.Context, userID, state string) ([]
 			ID: r.ID, UserID: r.UserID, RepoName: r.RepoName, Mode: r.Mode,
 			TotalFiles: r.TotalFiles, TotalBytes: r.TotalBytes, ReceivedBytes: r.ReceivedBytes,
 			StagingDir: r.StagingDir, Manifest: r.Manifest, State: r.State,
+			RepoID: r.RepoID, DiskID: r.DiskID, MountRoot: r.MountRoot,
 			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}
@@ -459,6 +486,9 @@ func (s *Store) ListStaleUploads(ctx context.Context, cutoff int64, limit int) (
 		TotalBytes    int64  `db:"total_bytes"`
 		ReceivedBytes int64  `db:"received_bytes"`
 		StagingDir    string `db:"staging_dir"`
+		RepoID        string `db:"repo_id"`
+		DiskID        string `db:"disk_id"`
+		MountRoot     string `db:"mount_root"`
 		Manifest      string `db:"manifest"`
 		State         string `db:"state"`
 		CreatedAt     int64  `db:"created_at"`
@@ -473,6 +503,7 @@ func (s *Store) ListStaleUploads(ctx context.Context, cutoff int64, limit int) (
 			ID: r.ID, UserID: r.UserID, RepoName: r.RepoName, Mode: r.Mode,
 			TotalFiles: r.TotalFiles, TotalBytes: r.TotalBytes, ReceivedBytes: r.ReceivedBytes,
 			StagingDir: r.StagingDir, Manifest: r.Manifest, State: r.State,
+			RepoID: r.RepoID, DiskID: r.DiskID, MountRoot: r.MountRoot,
 			CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 		})
 	}

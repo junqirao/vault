@@ -91,6 +91,11 @@ func TestUploadReusable(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			id, _ := seedUploadSession(t, st, user, "repo-"+c.name, 1, 10, c.state)
+			// 新流程的会话都带母盘目标（数据直接写进盘里）；没有它的会话按升级前的旧会话
+			// 处理，一律不复用（见 uploadReusable）。
+			if err := st.SetUploadTarget(ctx, id, "", "dk-"+c.name, filepath.Join(t.TempDir(), "mnt")); err != nil {
+				t.Fatalf("设置上传目标失败：%v", err)
+			}
 			if c.storageID != "" {
 				// 会话自己记着 storage_id（st-1），本次上传要求落到 st-2：不复用。
 				raw, err := st.GetUpload(ctx, id)
@@ -130,6 +135,18 @@ func TestPrepareUploadNameReusesMatchingSession(t *testing.T) {
 	ctx := context.Background()
 	user := seedUploadUser(t, st, "tester")
 	uploadID, staging := seedUploadSession(t, st, user, "No Mans Sky", 3, 4096, domain.UploadStateOpen)
+	// 会话记着的母盘必须真实存在：复用前会回查它（用户把失败残骸删掉之后就不该再续传）。
+	scratchRepo := seedUploadRepo(t, st, user, "reuse-scratch", domain.RepoStateActive)
+	if err := st.CreateDisk(ctx, &domain.Disk{
+		ID: "dk-nms", RepoID: scratchRepo, Kind: domain.DiskKindParent,
+		VHDXPath: filepath.Join(t.TempDir(), "base.vhdx"), SizeBytes: 1 << 20,
+		State: domain.DiskStateReady,
+	}); err != nil {
+		t.Fatalf("建磁盘记录失败：%v", err)
+	}
+	if err := st.SetUploadTarget(ctx, uploadID, scratchRepo, "dk-nms", filepath.Join(t.TempDir(), "mnt")); err != nil {
+		t.Fatalf("设置上传目标失败：%v", err)
+	}
 
 	plan, err := svc.prepareUploadName(ctx, user, "No Mans Sky", 3, 4096, "")
 	if err != nil {
@@ -264,7 +281,8 @@ func TestPrepareUploadNamePurgesRemnantRepo(t *testing.T) {
 }
 
 // TestPrepareUploadNameAllowsOverwriteForIdleRepo 覆盖"上次库建成了、这次重传同一个名字"：
-// 本人 + 没人用（无租约/未挂载/没分配过盘）→ 放行，由建库任务就地重建母盘，库记录不删。
+// 本人 + 没人用（无租约/未挂载/没分配过盘）→ 放行。新流程在 CreateUpload 里就要建盘并挂载，
+// 旧库/旧盘必须先清干净，所以这里期望"库记录被删、随本次上传重建"，而不是就地复用。
 func TestPrepareUploadNameAllowsOverwriteForIdleRepo(t *testing.T) {
 	svc, st := newUploadNameTestService(t)
 	ctx := context.Background()
@@ -278,8 +296,8 @@ func TestPrepareUploadNameAllowsOverwriteForIdleRepo(t *testing.T) {
 	if !plan.overwrite {
 		t.Fatal("空壳库应允许被本次上传覆盖重建")
 	}
-	if _, err := st.GetRepository(ctx, repoID); err != nil {
-		t.Fatalf("已建成的库不应被删除（由建库任务就地重建母盘）：%v", err)
+	if _, err := st.GetRepository(ctx, repoID); !isNotFound(err) {
+		t.Fatalf("旧库应被清掉、随本次上传重建，实际 err=%v", err)
 	}
 }
 

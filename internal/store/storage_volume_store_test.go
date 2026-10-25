@@ -75,7 +75,8 @@ func TestMigrateFromV8RewritesDerivedCondition(t *testing.T) {
 		t.Fatalf("插入存储库失败: %v", err)
 	}
 	// 把版本退回 v8，让下一次 Migrate 走 v9 的增量路径。
-	if _, err := s.DB().ExecContext(ctx, `DELETE FROM schema_version WHERE version = 9`); err != nil {
+	if _, err := s.DB().ExecContext(ctx,
+		s.DB().Rebind(`DELETE FROM schema_version WHERE version = ?`), currentSchemaVersion); err != nil {
 		t.Fatalf("回退版本号失败: %v", err)
 	}
 

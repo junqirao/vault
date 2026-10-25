@@ -148,16 +148,15 @@ const uploadPlanCacheMax = 16
 
 // uploadPlanEntry 是 planFor 的一条缓存：映射本身、是否旧模式、写入时刻（淘汰用）。
 type uploadPlanEntry struct {
-	files  []uploadFile
-	legacy bool
-	at     time.Time
+	files []uploadFile
+	at    time.Time
 }
 
 // UploadService 负责分块上传会话的编排与「由目录内容建盘」的异步任务（见 5.10）。
 //
-// 暂存目录位于 storage.staging_dir（相对白名单根），与 disks 目录同卷：
-// 上传的分块**直接就位写入暂存目录下的文件树**（见 PutChunk），完成时把 tree 交给建盘任务
-// 复制（见 5.10 要点）。
+// 会话一创建就建好母盘并挂载（见 provisionUploadTarget），上传的分块**直接就位写入母盘**
+// （见 PutChunk），因此全程只写一次盘：完成时只剩卸载、打标与登记，不再有整树拷贝。
+// 升级前创建的旧会话仍以 staging_dir 为工作副本，两条路径并行兼容。
 type UploadService struct {
 	Deps
 	Disks *DiskService
@@ -171,6 +170,13 @@ type UploadService struct {
 	// 网络再快也跑不满。
 	planMu    sync.Mutex
 	planCache map[string]uploadPlanEntry
+
+	// mounts 记录"上传会话 → 母盘挂载根"（进程内）。
+	//
+	// 数据直接写进这块挂载点，所以每次写分块前都要确认它还挂着。进程重启后 map 是空的，
+	// 由 ensureUploadMount 重新挂载（Windows 上盘符可能还留在系统里，见那里的兜底）。
+	mountMu sync.Mutex
+	mounts  map[string]string
 
 	// supersedeIdle 覆盖"同名旧会话还算活着"的时间窗（毫秒）。0 = 用默认值
 	// uploadSupersedeIdleMillis；负值 = 一律按"没人动过"处理（只有测试会这么设）。
@@ -300,16 +306,7 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 		return nil, err
 	}
 
-	raw := s.raw()
 	uploadID := uuid.NewString()
-	stagingRoot, err := guard.Resolve(filepath.Join(raw.Storage.StagingDir, uploadID))
-	if err != nil {
-		return nil, apperr.InvalidParam("staging_dir")
-	}
-	if err := os.MkdirAll(stagingRoot, 0o755); err != nil {
-		return nil, apperr.New(apperr.CodeInternal, 500).WithArg("reason", "staging_mkdir").WithCause(err)
-	}
-
 	u := &domain.Upload{
 		ID:         uploadID,
 		UserID:     in.UserID,
@@ -317,12 +314,24 @@ func (s *UploadService) CreateUpload(ctx context.Context, in CreateUploadInput) 
 		Mode:       in.Mode,
 		TotalFiles: totalFiles,
 		TotalBytes: totalBytes,
-		StagingDir: stagingRoot,
 		Manifest:   manifestJSON,
 		State:      domain.UploadStateOpen,
 	}
+	// 会话行必须先落库：接下来要建库、建盘、挂载三步 IO，任何一步失败都得能按 upload_id
+	// 找到半成品并回收；更关键的是"上传到一半服务重启"要靠这一行找回盘挂在哪。
 	if err := s.Store.CreateUpload(ctx, u); err != nil {
-		_ = os.RemoveAll(stagingRoot)
+		return nil, err
+	}
+
+	rec, err := parseManifest(manifestJSON)
+	if err != nil {
+		s.discardUploadSession(ctx, u)
+		return nil, err
+	}
+	if err := s.provisionUploadTarget(ctx, u, rec, size); err != nil {
+		// 建库/建盘/挂载任一步失败：盘和库都是半成品，留着只会挡住同名重试
+		// （见 prepareUploadName 的开头说明）。
+		s.discardUploadSession(ctx, u)
 		return nil, err
 	}
 	s.audit(ctx, in.UserID, "upload.create", "upload:"+uploadID,
@@ -390,10 +399,27 @@ func (s *UploadService) prepareUploadName(ctx context.Context, userID, name stri
 		if u.RepoName != name || u.State == domain.UploadStateComplete {
 			continue
 		}
-		if s.uploadReusable(u, totalFiles, totalBytes, storageID) {
-			plan.reusable = u
-			break
+		if !s.uploadReusable(u, totalFiles, totalBytes, storageID) {
+			continue
 		}
+		// 会话里记的 disk_id 可能已经被"删库"的回收任务删掉了（用户清掉失败残骸）：
+		// 没有盘就没有可以续传的目标，交给下面的清理重新建。
+		disk, dErr := s.Store.GetDisk(ctx, u.DiskID)
+		if dErr != nil {
+			if isNotFound(dErr) {
+				continue
+			}
+			return nil, dErr
+		}
+		// 盘**记录**还在、文件却被删了（手工清理、备份还原、杀软误删）：续传的每一次
+		// Attach 都会失败，用户看到的就是"重试同名库必定失败"。判为不可复用，走重建。
+		if s.Disk != nil && !s.Disk.Exists(disk.VHDXPath) {
+			s.Log.Warn("同名会话的母盘文件已不存在，放弃续传并重建",
+				"upload_id", u.ID, "disk_id", disk.ID, "vhdx", disk.VHDXPath)
+			continue
+		}
+		plan.reusable = u
+		break
 	}
 	buildingSession := false
 	for i := range sessions {
@@ -446,15 +472,14 @@ func (s *UploadService) prepareUploadName(ctx context.Context, userID, name stri
 		// 这个库正是那条会话建出来的（或即将由它建出来）：交给续传，别动它。
 		return plan, nil
 	}
-	if repo.State == domain.RepoStateImporting || repo.State == domain.RepoStateError {
-		// 半成品残骸：库停在 importing/error，母盘被 MarkCreateFailed 之后要求 creating 才能重建，
-		// 原地复活比清掉重来更容易卡死（这正是"重复创建必定秒失败"的一类）。残骸里没有任何
-		// 用户数据（库从没建成过），清掉不损失什么，反而让建库任务从零干净地重建。
-		if err := s.purgeRemnantRepo(ctx, repo); err != nil {
-			return nil, err
-		}
-		plan.cleaned = append(plan.cleaned, "repo:"+repo.ID)
+	// 无论残骸（importing/error）还是"从没人用过的空库"，都由本次上传**重新建**库与盘：
+	// 新流程在 CreateUpload 里就要建盘并挂载，旧库/旧盘必须先清干净，否则同名库会挡住新建
+	// （ensureRepoForUpload 的 existing 分支只做幂等复用，不会重建盘）。
+	// uploadOverwriteBlocked 已经排除了有人用的库，清掉不损失用户数据。
+	if err := s.purgeRemnantRepo(ctx, repo); err != nil {
+		return nil, err
 	}
+	plan.cleaned = append(plan.cleaned, "repo:"+repo.ID)
 	plan.overwrite = true
 	s.audit(ctx, userID, "upload.overwrite", "repo:"+repo.ID,
 		fmt.Sprintf("name=%s state=%s cleaned=%s", name, repo.State, strings.Join(plan.cleaned, ",")),
@@ -479,6 +504,11 @@ func (s *UploadService) uploadReusable(u *domain.Upload, totalFiles int, totalBy
 	default:
 		return false
 	}
+	// 升级前创建的会话没有母盘目标（数据还在暂存目录里），新流程没法接着往里写。
+	// 判为不可复用，交给 24h GC 收走；用户重传一次即可。
+	if u.MountRoot == "" || u.DiskID == "" {
+		return false
+	}
 	if u.TotalFiles != totalFiles || u.TotalBytes != totalBytes {
 		return false
 	}
@@ -501,9 +531,14 @@ func (s *UploadService) uploadCompleteJobAlive(ctx context.Context, uploadID str
 	return j.State == domain.JobStatePending || j.State == domain.JobStateRunning
 }
 
-// discardUploadSession 就地作废一条同名旧会话：删暂存目录、积分块记录与会话行。
+// discardUploadSession 就地作废一条同名旧会话：卸载盘、回收半成品库、删会话行。
+//
+// 新会话（MountRoot 非空）的数据在母盘里，所以必须"卸载 + 删盘 + 删库"一起做；
+// 旧版会话（升级前创建）仍是暂存目录，只能删目录。
 func (s *UploadService) discardUploadSession(ctx context.Context, u *domain.Upload) {
-	if u.StagingDir != "" {
+	if u.MountRoot != "" || u.DiskID != "" {
+		s.releaseUploadTarget(ctx, u, true)
+	} else if u.StagingDir != "" {
 		if err := os.RemoveAll(u.StagingDir); err != nil {
 			s.Log.Warn("清理旧上传暂存目录失败", "upload_id", u.ID, "staging_dir", u.StagingDir, "error", err)
 		}
@@ -556,7 +591,7 @@ func (s *UploadService) uploadOverwriteBlocked(ctx context.Context, repo *domain
 // purgeUploadRemnant 在建库前清掉同名残骸（只清状态为 error 的、本人的、没人用的库）。
 //
 // 为什么只清 error：importing 可能是"另一个还没跑完的任务"（正文里有 skip 保护），
-// active 是正常库（重传覆盖由 buildVHDXFromSource 就地重建母盘，不该删记录）。
+// active 是正常库（重传覆盖由本次上传接管就地重建母盘，不该删记录）。
 func (s *UploadService) purgeUploadRemnant(ctx context.Context, name, ownerID string) error {
 	repo, err := s.Store.GetRepositoryByName(ctx, name)
 	if err != nil {
@@ -617,6 +652,11 @@ func (s *UploadService) resumeUploadSession(ctx context.Context, plan *uploadNam
 		return nil, err
 	}
 	if err := s.ensureUploadQuota(ctx, u.UserID, guard.Root, size); err != nil {
+		return nil, err
+	}
+	// 续传前先确认母盘还挂着：进程重启、上一次卸载失败都会让挂载根失效，
+	// 而分块是直接写进挂载点的（见 ensureUploadMount）。
+	if _, err := s.ensureUploadMount(ctx, u); err != nil {
 		return nil, err
 	}
 
@@ -698,7 +738,7 @@ func (s *UploadService) Status(ctx context.Context, uploadID string) (*UploadSta
 // 空文件不计入：它们不占拼接流，只有 complete 补建后才存在，提前计入会让进度出现
 // "看起来全好了、却还在传"的假象。
 func (s *UploadService) readyFileCount(ctx context.Context, u *domain.Upload) (int, error) {
-	files, _, err := s.planFor(u)
+	files, err := s.planFor(u)
 	if err != nil {
 		return 0, err
 	}
@@ -770,7 +810,12 @@ func (s *UploadService) PutChunk(ctx context.Context, uploadID string, index int
 	if err != nil {
 		return nil, err
 	}
-	files, legacy, err := s.planFor(u)
+	// 分块直接写进母盘挂载点：先确认盘还挂着（进程重启、上一次卸载失败都会让根失效）。
+	// 有缓存时这里只是一次加锁 + stat，不会成为每块的瓶颈。
+	if _, err := s.ensureUploadMount(ctx, u); err != nil {
+		return nil, err
+	}
+	files, err := s.planFor(u)
 	if err != nil {
 		return nil, err
 	}
@@ -802,14 +847,8 @@ func (s *UploadService) PutChunk(ctx context.Context, uploadID string, index int
 		return nil, apperr.New("upload.chunk_checksum_mismatch", 400).WithArg("index", index)
 	}
 
-	// 旧会话（升级前创建、数据已落在 *.part 里）继续走旧路径：混着写会让它的 complete 既拼不出
-	// 完整树、也找不到全部分块文件，只能失败（见 planFor 的模式判定）。
-	if legacy {
-		if err := writePartFile(u.StagingDir, index, data); err != nil {
-			return nil, apperr.New(apperr.CodeInternal, 500).WithArg("reason", "staging_write").WithCause(err)
-		}
-	} else if err := writeChunkToTree(files, offset, data); err != nil {
-		return nil, apperr.New(apperr.CodeInternal, 500).WithArg("reason", "staging_write").WithCause(err)
+	if err := writeChunkToTree(files, offset, data); err != nil {
+		return nil, apperr.New(apperr.CodeInternal, 500).WithArg("reason", "disk_write").WithCause(err)
 	}
 
 	delta := expectSize
@@ -841,9 +880,6 @@ func (s *UploadService) PutChunk(ctx context.Context, uploadID string, index int
 	result := &ChunkResult{
 		Index: index, Size: expectSize, ReceivedBytes: received,
 		Done: s.isComplete(received, total), FilesTotal: u.TotalFiles,
-	}
-	if legacy {
-		return result, nil
 	}
 	// 逐文件校验：本次写到的文件里，凡分块已到齐的就地校验并回报（见 readyFiles）。
 	done, err := s.readyFiles(ctx, u, files, offset, expectSize)
@@ -894,14 +930,6 @@ func (s *UploadService) readyFiles(ctx context.Context, u *domain.Upload, files 
 		done = append(done, f.RelPath)
 	}
 	return done, nil
-}
-
-// writePartFile 把分块写成旧的 *.part 文件（仅用于升级前创建的会话）。
-func writePartFile(stagingDir string, index int, data []byte) error {
-	if err := os.MkdirAll(stagingDir, 0o755); err != nil {
-		return err
-	}
-	return os.WriteFile(partFilePath(stagingDir, index), data, 0o644)
 }
 
 // writeChunkToTree 把一个分块的字节写进文件树里对应的位置（可能横跨两个文件）。
@@ -1000,7 +1028,9 @@ func min64(a, b int64) int64 {
 	return b
 }
 
-// Complete 完成上传：串行重组文件树 → 校验 → 提交 JobUploadComplete（幂等键为 upload_id）。
+// Complete 完成上传：核对树完整性 → 提交 JobUploadComplete（幂等键为 upload_id）。
+//
+// 新会话的数据在上传期间已经写进母盘，这里不做任何重组或拷贝。
 func (s *UploadService) Complete(ctx context.Context, uploadID string) (*domain.Job, error) {
 	u, err := s.Store.GetUpload(ctx, uploadID)
 	if err != nil {
@@ -1031,7 +1061,18 @@ func (s *UploadService) Complete(ctx context.Context, uploadID string) (*domain.
 	// 只核对、不重组：分块到达时就写进树的最终位置了（见 PutChunk）。
 	// 整棵树的全量走查（verifyTree）留给异步的建库任务 —— 那才是最终正确性关口，
 	// 而它没有理由拖住这个 HTTP 请求（拖住的后果就是客户端 30 秒超时误报上传失败）。
-	if err := s.finalizeTree(ctx, u); err != nil {
+	//
+	// 必须先确认盘还挂着：这里是唯一绕过 ensureUploadMount、直接拿 DB 里的 MountRoot 做
+	// 文件 IO 的入口。服务端重启后 Windows 的 attach 状态随进程消失，盘符可能被系统回收，
+	// 旧 MountRoot 于是指向一个不存在的盘符 —— createEmptyFiles 会去 mkdir "G:\" 并报
+	// "The system cannot find the path specified"，被包成 system.internal/disk_write，
+	// 用户只能看到"上传失败"，重试同名库仍然在同一个地方失败。
+	root, err := s.ensureUploadMount(ctx, u)
+	if err != nil {
+		return nil, apperr.New("upload.target_unavailable", 409).
+			WithArg("upload_id", uploadID).WithCause(err)
+	}
+	if err := s.finalizeTree(ctx, u, root); err != nil {
 		return nil, err
 	}
 
@@ -1090,7 +1131,9 @@ func (s *UploadService) requeueFailedCompleteJob(ctx context.Context, uploadID s
 	return existing.ID, nil
 }
 
-// Abort 中止上传并清理暂存目录（幂等）。
+// Abort 中止上传并清掉这次上传占用的东西（幂等）。
+//
+// 新会话的数据在母盘里：卸载 + 删盘 + 删库；升级前的旧会话只有暂存目录可删。
 func (s *UploadService) Abort(ctx context.Context, uploadID string) error {
 	u, err := s.Store.GetUpload(ctx, uploadID)
 	if err != nil {
@@ -1099,8 +1142,13 @@ func (s *UploadService) Abort(ctx context.Context, uploadID string) error {
 	if u.State == domain.UploadStateComplete {
 		return apperrConflictState(u.State)
 	}
-	if err := os.RemoveAll(u.StagingDir); err != nil {
-		return apperr.New(apperr.CodeInternal, 500).WithArg("reason", "staging_remove").WithCause(err)
+	if u.MountRoot != "" || u.DiskID != "" {
+		// 数据已经在母盘里：取消 = 卸载 + 删盘 + 删库。只删会话行会留下挂着盘的半成品库。
+		s.releaseUploadTarget(ctx, u, true)
+	} else if u.StagingDir != "" {
+		if err := os.RemoveAll(u.StagingDir); err != nil {
+			return apperr.New(apperr.CodeInternal, 500).WithArg("reason", "staging_remove").WithCause(err)
+		}
 	}
 	if u.State != domain.UploadStateAborted {
 		if err := s.Store.UpdateUploadState(ctx, uploadID, domain.UploadStateAborted); err != nil {
@@ -1113,7 +1161,7 @@ func (s *UploadService) Abort(ctx context.Context, uploadID string) error {
 	return nil
 }
 
-// GCStaleUploads 回收上传暂存，返回清理的条目数（过期会话 + 残留的暂存目录）。
+// GCStaleUploads 回收上传占用的资源，返回清理的条目数（过期会话 + 残留的暂存目录）。
 //
 // 两趟各管一类残骸，见 gcStaleSessions / gcLeftoverStaging。两趟互不牵连：一趟失败不该让
 // 另一趟也停摆 —— 它们清的是不同来源的盘占用，而其中任何一处不清都是"磁盘只涨不落"。
@@ -1124,7 +1172,8 @@ func (s *UploadService) GCStaleUploads(ctx context.Context) (int, error) {
 	return sessions + s.gcLeftoverStaging(ctx), err
 }
 
-// gcStaleSessions 清理超期未完成的上传会话：删暂存目录 + 删会话行（含分块登记）。
+// gcStaleSessions 清理超期未完成的上传会话：回收其占用的盘与库（旧会话删暂存目录），
+// 再删会话行（含分块登记）。
 func (s *UploadService) gcStaleSessions(ctx context.Context) (int, error) {
 	cutoff := s.nowFn().Add(-uploadGCRetention).UnixMilli()
 	stale, err := s.Store.ListStaleUploads(ctx, cutoff, 100)
@@ -1139,15 +1188,24 @@ func (s *UploadService) gcStaleSessions(ctx context.Context) (int, error) {
 			// 别拿着已取消的 ctx 继续写库。
 			return cleaned, nil
 		}
-		// 建库任务还在跑（正在从暂存树里建盘）时**绝不能删**：要删的就是它脚下的源。
-		// 过期判定按"最后一次收到分块"算（见 ListStaleUploads），而超大目录的建库本身
-		// 就要跑很久 —— 少了这道判断，用户会在"建库中"看到上传莫名其妙地消失、
-		// 任务随即因为源目录不见而失败。取舍与"同名会话有活跃任务时不碰"一致
-		// （见 prepareUploadName）。
+		// 收尾任务还在跑时**绝不能删**：它要卸载这块盘、写标签、登记目标，此时删盘删库
+		// 会让任务在半路上失败。过期判定按"最后一次收到分块"算（见 ListStaleUploads），
+		// 而超大目录的上传本身就要跑很久 —— 少了这道判断，用户会在"写入中"看到上传
+		// 莫名其妙地消失。取舍与"同名会话有活跃任务时不碰"一致（见 prepareUploadName）。
 		if s.uploadCompleteJobAlive(ctx, u.ID) {
 			continue
 		}
-		if u.StagingDir != "" {
+		if u.MountRoot != "" || u.DiskID != "" {
+			// 新会话的数据在母盘里：先卸载，再连库带盘回收。
+			s.releaseUploadTarget(ctx, u, true)
+			// 回收没做完（盘被占用、iSCSI 目标还在）就留到下一轮，别把唯一能找回这块盘的行删掉。
+			if u.RepoID != "" {
+				if _, rErr := s.Store.GetRepository(ctx, u.RepoID); rErr == nil {
+					s.Log.Warn("过期上传的库尚未回收，下一轮重试", "upload_id", u.ID, "repo_id", u.RepoID)
+					continue
+				}
+			}
+		} else if u.StagingDir != "" {
 			if err := os.RemoveAll(u.StagingDir); err != nil {
 				s.Log.Warn("清理上传暂存目录失败", "upload_id", u.ID, "staging_dir", u.StagingDir, "error", err)
 				continue
@@ -1235,37 +1293,27 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 		return apperr.New("upload.state_invalid", 409).WithArg("state", u.State)
 	}
 
-	rep.Progress(5)
-	treeDir, err := s.ensureTree(ctx, u)
+	rep.Progress(2)
+	root, err := s.ensureUploadMount(ctx, u)
 	if err != nil {
 		return err
 	}
-	if err := s.verifyTree(treeDir, u); err != nil {
+	if err := s.verifyTree(root, u); err != nil {
 		return err
 	}
-	rep.Progress(20)
+	rep.Progress(8)
 
-	// 上次建库失败留下的残骸（库与母盘停在 error）不能原地复活：磁盘处于 error 时
-	// buildVHDXFromSource 会按"未建好"重来，但半截的盘文件/失效的目标更容易再次卡死，
-	// 用户看到的就是"重试秒失败"。残骸里没有用户数据，清掉后由 ensureRepoForUpload
-	// 从零重建；暂存里的目录树不动，已上传的字节一个都不用重传。
-	// 走本地续传记录重试的路径不经过 CreateUpload，所以这道自愈必须也放在这里。
-	if err := s.purgeUploadRemnant(ctx, u.RepoName, u.UserID); err != nil {
-		return err
-	}
-
-	repo, disk, err := s.ensureRepoForUpload(ctx, u, treeDir)
+	repo, err := s.Store.GetRepository(ctx, u.RepoID)
 	if err != nil {
 		return err
 	}
-	// 母盘构建期间一律标为 importing（界面「写入中」）：ensureRepoForUpload 对同名库是幂等
-	// 复用的，复用出来的库可能已经是 active（上次建好过、这次是重传覆盖），而这次要把母盘
-	// 整个重建 —— 期间必须拒绝挂载，否则用户挂上去看到的是正在被覆盖的半成品。
-	//
-	// 界面文案是「写入中」而不是「上传中」：走到这里数据早传完了，后面这段长活是把整棵树写进
-	// 新盘（30G 的库要几十分钟），说"上传中"会让人以为还在传数据、白等（真实反馈："写入母盘
-	// 这个过程状态展示要展示写入中，如果上传中的话可能会造成误会"）。
-	// 还在传数据的那一帧由客户端合成的占位库表达，标签取值另算（见前端 repoStateValue）。
+	disk, err := s.Store.GetDisk(ctx, u.DiskID)
+	if err != nil {
+		return err
+	}
+	// 上传全程库都是 importing（界面「写入中」），这里只是兜底：重传覆盖一个曾建成的同名库时，
+	// ensureRepoForUpload 复用它之前可能还是 active，而盘已经被本次重建过 —— 必须拒绝挂载，
+	// 否则用户挂上去看到的是正在被覆盖的半成品。
 	if repo.State != domain.RepoStateImporting {
 		if err := s.Store.SetRepositoryState(ctx, repo.ID, domain.RepoStateImporting); err != nil {
 			return err
@@ -1277,20 +1325,36 @@ func (s *UploadService) runUploadComplete(ctx context.Context, j *domain.Job, re
 			"state":   string(domain.RepoStateImporting),
 		})
 	}
-	rep.Progress(35)
+	rep.Progress(10)
 
-	// 母盘构建占 5%-65%，给后面的指纹计算、池位预创建留出进度空间。
-	buildRep := job.ReporterFunc(func(v int) { rep.Progress(5 + 60*v/100) })
-	if err := s.Disks.buildVHDXFromSource(ctx, disk, treeDir, buildRep); err != nil {
+	// 先卸载：数据在上传时就全部写进盘里了，收尾只剩"把这块盘变成可发布状态"。
+	// 旧流程在这里做的是 buildVHDXFromSource（再拷一遍整棵树），那一步已经没有了。
+	if err := s.Vol.UnmountVolume(ctx, disk.VHDXPath, root); err != nil {
+		return apperr.New(apperr.CodeInternal, 500).WithArg("reason", "upload_disk_unmount").WithCause(err)
+	}
+	s.forgetMount(u.ID)
+	disk.Mounted = false
+	if size, sErr := s.Disk.PhysicalSize(disk.VHDXPath); sErr == nil {
+		disk.PhysicalBytes = size
+	}
+	disk.State = domain.DiskStateReady
+	if err := s.Store.UpdateDisk(ctx, disk); err != nil {
 		return err
 	}
-	rep.Progress(70)
-	// 勾选了"预分配"的共享库：母盘建好后，把差异盘池与 iSCSI 目标一并建好，
+	// 贴"出厂标签"（见 diskmeta.go）：必须在卸载之后写，挂载中的盘写不了。
+	s.Disks.writeDiskMetaAfterBuild(ctx, disk, "")
+	// 独享库的盘建好就该能被客户端挂上：预建 iSCSI 目标（共享库的母盘会跳过）。
+	// 旧流程由 buildVHDXFromSource 代劳，这里不再走它，必须自己补。
+	s.Disks.prePublishTarget(ctx, disk)
+	rep.Progress(30)
+
+	// 勾选了"预分配"的共享库：母盘就绪后，把差异盘池与 iSCSI 目标一并建好，
 	// 之后分配即用（与「新建存储库」直接建库那条路径保持同一行为）。
-	if err := s.prepareUploadPool(ctx, repo, disk, rep); err != nil {
+	poolRep := job.ReporterFunc(func(v int) { rep.Progress(30 + 50*v/100) })
+	if err := s.prepareUploadPool(ctx, repo, disk, poolRep); err != nil {
 		return err
 	}
-	rep.Progress(95)
+	rep.Progress(82)
 
 	// 记录母盘内容指纹，供后续派生差异盘时的指纹校验使用（5.4）。
 	if repo.IsShared() && disk.Kind == domain.DiskKindParent && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
@@ -1388,7 +1452,16 @@ func (s *UploadService) MarkUploadCompleteFailed(ctx context.Context, payload st
 		}
 		return err
 	}
-	repo, err := s.Store.GetRepositoryByName(ctx, u.RepoName)
+	// 先把母盘卸下来再回滚状态。收尾流程里"卸载"排在目录树校验之后，校验失败（例如
+	// 撞到卷根的系统目录）时盘会一直挂着、disks.mounted 仍是 true，而库已经被置为
+	// error —— 用户看到一条"异常"的库，想删却只会得到 disk.busy（见 RepoService.Delete）。
+	// 会话行与 mount_root 都保留：同名重传走续传，ensureUploadMount 会重新挂上。
+	s.releaseUploadTarget(ctx, u, false)
+	// 优先按会话记下的库 ID 找：同名库可能在会话创建后被改名（迁移 / 冲突改名）。
+	repo, err := s.Store.GetRepository(ctx, u.RepoID)
+	if err != nil && u.RepoID == "" {
+		repo, err = s.Store.GetRepositoryByName(ctx, u.RepoName)
+	}
 	if err != nil {
 		// 还没走到建库就失败了（分块不全、目录树校验不过）：没有库要回滚。
 		if isNotFound(err) {
@@ -1431,8 +1504,11 @@ func (s *UploadService) MarkUploadCompleteFailed(ctx context.Context, payload st
 // ensureRepoForUpload 幂等地为上传创建存储库与母盘记录。
 //
 // 建库模式（shared | exclusive）、目标存储与配额取自会话清单中持久化的选项
-// （见 uploadManifestRecord），因此异步任务重试时语义稳定。
-func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Upload, treeDir string) (*domain.Repository, *domain.Disk, error) {
+// （见 uploadManifestRecord），因此任务重试时语义稳定。
+//
+// 容量由调用方传入（按清单总量算好的标称容量，见 CreateUpload）：数据是**直接写进
+// 这块盘的**，所以盘必须先于分块存在，不能再等目录落完再量一遍。
+func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Upload, size int64) (*domain.Repository, *domain.Disk, error) {
 	raw := s.raw()
 	rec, err := parseManifest(u.Manifest)
 	if err != nil {
@@ -1442,12 +1518,6 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 	if !mode.Valid() {
 		mode = domain.RepoModeShared
 	}
-
-	dirBytes, err := dirSize(treeDir)
-	if err != nil {
-		return nil, nil, err
-	}
-	size := s.sizing().CalculateVHDXSize(dirBytes, 0)
 
 	guard, err := s.uploadTargetGuard(ctx, u, rec.StorageID)
 	if err != nil {
@@ -1582,6 +1652,154 @@ func (s *UploadService) ensureRepoForUpload(ctx context.Context, u *domain.Uploa
 	return repo, disk, nil
 }
 
+// provisionUploadTarget 为一次新上传准备好落盘目标：建库/母盘记录 → 建出虚拟盘 → 挂载格式化。
+//
+// 这是"直写母盘"的核心：以前数据先落暂存目录，等 Complete 时再由建盘任务把整棵树拷进
+// VHDX —— 同样的字节在服务端要写两遍（一遍网络落盘、一遍本地拷贝），30G 的库就是多
+// 30G 的读写。现在上传一开始就把盘建出来挂上，分块直接写进去，结束时只剩卸载与登记。
+func (s *UploadService) provisionUploadTarget(ctx context.Context, u *domain.Upload, rec *uploadManifestRecord, size int64) error {
+	if s.Disk == nil || s.Vol == nil {
+		return errNotImplemented
+	}
+	repo, disk, err := s.ensureRepoForUpload(ctx, u, size)
+	if err != nil {
+		return err
+	}
+	// 先记到会话上：挂载可能失败，失败后 discardUploadSession 要靠这两个 ID 把半成品
+	// 库与盘一起回收（没有它们就只能删会话行，留下一条 importing 的库）。
+	u.RepoID, u.DiskID = repo.ID, disk.ID
+	root, err := s.mountUploadDisk(ctx, u.ID, disk)
+	if err != nil {
+		return err
+	}
+	if err := s.Store.SetUploadTarget(ctx, u.ID, repo.ID, disk.ID, root); err != nil {
+		return err
+	}
+	u.RepoID, u.DiskID, u.MountRoot = repo.ID, disk.ID, root
+	s.Log.Info("上传目标已就绪（分块直接写入母盘）",
+		"upload_id", u.ID, "repo_id", repo.ID, "disk_id", disk.ID, "root", root,
+		"mode", string(repo.Mode), "size", size)
+	return nil
+}
+
+// mountUploadDisk 建盘（若还不存在）并挂载、格式化，返回挂载根。
+//
+// VHDX 文件可能已经建好（失败重试 / 进程重启），挂载也可能已经由操作系统保留
+// （Windows 上进程重启不会解除 Attach），所以这里只保证"文件存在 + 挂上"，
+// 重复调用的兜底在 ensureUploadMount。
+func (s *UploadService) mountUploadDisk(ctx context.Context, uploadID string, disk *domain.Disk) (string, error) {
+	if !s.Disk.Exists(disk.VHDXPath) {
+		if err := s.Disk.Create(ctx, disk.VHDXPath, disk.SizeBytes); err != nil {
+			return "", err
+		}
+	}
+	root, err := s.Vol.MountVolume(ctx, disk.VHDXPath, disk.FileSystemOrDefault().String())
+	if err != nil {
+		return "", err
+	}
+	disk.Mounted = true
+	disk.State = domain.DiskStateReady
+	if err := s.Store.UpdateDisk(ctx, disk); err != nil {
+		return "", err
+	}
+	s.mountMu.Lock()
+	if s.mounts == nil {
+		s.mounts = map[string]string{}
+	}
+	s.mounts[uploadID] = root
+	s.mountMu.Unlock()
+	return root, nil
+}
+
+// ensureUploadMount 返回会话当前的挂载根，必要时重新挂载（进程重启、卸载失败后重试）。
+func (s *UploadService) ensureUploadMount(ctx context.Context, u *domain.Upload) (string, error) {
+	if u.MountRoot == "" || u.DiskID == "" {
+		return "", apperrConflictState(u.State)
+	}
+	s.mountMu.Lock()
+	root := s.mounts[u.ID]
+	s.mountMu.Unlock()
+	if root != "" && dirExists(root) {
+		return root, nil
+	}
+	disk, err := s.Store.GetDisk(ctx, u.DiskID)
+	if err != nil {
+		return "", err
+	}
+	root, err = s.Vol.MountVolume(ctx, disk.VHDXPath, disk.FileSystemOrDefault().String())
+	if err != nil {
+		// 盘文件本身已经不在了：这块盘被删掉/回收了（用户清了残骸、备份还原、手工清理）。
+		// 这时 DB 里的旧盘符**无论如何都不能再用** —— Windows 的盘符是全局资源，那块
+		// 盘符可能已经分给了别的卷，沿用等于把用户的数据写进别人的盘。如实报错，让上层
+		// 按"目标不可用 / 需要重新上传"处理。
+		if s.Disk != nil && !s.Disk.Exists(disk.VHDXPath) {
+			return "", err
+		}
+		// 盘文件还在却 Attach 失败：多半是进程重启后 Windows 仍保持着 Attach
+		// （再 Attach 会报 sharing violation），盘符不会变，挂载根还能访问就沿用。
+		if !dirExists(u.MountRoot) {
+			return "", err
+		}
+		root = u.MountRoot
+	}
+	s.mountMu.Lock()
+	if s.mounts == nil {
+		s.mounts = map[string]string{}
+	}
+	s.mounts[u.ID] = root
+	s.mountMu.Unlock()
+	if root != u.MountRoot {
+		if err := s.Store.SetUploadTarget(ctx, u.ID, u.RepoID, u.DiskID, root); err != nil {
+			return "", err
+		}
+		u.MountRoot = root
+		// 挂载根变了，文件映射里的绝对路径也跟着变。
+		s.forgetPlan(u.ID)
+	}
+	return root, nil
+}
+
+// releaseUploadTarget 卸载会话的母盘；purge 为真时连库与盘一起回收（取消 / 失败 / 过期）。
+func (s *UploadService) releaseUploadTarget(ctx context.Context, u *domain.Upload, purge bool) {
+	// 清理路径不能因为调用方 ctx 已取消就半途而废（用户点了取消、请求已断开）。
+	ctx = context.WithoutCancel(ctx)
+	s.mountMu.Lock()
+	_, cached := s.mounts[u.ID]
+	delete(s.mounts, u.ID)
+	s.mountMu.Unlock()
+
+	if u.DiskID != "" && s.Vol != nil {
+		disk, err := s.Store.GetDisk(ctx, u.DiskID)
+		if err != nil && !isNotFound(err) {
+			s.Log.Warn("卸载上传母盘失败：读取磁盘记录出错", "upload_id", u.ID, "disk_id", u.DiskID, "error", err)
+		}
+		if err == nil && (disk.Mounted || cached) {
+			if uErr := s.Vol.UnmountVolume(ctx, disk.VHDXPath, u.MountRoot); uErr != nil {
+				s.Log.Warn("卸载上传母盘失败", "upload_id", u.ID, "disk_id", disk.ID, "error", uErr)
+			} else {
+				disk.Mounted = false
+				if err := s.Store.UpdateDisk(ctx, disk); err != nil {
+					s.Log.Warn("回写磁盘挂载状态失败", "disk_id", disk.ID, "error", err)
+				}
+			}
+		}
+	}
+
+	if !purge || u.RepoID == "" {
+		return
+	}
+	repo, err := s.Store.GetRepository(ctx, u.RepoID)
+	if err != nil {
+		if !isNotFound(err) {
+			s.Log.Warn("回收上传目标失败：读取存储库出错", "upload_id", u.ID, "repo_id", u.RepoID, "error", err)
+		}
+		return
+	}
+	if err := s.purgeRemnantRepo(ctx, repo); err != nil {
+		s.Log.Warn("回收上传目标失败", "upload_id", u.ID, "repo_id", u.RepoID, "error", err)
+	}
+}
+
 // prepareUploadPool 为"上传建库 + 勾选预分配"的共享库预创建差异盘池与 iSCSI 目标。
 //
 // 为什么放在上传完成的任务里而不是再派一个任务：母盘此时刚建好，后面的池位创建是
@@ -1612,6 +1830,12 @@ func (s *UploadService) prepareUploadPool(
 		Phase: domain.RepoPhaseDiffs, Done: 0, Total: count,
 	})
 
+	// 本函数的 rep 是 0-100 的**本阶段**进度（调用方再把它映射进建库总进度，见
+	// UploadService.runUploadComplete 的 poolRep）：差异盘占前 60、iSCSI 目标占后 40。
+	//
+	// 早先这里是 70→85→94 一整段，映射进总进度后只剩 65-77 那 12 个点：预分配几十个池位时
+	// 界面上的任务进度几乎钉在 75 不动（真实反馈）。把本阶段铺满 0-100，总进度才有
+	// 30-80 的跨度，用户至少能看出「在往前走」。
 	disks := make([]*domain.Disk, 0, count)
 	for i := 0; i < count; i++ {
 		if err := ctx.Err(); err != nil {
@@ -1620,7 +1844,8 @@ func (s *UploadService) prepareUploadPool(
 		idx := i
 		d, err := s.Disks.ensurePoolDiffDisk(ctx, repo, parent, idx,
 			job.ReporterFunc(func(v int) {
-				rep.Progress(70 + (15*idx+15*v/100)/count)
+				// 单块内部的 0-100（打开母盘 / 派生 / 落库）压进它自己那一格。
+				rep.Progress((60*idx + 60*v/100) / count)
 			}))
 		if err != nil {
 			return err
@@ -1629,7 +1854,7 @@ func (s *UploadService) prepareUploadPool(
 		s.Repos.setRepoPrepare(ctx, repo.ID, &domain.RepoPrepare{
 			Phase: domain.RepoPhaseDiffs, Done: idx + 1, Total: count,
 		})
-		rep.Progress(70 + 15*(idx+1)/count)
+		rep.Progress(60 * (idx + 1) / count)
 	}
 
 	s.Repos.setRepoPrepare(ctx, repo.ID, &domain.RepoPrepare{
@@ -1638,7 +1863,7 @@ func (s *UploadService) prepareUploadPool(
 	if s.Disks.IscsiSvc == nil {
 		s.Log.Warn("iSCSI 服务未装配，预分配池位只建盘不发布", "repo_id", repo.ID)
 		s.Repos.setRepoPrepare(ctx, repo.ID, nil)
-		rep.Progress(94)
+		rep.Progress(100)
 		return nil
 	}
 	for i, d := range disks {
@@ -1651,7 +1876,7 @@ func (s *UploadService) prepareUploadPool(
 		s.Repos.setRepoPrepare(ctx, repo.ID, &domain.RepoPrepare{
 			Phase: domain.RepoPhaseTargets, Done: i + 1, Total: len(disks),
 		})
-		rep.Progress(85 + 9*(i+1)/len(disks))
+		rep.Progress(60 + 40*(i+1)/len(disks))
 	}
 	s.Repos.setRepoPrepare(ctx, repo.ID, nil)
 	s.audit(ctx, "", "repo.prepare.upload.done", "repo:"+repo.ID,
@@ -1661,9 +1886,13 @@ func (s *UploadService) prepareUploadPool(
 
 // uploadTargetGuard 解析建库应使用的目标根。
 //
-//   - 会话显式指定了 storage_id → 必须与该存储根一致（暂存必须在其下），
-//     否则返回 storage.staging_mismatch——这是"建盘与暂存同卷、可原子改名"的前提；
+//   - 会话显式指定了 storage_id → 用它；旧会话额外校验"暂存目录必须在该存储根下"
+//     （storage.staging_mismatch）——它们的树要先在暂存里拼出来、再靠同卷改名建盘；
 //   - 未指定 → 从 staging 反推根（沿用既有做法）。
+//
+// 新会话没有暂存目录：它创建时还没有 MountRoot（正要去建盘），母盘直接建在这块存储下，
+// 分块也写进这块盘，本来就不存在"暂存与目标不同根"的可能 —— 不能因为 staging_dir 为空
+// 就判失败（那会让每次新建上传都报 storage.staging_mismatch）。
 func (s *UploadService) uploadTargetGuard(ctx context.Context, u *domain.Upload, storageID string) (domain.PathGuard, error) {
 	if strings.TrimSpace(storageID) == "" {
 		return s.guardForUpload(ctx, u)
@@ -1675,27 +1904,26 @@ func (s *UploadService) uploadTargetGuard(ctx context.Context, u *domain.Upload,
 	if !st.Enabled {
 		return domain.PathGuard{}, apperr.StorageDisabled().WithArg("id", st.ID)
 	}
-	guards, err := s.storageGuards(ctx)
-	if err != nil {
-		return domain.PathGuard{}, err
-	}
-	if sg, ok := guards.GuardForPath(u.StagingDir); !ok || !strings.EqualFold(sg.Root, st.Path) {
+	if u.MountRoot == "" && strings.TrimSpace(u.StagingDir) != "" && !pathWithin(u.StagingDir, st.Path) {
 		return domain.PathGuard{}, apperr.New("storage.staging_mismatch", 409).
 			WithArg("staging_dir", u.StagingDir).WithArg("storage_path", st.Path)
 	}
 	return domain.NewPathGuard(st.Path), nil
 }
 
-// ensureTree 幂等地把分块重组为文件树；已存在且完整的树直接复用。
+// ensureTree 确保文件树就绪并返回它的根（母盘挂载点）；已存在且完整的树直接复用。
 //
-// 只由异步的建库任务调用（Complete 走 finalizeTree：只核对、不重组）。走到"需要重组"这一步
-// 的只剩升级前创建的会话（数据还在 *.part 里），由 finalizeTree 的兜底路径拼一次。
+// 数据在上传时就写进这棵树，所以这里通常只是"确认盘还挂着 + stat 一遍"。
 func (s *UploadService) ensureTree(ctx context.Context, u *domain.Upload) (string, error) {
-	treeDir := filepath.Join(u.StagingDir, "tree")
+	// 文件树的根就是母盘挂载根（写到哪、最终就在哪），不再是暂存目录下的 tree。
+	treeDir, err := s.ensureUploadMount(ctx, u)
+	if err != nil {
+		return "", err
+	}
 	if s.treeOK(treeDir, u) {
 		return treeDir, nil
 	}
-	if err := s.finalizeTree(ctx, u); err != nil {
+	if err := s.finalizeTree(ctx, u, treeDir); err != nil {
 		return "", err
 	}
 	if err := s.verifyTree(treeDir, u); err != nil {
@@ -1706,14 +1934,17 @@ func (s *UploadService) ensureTree(ctx context.Context, u *domain.Upload) (strin
 
 // finalizeTree 确认文件树已就绪：核对 + 补空文件，**不重组**。
 //
-// 正常路径（分块都经新路径直接写进树）到这里就是"stat 一遍即通过"，毫秒级。三种例外各有交代：
+// treeDir 必须由调用方给出（而不是从会话的 MountRoot 取）：挂载根可能在本次调用前刚被
+// ensureUploadMount 换掉（盘符重分配），映射缓存里残留的旧根会让补空文件写到不存在的
+// 盘符上。这里按传入的根现算一次映射，不读写 planFor 的缓存。
+//
+// 正常路径（分块都经新路径直接写进树）到这里就是"stat 一遍即通过"，毫秒级。两种例外各有交代：
 //
 //   - 空文件：零字节不占拼接流，没有任何分块会写到它们，所以在这里补建；
-//   - 旧会话（升级前创建、数据在 *.part 里）：走一次 assembleTree 兜底，这是历史路径；
 //   - 块齐但树对不上（树被外部动过 / 磁盘故障）：作废这些文件的登记让客户端重传对应分块
 //     （见 healTreeMismatch），而不是整库重传。
-func (s *UploadService) finalizeTree(ctx context.Context, u *domain.Upload) error {
-	files, legacy, err := s.planFor(u)
+func (s *UploadService) finalizeTree(ctx context.Context, u *domain.Upload, treeDir string) error {
+	files, err := s.filePlan(u, treeDir)
 	if err != nil {
 		return err
 	}
@@ -1721,18 +1952,10 @@ func (s *UploadService) finalizeTree(ctx context.Context, u *domain.Upload) erro
 		return nil
 	}
 	if err := createEmptyFiles(files); err != nil {
-		return apperr.New(apperr.CodeInternal, 500).WithArg("reason", "staging_write").WithCause(err)
+		return apperr.New(apperr.CodeInternal, 500).WithArg("reason", "disk_write").WithCause(err)
 	}
 	if treeMatches(files) {
 		return nil
-	}
-	if legacy {
-		if err := assembleTree(u, files); err != nil {
-			return err
-		}
-		if treeMatches(files) {
-			return nil
-		}
 	}
 	healed, err := s.healTreeMismatch(ctx, u, files)
 	if err != nil {
@@ -1891,29 +2114,32 @@ func (s *UploadService) receivedBytes(ctx context.Context, u *domain.Upload) (in
 	return fresh.ReceivedBytes, nil
 }
 
-// planFor 返回会话的"拼接流 → 文件"映射，以及该会话是否还在用旧的 *.part 分块文件。
+// planFor 返回会话的"拼接流 → 文件"映射。
 //
-// 两者都按会话缓存（见 planCache）。缓存是必需的，不是优化：
-//   - 映射：现在每写一个分块都要用它定位（见 writeChunkToTree），而清单可能有几十万文件
-//     （JSON 几十 MB）—— 不缓存就等于每 8MiB 重新解析一次；
-//   - 模式：判定要读一遍 staging 目录，而那个目录在上传过程中会涨到上万条目（旧会话的
-//     *.part）甚至几十万（新会话的文件树）。
+// 结果按会话缓存（见 planCache）。缓存是必需的，不是优化：现在每写一个分块都要用它定位
+// （见 writeChunkToTree），而清单可能有几十万文件（JSON 几十 MB）—— 不缓存就等于每 8MiB
+// 重新解析一次几十 MB JSON，网络再快也跑不满。
 //
-// 结果在会话存续期内不会变：manifest 不变；旧会话继续写 part、新会话从不写 part。
-func (s *UploadService) planFor(u *domain.Upload) ([]uploadFile, bool, error) {
+// 映射在会话存续期内不会变：manifest 不变，树的根（母盘挂载根）也不会变。
+// MountRoot 为空只可能是升级前创建的旧会话（数据在暂存目录的 *.part 里）：新版本不再
+// 支持继续写入，直接按状态冲突拒绝；下一次上传会由 CreateUpload 清掉这套残留。
+func (s *UploadService) planFor(u *domain.Upload) ([]uploadFile, error) {
 	s.planMu.Lock()
 	if e, ok := s.planCache[u.ID]; ok {
-		files, legacy := e.files, e.legacy
+		files := e.files
 		s.planMu.Unlock()
-		return files, legacy, nil
+		return files, nil
 	}
 	s.planMu.Unlock()
 
-	files, err := s.filePlan(u, filepath.Join(u.StagingDir, "tree"))
-	if err != nil {
-		return nil, false, err
+	// 挂载根就是文件树的根（写入即最终位置，不再有"暂存 tree → 拷进盘"这一步）。
+	if u.MountRoot == "" {
+		return nil, apperrConflictState(u.State)
 	}
-	legacy := legacyPartFiles(u.StagingDir)
+	files, err := s.filePlan(u, u.MountRoot)
+	if err != nil {
+		return nil, err
+	}
 
 	s.planMu.Lock()
 	if s.planCache == nil {
@@ -1930,9 +2156,9 @@ func (s *UploadService) planFor(u *domain.Upload) ([]uploadFile, bool, error) {
 		}
 		delete(s.planCache, oldestKey)
 	}
-	s.planCache[u.ID] = uploadPlanEntry{files: files, legacy: legacy, at: time.Now()}
+	s.planCache[u.ID] = uploadPlanEntry{files: files, at: time.Now()}
 	s.planMu.Unlock()
-	return files, legacy, nil
+	return files, nil
 }
 
 // forgetPlan 丢弃会话的映射缓存（会话完成/中止时调用，别让几十 MB 的清单长期占着内存）。
@@ -1940,24 +2166,6 @@ func (s *UploadService) forgetPlan(uploadID string) {
 	s.planMu.Lock()
 	delete(s.planCache, uploadID)
 	s.planMu.Unlock()
-}
-
-// legacyPartFiles 判断 staging 下是否已有旧的 *.part 分块文件（有则说明这是升级前创建的会话）。
-//
-// 历史实现把每个分块存成 N.part、由 complete 统一拼成树。这类会话必须继续按旧路径写：
-// 一旦混着写，数据就一半在 part、一半在树里，complete 时既拼不出完整树、也找不到全部分块文件，
-// 只能失败。新会话从不写 part，所以这个判定一旦成立就不会再变（见 planFor 的缓存）。
-func legacyPartFiles(stagingDir string) bool {
-	entries, err := os.ReadDir(stagingDir)
-	if err != nil {
-		return false
-	}
-	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".part") {
-			return true
-		}
-	}
-	return false
 }
 
 // ensureUploadQuota 校验用户配额与目标根所在卷的水位。
@@ -2012,6 +2220,15 @@ func (s *UploadService) guardForUpload(ctx context.Context, u *domain.Upload) (d
 	if err != nil {
 		return domain.PathGuard{}, err
 	}
+	// 新会话（无暂存目录）：目标根就是清单里选定的那块存储 —— 母盘建在它下面，
+	// 数据也直接写进这块盘，两者天然同卷。
+	if u != nil && u.MountRoot != "" {
+		if rec, mErr := parseManifest(u.Manifest); mErr == nil && strings.TrimSpace(rec.StorageID) != "" {
+			if st, sErr := s.Store.GetStorage(ctx, rec.StorageID); sErr == nil && st.Enabled {
+				return domain.NewPathGuard(st.Path), nil
+			}
+		}
+	}
 	if u != nil && strings.TrimSpace(u.StagingDir) != "" {
 		if g, ok := guards.GuardForPath(u.StagingDir); ok {
 			return g, nil
@@ -2027,6 +2244,33 @@ func (s *UploadService) guardForUpload(ctx context.Context, u *domain.Upload) (d
 
 // isComplete 判断已接收字节是否覆盖全部内容。
 func (s *UploadService) isComplete(received, total int64) bool { return received >= total }
+
+// forgetMount 丢掉会话的挂载缓存（卸载之后、或挂载根变了时调用）。
+func (s *UploadService) forgetMount(id string) {
+	s.mountMu.Lock()
+	delete(s.mounts, id)
+	s.mountMu.Unlock()
+}
+
+// pathWithin 判断 p 是否落在 root 之内（含 root 自身）。
+func pathWithin(p, root string) bool {
+	if strings.TrimSpace(p) == "" || strings.TrimSpace(root) == "" {
+		return false
+	}
+	absP, err := filepath.Abs(p)
+	if err != nil {
+		absP = filepath.Clean(p)
+	}
+	absR, err := filepath.Abs(root)
+	if err != nil {
+		absR = filepath.Clean(root)
+	}
+	rel, err := filepath.Rel(absR, absP)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
 
 // ---- 纯函数辅助 ----
 
@@ -2066,11 +2310,6 @@ func allChunkIndices(total, chunkSize int64) []int {
 		out = append(out, i)
 	}
 	return out
-}
-
-// partFilePath 返回分块文件路径。
-func partFilePath(stagingDir string, index int) string {
-	return filepath.Join(stagingDir, fmt.Sprintf("%d.part", index))
 }
 
 // sanitizeManifestPath 规范化并校验清单中的相对路径（见 5.10 路径安全要点）。
@@ -2232,138 +2471,6 @@ func uploadClientOS(rec *uploadManifestRecord) domain.ClientOS {
 	return domain.ClientOSDefault
 }
 
-// treeWriter 把拼接流顺序写入文件树，跨越文件边界。
-type treeWriter struct {
-	files  []uploadFile
-	idx    int
-	f      *os.File
-	remain int64
-}
-
-// newTreeWriter 打开第一个输出文件。
-func newTreeWriter(files []uploadFile) (*treeWriter, error) {
-	w := &treeWriter{files: files}
-	if err := w.advance(); err != nil {
-		return nil, err
-	}
-	return w, nil
-}
-
-// advance 关闭当前文件并打开下一个非空文件（空文件直接创建）。
-func (w *treeWriter) advance() error {
-	if w.f != nil {
-		if err := w.f.Close(); err != nil {
-			return err
-		}
-		w.f = nil
-	}
-	for w.idx < len(w.files) {
-		p := w.files[w.idx]
-		if err := os.MkdirAll(filepath.Dir(p.OutPath), 0o755); err != nil {
-			return err
-		}
-		f, err := os.OpenFile(p.OutPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
-		if err != nil {
-			return err
-		}
-		if p.Size <= 0 {
-			if err := f.Close(); err != nil {
-				return err
-			}
-			w.idx++
-			continue
-		}
-		w.f = f
-		w.remain = p.Size
-		return nil
-	}
-	return nil
-}
-
-// Write 实现 io.Writer。
-func (w *treeWriter) Write(p []byte) (int, error) {
-	total := len(p)
-	for len(p) > 0 {
-		if w.f == nil {
-			if w.idx >= len(w.files) {
-				return total - len(p), fmt.Errorf("上传内容超过清单总大小")
-			}
-			if err := w.advance(); err != nil {
-				return total - len(p), err
-			}
-			if w.f == nil {
-				return total - len(p), fmt.Errorf("上传内容超过清单总大小")
-			}
-		}
-		n := len(p)
-		if int64(n) > w.remain {
-			n = int(w.remain)
-		}
-		if _, err := w.f.Write(p[:n]); err != nil {
-			return total - len(p), err
-		}
-		w.remain -= int64(n)
-		p = p[n:]
-		if w.remain == 0 {
-			w.idx++
-			if err := w.advance(); err != nil {
-				return total - len(p), err
-			}
-		}
-	}
-	return total, nil
-}
-
-// Close 关闭当前文件句柄。
-func (w *treeWriter) Close() error {
-	if w.f != nil {
-		err := w.f.Close()
-		w.f = nil
-		return err
-	}
-	return nil
-}
-
-// assembleTree 顺序读取全部分块并重组成文件树（幂等：先清空再重建）。
-func assembleTree(u *domain.Upload, files []uploadFile) error {
-	treeDir := filepath.Join(u.StagingDir, "tree")
-	if err := os.RemoveAll(treeDir); err != nil {
-		return apperr.New("upload.tree_invalid", 500).WithArg("reason", "clean").WithCause(err)
-	}
-	if err := os.MkdirAll(treeDir, 0o755); err != nil {
-		return apperr.New("upload.tree_invalid", 500).WithArg("reason", "mkdir").WithCause(err)
-	}
-	w, err := newTreeWriter(files)
-	if err != nil {
-		return apperr.New("upload.tree_invalid", 500).WithArg("reason", "writer").WithCause(err)
-	}
-	count := chunkCount(u.TotalBytes, DefaultUploadChunkSize)
-	for i := 0; i < count; i++ {
-		part := partFilePath(u.StagingDir, i)
-		expect := chunkSizeAt(i, u.TotalBytes, DefaultUploadChunkSize)
-		info, statErr := os.Stat(part)
-		if statErr != nil || info.Size() != expect {
-			_ = w.Close()
-			return apperr.New("upload.chunk_missing", 500).WithArg("index", i)
-		}
-		f, openErr := os.Open(part)
-		if openErr != nil {
-			_ = w.Close()
-			return apperr.New("upload.chunk_missing", 500).WithArg("index", i).WithCause(openErr)
-		}
-		_, copyErr := io.Copy(w, f)
-		_ = f.Close()
-		if copyErr != nil {
-			_ = w.Close()
-			return apperr.New("upload.tree_invalid", 500).WithArg("reason", "assemble").WithCause(copyErr)
-		}
-	}
-	if err := w.Close(); err != nil {
-		return apperr.New("upload.tree_invalid", 500).WithArg("reason", "close").WithCause(err)
-	}
-	return nil
-}
-
 // treeMatches 校验树中每个文件的类型与大小与清单一致（拒绝符号链接）。
 func treeMatches(files []uploadFile) bool {
 	for i := range files {
@@ -2390,13 +2497,62 @@ func fileMatches(f uploadFile) bool {
 	return info.Size() == f.Size
 }
 
+// volSystemEntries 是 Windows 在每个卷根上自动创建的条目（小写比对）。
+//
+// 其中 System Volume Information 连管理员都读不了：在卷根上做一次正常遍历会直接
+// 返回 "Access is denied"。它和回收站、分页文件一样**都不是客户端传上来的内容**，
+// 统计时必须排除——否则每次上传都会在建库的最后一步被判成"树无效"而整单失败。
+var volSystemEntries = map[string]bool{
+	"$recycle.bin":              true,
+	"$extend":                   true,
+	"$rmmetadata":               true,
+	"$sysreset":                 true,
+	"system volume information": true,
+	"config.msi":                true,
+	"recovery":                  true,
+	"found.000":                 true,
+	"pagefile.sys":              true,
+	"hiberfil.sys":              true,
+	"swapfile.sys":              true,
+	"dumpstack.log":             true,
+	"dumpstack.log.tmp":         true,
+}
+
+// isVolSystemEntry 判断是否为卷自带的系统条目（Windows 文件名大小写不敏感）。
+func isVolSystemEntry(name string) bool {
+	return volSystemEntries[strings.ToLower(name)]
+}
+
 // countTree 统计目录树下的常规文件数与总字节数。
+//
+// 树的根就是母盘挂载点（卷根），所以这里会看到卷自带的系统条目：它们既不该计入统计，
+// 也不一定读得了（见 volSystemEntries）。**只排除卷根的直接子项**——同名目录出现在
+// 更深处时是用户自己的数据（游戏目录里就有叫 Recovery 的），不能顺手跳过。
 func countTree(root string) (int, int64, error) {
+	root = filepath.Clean(root)
+	atRoot := func(p string) bool { return filepath.Dir(p) == root }
 	var files int
 	var bytes int64
-	err := filepath.Walk(root, func(_ string, fi os.FileInfo, walkErr error) error {
+	err := filepath.Walk(root, func(p string, fi os.FileInfo, walkErr error) error {
 		if walkErr != nil {
+			// 读不了的多半是卷自带的系统目录（枚举它就 EPERM）：跳过继续。
+			// 根目录本身读不了才是真错误 —— 那意味着整块盘都不可用。
+			if p != root && atRoot(p) && isVolSystemEntry(filepath.Base(p)) {
+				if fi != nil && fi.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 			return walkErr
+		}
+		if p == root {
+			return nil
+		}
+		if atRoot(p) && isVolSystemEntry(fi.Name()) {
+			if fi.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
 		}
 		if fi.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("目录树中存在符号链接")

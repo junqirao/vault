@@ -435,6 +435,18 @@ func (s *RepoService) Delete(ctx context.Context, id string) error {
 	if active > 0 {
 		return apperr.RepoHasActiveLease(active)
 	}
+	// 删除前先退掉服务端本地的挂载。
+	//
+	// disks.mounted 记的是"服务端本地挂载"（维护态编辑母盘、上传期间建盘/写盘），**不是**
+	// 客户端在用 —— 客户端占用由租约判定，上面已经确认没有活跃租约。上传在"卸载母盘"之前
+	// 失败、维护态没退出、进程崩溃前没来得及卸，都会让这条库一直卡住：挂不了（状态不是
+	// active），也删不掉（下面会以 disk.busy 拒绝）。用户看到的就是一条"异常且删不掉"的库。
+	//
+	// 这里不看库的状态：卡在 importing 的上传残骸同样需要能删。
+	if s.Vol != nil {
+		s.UnmountParentVolume(ctx, id)
+		s.releaseStaleMounts(ctx, id)
+	}
 
 	var payload reclaimPayload
 	var userIDs []string
@@ -446,13 +458,9 @@ func (s *RepoService) Delete(ctx context.Context, id string) error {
 		if err != nil {
 			return err
 		}
-		// 仍挂在客户端上的盘不能删：文件删不掉，事后还会留下一个"看不见的占用"。
-		// 在删记录之前判定，用户拿到明确的 disk.busy（409），而不是等半天换来一个失败任务。
-		for i := range disks {
-			if disks[i].Mounted {
-				return apperr.DiskBusy().WithArg("disk_id", disks[i].ID)
-			}
-		}
+		// 这里**不再**用 disks.mounted 拒绝删除：它表示服务端本地挂载（上面已尽力卸载），
+		// 不代表客户端在用（那由租约判定）。卸载万一失败（盘上还有没释放的句柄），也照样删
+		// 记录 —— 回收任务重试删除会失败并留痕，比让用户永远删不掉一条异常库要好。
 
 		// 目标只从**本库的磁盘**上取：全量目标列表里还有别的库的目标，无差别删除会误伤
 		// （真实事故：删一个库导致另一个库的挂载失败，见 purgeRepository 的注释）。
@@ -549,6 +557,35 @@ func (s *RepoService) Delete(ctx context.Context, id string) error {
 	s.Log.Info("已删除存储库记录，资源回收转入后台",
 		"repo_id", id, "name", repo.Name, "disk_count", len(payload.Artifacts))
 	return nil
+}
+
+// releaseStaleMounts 尽力卸载本库里仍挂在服务端本地的盘（Delete 前调用）。
+//
+// 场景：上传在收尾的"卸载母盘"之前失败（例如目录树校验不过），或维护态没正常退出，
+// 盘一直 attach 着。这类盘没有客户端在用（调用方已确认无活跃租约），卸下来才能让
+// 回收任务删掉文件。
+//
+// 只调用卸载、**不回写 disks.mounted**：这条库马上就要删掉，回写没有意义；而且 Linux 的
+// UnmountVolume 需要挂载点，进程重启后拿不到了（传空等于空操作），在这里标成"已卸载"
+// 反而会掩盖真实状态。卸载失败只告警，不挡删除。
+func (s *RepoService) releaseStaleMounts(ctx context.Context, repoID string) {
+	disks, err := s.Store.ListDisksByRepo(ctx, repoID)
+	if err != nil {
+		s.Log.Warn("读取存储库的磁盘失败", "repo_id", repoID, "error", err)
+		return
+	}
+	for i := range disks {
+		d := &disks[i]
+		if !d.Mounted {
+			continue
+		}
+		if err := s.Vol.UnmountVolume(ctx, d.VHDXPath, ""); err != nil {
+			s.Log.Warn("卸载存储库残留的本地挂载失败（回收任务将重试删除）",
+				"repo_id", repoID, "disk_id", d.ID, "path", d.VHDXPath, "error", err)
+			continue
+		}
+		s.Log.Info("已卸载存储库残留的本地挂载", "repo_id", repoID, "disk_id", d.ID)
+	}
 }
 
 // SetMembers 覆盖式设置可管理列表（仅 owner 或超级管理员可操作）。

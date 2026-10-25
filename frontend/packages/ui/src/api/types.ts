@@ -134,7 +134,7 @@ export interface RepoDTO {
   client_config?: Record<string, unknown>
   /** 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。 */
   pool: boolean
-  /** 建库进度：state=creating 时用于显示"正在派生差异盘 3/5"。 */
+  /** 建库进度：state=creating（界面新建）或 importing（上传收尾）时用于显示"正在派生差异盘 3/5"。 */
   prepare?: RepoPrepareDTO
   /** 迁移进度：state=moving 时用于在卡片与详情里显示复制进度。 */
   move?: RepoMoveDTO

@@ -18,7 +18,15 @@ import { CAPACITY_UNIT, capacityNormalize, capacityValueProps } from '../../util
 import { spacing } from '../../tokens/palette'
 import { RepoGroupSelect } from './RepoGroupSelect'
 import { SourceDirPicker, type SourceDirValue } from './SourceDirPicker'
-import { UploadCurrentFile, UploadMeta, UploadNotice, uploadPercent, uploadStageText } from './uploadView'
+import {
+  UploadBuildStage,
+  UploadCurrentFile,
+  UploadMeta,
+  UploadNotice,
+  uploadPercent,
+  uploadStageText,
+  useUploadPrepare
+} from './uploadView'
 
 export interface RepoCreateFormProps {
   isSuperAdmin: boolean
@@ -195,7 +203,23 @@ export function RepoCreateForm({
   return (
     <PageShell
       title={t('repo.create.title')}
-      extra={<Button onClick={onCancel}>{t('common.back')}</Button>}
+      extra={
+        tracked ? (
+          <Button onClick={onCancel}>{t('common.back')}</Button>
+        ) : (
+          <Space>
+            <Button onClick={onCancel}>{t('common.cancel')}</Button>
+            <Button
+              type="primary"
+              loading={mutation.isPending || uploadMutation.isPending}
+              disabled={!sourceDirValid}
+              onClick={() => void submit()}
+            >
+              {t('common.create')}
+            </Button>
+          </Space>
+        )
+      }
     >
       {error ? <ErrorNotice error={error} /> : null}
       {tracked ? (
@@ -219,7 +243,6 @@ export function RepoCreateForm({
             setPreallocate(values.preallocate !== false)
             autoFillName(changed)
           }}
-          style={{ maxWidth: 880 }}
         >
           {/* 分三段，按用户真正的思考顺序排：先想清楚"建个什么库"（名字 / 类型 / 归属），
               再决定"放在哪、多大"（存储 / 容量 / 预分配），最后才是"要不要导入数据"。
@@ -350,18 +373,6 @@ export function RepoCreateForm({
               <SourceDirPicker onValidityChange={setSourceDirValid} />
             </Form.Item>
           </SectionCard>
-
-          <Space style={{ marginTop: spacing.md }}>
-            <Button
-              type="primary"
-              loading={mutation.isPending || uploadMutation.isPending}
-              disabled={!sourceDirValid}
-              onClick={() => void submit()}
-            >
-              {t('common.create')}
-            </Button>
-            <Button onClick={onCancel}>{t('common.cancel')}</Button>
-          </Space>
         </Form>
       )}
     </PageShell>
@@ -428,6 +439,9 @@ function UploadPanel({
 }): JSX.Element {
   const { t } = useI18n()
   const active = ACTIVE_UPLOAD_STATES.includes(upload.state)
+  // 字节传完后的建库阶段（池位派生 / 目标下发）：百分比由服务端任务给出，
+  // 阶段明细由库的 prepare 快照给出。
+  const prepare = useUploadPrepare(upload)
 
   return (
     <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
@@ -453,6 +467,7 @@ function UploadPanel({
       {/* 与「上传任务」页共用同一份元信息（已传/总量 · 速度 · 预计剩余 · 文件 · 分块）：
           新建页是"刚发起的任务"、任务页是"回头查看同一件事"，两处口径必须一致。 */}
       <UploadMeta upload={upload} />
+      <UploadBuildStage upload={upload} prepare={prepare} />
       <UploadCurrentFile upload={upload} style={{ display: 'block' }} />
       <UploadNotice upload={upload} style={{ display: 'block' }} />
       {upload.state === 'done' ? (

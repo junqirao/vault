@@ -1212,6 +1212,7 @@
   "err.lease.not_found": "租约不存在",
   "err.lease.revoked": "该租约已被强制下线",
   "err.upload.not_found": "上传任务不存在",
+  "err.upload.target_unavailable": "上传目标不可用：服务端存放本次上传的磁盘未挂载或已离线。请检查该磁盘后重试；若已无法恢复，请取消本次上传并重新开始",
   "err.job.not_found": "任务不存在",
   "err.user.not_found": "用户不存在",
   "err.user.username_taken": "用户名已被占用（{username}）",
@@ -1428,9 +1429,9 @@
   "upload.task.currentFile": "当前文件",
   "notice.repoOverwritten": "已存在同名存储库，本次上传将覆盖重建它（库里原本的内容会被替换）",
   "upload.task.chunks": "分块",
-  "upload.task.buildProgress": "写入母盘 {percent}%",
   "upload.task.back": "返回存储库",
   "upload.task.pendingRepo": "上传完成后会自动创建存储库",
+  "upload.build.progress": "服务端建库 {percent}%",
   "upload.task.notFound": "上传任务不存在或已结束",
   "upload.task.notFoundDesc": "上传进度只保留在本机客户端；页面刷新或客户端重启后，已结束的任务可能不再显示。",
 

@@ -1212,6 +1212,7 @@
   "err.lease.not_found": "リースが存在しません",
   "err.lease.revoked": "このリースは強制切断されています",
   "err.upload.not_found": "アップロードジョブが存在しません",
+  "err.upload.target_unavailable": "アップロード先が利用できません：このアップロードを保持しているサーバー側のディスクがマウントされていないか、オフラインです。ディスクを確認して再試行するか、このアップロードをキャンセルして最初からやり直してください",
   "err.job.not_found": "ジョブが存在しません",
   "err.user.not_found": "ユーザーが存在しません",
   "err.user.username_taken": "ユーザー名は既に使用されています（{username}）",
@@ -1428,9 +1429,9 @@
   "upload.task.currentFile": "処理中のファイル",
   "notice.repoOverwritten": "同名のリポジトリが既に存在します。このアップロードで再構築され、以前の内容は置き換わります",
   "upload.task.chunks": "チャンク",
-  "upload.task.buildProgress": "ディスクへ書き込み中 {percent}%",
   "upload.task.back": "リポジトリ一覧へ戻る",
   "upload.task.pendingRepo": "アップロード完了後にリポジトリが自動作成されます",
+  "upload.build.progress": "サーバー側の構築 {percent}%",
   "upload.task.notFound": "アップロードタスクが見つからないか、すでに終了しています",
   "upload.task.notFoundDesc": "アップロードの進捗はこのクライアントにのみ保持されます。ページの再読み込みやクライアントの再起動後は、終了したタスクが表示されないことがあります。",
 

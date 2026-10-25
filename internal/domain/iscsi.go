@@ -124,8 +124,20 @@ type Upload struct {
 	TotalFiles    int   `db:"total_files" json:"total_files"`
 	TotalBytes    int64 `db:"total_bytes" json:"total_bytes"`
 	ReceivedBytes int64 `db:"received_bytes" json:"received_bytes"`
-	// StagingDir 暂存目录，必须与 disks 目录同卷。
+	// StagingDir 旧版暂存目录（只读兼容字段）。
+	//
+	// 新会话不再使用：数据直接写进母盘挂载点（见 MountRoot）。老会话（升级前创建、尚未完成）
+	// 仍是这个目录，GC / Abort 会把它们连同目录一起清掉。
 	StagingDir string `db:"staging_dir" json:"staging_dir"`
+	// RepoID / DiskID 本次上传正在写的母盘（新流程：建会话时就建好库与盘）。
+	//
+	// 数据直接写进这块盘的挂载点，不再"先落暂存目录、完成时再拷一遍"。
+	RepoID string `db:"repo_id" json:"repo_id"`
+	DiskID string `db:"disk_id" json:"disk_id"`
+	// MountRoot 母盘在服务端的挂载根（Windows 形如 `E:\`，Linux 形如 `/run/vault/uploads/xxx`）。
+	//
+	// 分块就绪后直接写到这里，路径即"母盘里的最终路径"。空 = 旧版暂存目录会话。
+	MountRoot string `db:"mount_root" json:"mount_root"`
 	// Manifest JSON 序列化的文件清单。
 	Manifest  string `db:"manifest" json:"manifest"`
 	State     string `db:"state" json:"state"`

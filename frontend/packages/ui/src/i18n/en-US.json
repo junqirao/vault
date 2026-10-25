@@ -1154,6 +1154,7 @@
   "err.lease.not_found": "Lease not found",
   "err.lease.revoked": "This lease has been force-offlined",
   "err.upload.not_found": "Upload task not found",
+  "err.upload.target_unavailable": "Upload target unavailable: the server disk holding this upload is not mounted or is offline. Check the disk and retry, or cancel this upload and start over",
   "err.job.not_found": "Job not found",
   "err.user.not_found": "User not found",
   "err.user.username_taken": "Username is already taken ({username})",
@@ -1370,9 +1371,9 @@
   "upload.task.currentFile": "Current file",
   "notice.repoOverwritten": "A repository with this name already exists. This upload will rebuild it, replacing its previous content",
   "upload.task.chunks": "Chunks",
-  "upload.task.buildProgress": "Writing to disk {percent}%",
   "upload.task.back": "Back to repositories",
   "upload.task.pendingRepo": "The repository is created automatically once the upload finishes",
+  "upload.build.progress": "Server build {percent}%",
   "upload.task.notFound": "Upload task not found or already finished",
   "upload.task.notFoundDesc": "Upload progress is kept on this client only; finished tasks may disappear after a page refresh or a client restart.",
 

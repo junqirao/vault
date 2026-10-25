@@ -37,7 +37,10 @@ import (
 //	9 → 移除母盘条件 `derived`：差异盘不再是独立状态，正常态（idle）可以同时存在差异盘；
 //	    维护态用来承载"清理差异盘 + 更新母盘"。存量 `parent_condition='derived'` 一律回填为
 //	    `idle`（它们本来就是有差异盘的正常库），使老库升级后不会卡在一个已不存在的状态上。
-const currentSchemaVersion = 9
+//	10 → uploads 新增 repo_id / disk_id / mount_root：上传改为**直接写母盘**（建会话时就建好
+//	    库与虚拟盘，挂载后把分块写进盘里），不再"先落暂存目录、完成时再整树拷一遍"。
+//	    这三列记下这次上传正在写的库/盘/挂载根；空 mount_root 表示升级前创建的旧会话。
+const currentSchemaVersion = 10
 
 // Migrate 建表并记录 schema 版本。
 //
@@ -164,6 +167,15 @@ func addColumns(ctx context.Context, q queryer, dialect Dialect) error {
 		{"disks", "accounted_bytes",
 			`ALTER TABLE disks ADD COLUMN accounted_bytes INTEGER NOT NULL DEFAULT 0`,
 			`ALTER TABLE disks ADD COLUMN accounted_bytes BIGINT NOT NULL DEFAULT 0`},
+		{"uploads", "repo_id",
+			`ALTER TABLE uploads ADD COLUMN repo_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE uploads ADD COLUMN repo_id VARCHAR(64) NOT NULL DEFAULT ''`},
+		{"uploads", "disk_id",
+			`ALTER TABLE uploads ADD COLUMN disk_id TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE uploads ADD COLUMN disk_id VARCHAR(64) NOT NULL DEFAULT ''`},
+		{"uploads", "mount_root",
+			`ALTER TABLE uploads ADD COLUMN mount_root TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE uploads ADD COLUMN mount_root VARCHAR(512) NOT NULL DEFAULT ''`},
 	}
 	for _, c := range columns {
 		exists, err := columnExists(ctx, q, dialect, c.table, c.column)

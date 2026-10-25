@@ -12,7 +12,15 @@ import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
 import { formatTime } from '../../utils/format'
-import { UploadCurrentFile, UploadMeta, UploadNotice, uploadPercent, uploadStageText } from './uploadView'
+import {
+  UploadBuildStage,
+  UploadCurrentFile,
+  UploadMeta,
+  UploadNotice,
+  uploadPercent,
+  uploadStageText,
+  useUploadPrepare
+} from './uploadView'
 
 export interface UploadTaskPageProps {
   uploadId: string
@@ -36,6 +44,8 @@ export function UploadTaskPage({ uploadId, onBack, onOpenRepo }: UploadTaskPageP
   const { t } = useI18n()
   const { uploads, refreshUploads } = useAgent()
   const upload = uploads.find((item) => item.upload_id === uploadId)
+  // 收尾阶段（字节已 100%）服务端在建池位：拿库的 prepare 快照，才能说清"在干什么"。
+  const prepare = useUploadPrepare(upload)
 
   // 直接打开/刷新本页时快照可能还没拉回来，主动补一次，免得把"还没加载"显示成"任务不存在"。
   useEffect(() => {
@@ -136,7 +146,13 @@ export function UploadTaskPage({ uploadId, onBack, onOpenRepo }: UploadTaskPageP
           <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
             {`${t('field.createdAt')} ${formatTime(upload.started_at)}`}
           </Typography.Text>
-          {active ? <Typography.Text type="secondary">{t('upload.task.pendingRepo')}</Typography.Text> : null}
+          {/* 收尾阶段不能再挂"上传完成后会自动创建"：库已经在建了，这句话会让人以为还剩一步。
+              换成服务端建库的实际进度（百分比 + 池位做到第几个）。 */}
+          {upload.state === 'completing' ? (
+            <UploadBuildStage upload={upload} prepare={prepare} />
+          ) : active ? (
+            <Typography.Text type="secondary">{t('upload.task.pendingRepo')}</Typography.Text>
+          ) : null}
           {upload.state === 'failed' ? (
             <ErrorNotice error={new ApiError({ kind: 'business', code: upload.error || 'system.internal' })} />
           ) : null}

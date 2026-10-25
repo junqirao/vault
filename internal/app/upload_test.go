@@ -283,3 +283,48 @@ func TestRequeueFailedCompleteJob(t *testing.T) {
 		})
 	}
 }
+
+// TestCountTreeSkipsVolumeSystemEntries 锁定"卷根上的系统条目不计入统计"。
+//
+// 真实故障：收尾任务在挂载点（卷根）上走查，撞到 Windows 自动创建的
+// System Volume Information（连管理员都读不了）→ upload.tree_invalid，整单上传在
+// 最后一刻失败。这类条目不是客户端传上来的内容，必须跳过。
+func TestCountTreeSkipsVolumeSystemEntries(t *testing.T) {
+	root := t.TempDir()
+	// 正常数据：一个目录两个文件。
+	sub := filepath.Join(root, "game", "bin")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("建目录失败：%v", err)
+	}
+	for _, name := range []string{"a.dat", "b.dat"} {
+		if err := os.WriteFile(filepath.Join(sub, name), make([]byte, 10), 0o644); err != nil {
+			t.Fatalf("写文件失败：%v", err)
+		}
+	}
+	// 卷自带条目：一个是目录（真实环境里读不了，这里只验证被排除），一个是根级分页文件。
+	if err := os.MkdirAll(filepath.Join(root, "System Volume Information"), 0o755); err != nil {
+		t.Fatalf("建系统目录失败：%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "System Volume Information", "x.bin"), make([]byte, 99), 0o644); err != nil {
+		t.Fatalf("写系统目录文件失败：%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "pagefile.sys"), make([]byte, 99), 0o644); err != nil {
+		t.Fatalf("写分页文件失败：%v", err)
+	}
+	// 同名目录出现在更深处是用户自己的数据，不能被当成系统条目跳过。
+	deep := filepath.Join(sub, "Recovery")
+	if err := os.MkdirAll(deep, 0o755); err != nil {
+		t.Fatalf("建深层目录失败：%v", err)
+	}
+	if err := os.WriteFile(filepath.Join(deep, "log.txt"), make([]byte, 5), 0o644); err != nil {
+		t.Fatalf("写深层文件失败：%v", err)
+	}
+
+	files, bytes, err := countTree(root)
+	if err != nil {
+		t.Fatalf("统计不应失败：%v", err)
+	}
+	if files != 3 || bytes != 25 {
+		t.Fatalf("应统计 3 个文件 25 字节（排除卷根系统条目），实际 %d 个 %d 字节", files, bytes)
+	}
+}

@@ -1,8 +1,10 @@
 import { Space, Typography } from 'antd'
 import type { CSSProperties } from 'react'
+import { useQuery } from '@tanstack/react-query'
 
 import type { UploadState, UploadStatus } from '../../api/agentTypes'
-import type { RepoDTO } from '../../api/types'
+import type { RepoDTO, RepoPrepareDTO } from '../../api/types'
+import { useApi } from '../../api/provider'
 import { useI18n, type I18nApi } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
 import { formatBytes, formatSpeed } from '../../utils/format'
@@ -33,18 +35,81 @@ export function uploadStageText(t: I18nApi['t'], state: UploadStatus): string {
 }
 
 /**
- * 上传任务的进度百分比。
+ * 上传任务的进度百分比：**全流程只有一条进度**。
  *
- * 建库（completing）阶段改用建库进度：那一刻字节已经传完，但服务端正在把整棵树写进母盘，
- * 真正的长活（30G 的库就是 30G 的读 + 30G 的写）全在这里。让进度条继续钉在 100%，
- * 用户看到的就是"卡住了"；阶段文案已经换成"建库中"，进度条在这个节点重新计数才说得通。
+ * 以前这里有个分叉 —— 进入收尾（completing）后改用 build_progress 从 0 重新数到 100：
+ * 旧流程在那一刻要把暂存目录里的整棵树再拷进 VHDX，是另一段几十分钟的长活。现在数据
+ * 在上传时就**直接写进母盘**（服务端 provisionUploadTarget 建盘挂载，分块即最终位置），
+ * 收尾只剩卸载、打标与登记，秒级完成。再让进度条回零重数，用户看到的就是"传完了又倒退"。
+ *
+ * 因此：扫描 / 准备阶段钉在 0（没有可细分的字节），传输阶段按字节算，收尾保持 100。
  */
 export function uploadPercent(upload: UploadState): number {
-  if (upload.state === 'completing' && upload.build_progress) {
-    return Math.min(100, upload.build_progress)
-  }
+  if (upload.state === 'completing') return 100
   if (!upload.total_bytes || upload.total_bytes <= 0) return 0
   return Math.min(100, Math.round((upload.uploaded_bytes / upload.total_bytes) * 100))
+}
+
+/**
+ * 收尾阶段（completing）的「库建到哪一步」。
+ *
+ * 为什么需要单独取一次：这段时间字节已经传完（进度条钉在 100%），服务端在派生池位差异盘、
+ * 逐个下发 iSCSI 目标 —— 每块盘都要独占打开母盘 VHDX，Windows 上一次目标下发约 15 秒，
+ * 预分配十几个池位就是几分钟到十几分钟。没有这一步的信息，界面给出的只有「100% + 建库中」，
+ * 用户唯一能得出的结论是「卡死了」。
+ *
+ * 数据用库列表里的 prepare 快照（服务端 setRepoPrepare 落库，见 domain.RepoPrepare）：
+ * 上传建库的库在收尾期间已经存在（state=importing），按库名就能对上。
+ *
+ * 3 秒轮询：这一阶段是分钟级，而 job 事件只带百分比、带不出阶段。
+ */
+export function useUploadPrepare(upload: UploadState | null | undefined): RepoPrepareDTO | undefined {
+  const api = useApi()
+  const name = upload?.repo_name ?? ''
+  const enabled = name !== '' && upload?.state === 'completing'
+  const query = useQuery({
+    queryKey: ['repo-prepare', name],
+    queryFn: () => api.listRepos({ limit: 200 }),
+    enabled,
+    refetchInterval: enabled ? 3000 : false
+  })
+  if (!enabled) return undefined
+  return query.data?.items.find((item) => item.name === name)?.prepare
+}
+
+/**
+ * 收尾阶段的细化进度：服务端建库任务走到百分之几、以及当前阶段做到第几个。
+ *
+ * 为什么不把它画成第二条进度条：主进度条表示「字节传完了」，这里表示「库建到哪一步」，
+ * 两者是不同度量；同一条里让 100% 回落到 40% 正是历史上被投诉的「传完了又倒退」
+ * （见 uploadPercent 的说明）。所以主条保持 100%，这一行只用文字给出后半段的实感。
+ */
+export function UploadBuildStage({
+  upload,
+  prepare
+}: {
+  upload: UploadState
+  prepare?: RepoPrepareDTO
+}): JSX.Element | null {
+  const { t } = useI18n()
+  if (upload.state !== 'completing') return null
+  // 缺省（任务还没报第一次进度）时不显示 "0%"，那不是真实进度。
+  const percent = upload.build_progress
+  const stage =
+    percent === undefined
+      ? null
+      : t('upload.build.progress', { percent: Math.max(0, Math.min(100, percent)) })
+  if (stage === null && !prepare) return null
+  return (
+    <Space size={spacing.md} wrap>
+      {stage === null ? null : <Typography.Text type="secondary">{stage}</Typography.Text>}
+      {prepare && prepare.total > 0 ? (
+        <Typography.Text type="secondary">
+          {`${t(`repo.prepare.${prepare.phase}`)} ${prepare.done}/${prepare.total}`}
+        </Typography.Text>
+      ) : null}
+    </Space>
+  )
 }
 
 /**
@@ -68,7 +133,7 @@ export function uploadEtaText(t: I18nApi['t'], seconds: number | undefined): str
 }
 
 /**
- * 进度元信息行：已传 / 总量 · 速度 · 预计剩余 · 文件 · 分块 · 写入母盘。
+ * 进度元信息行：已传 / 总量 · 速度 · 预计剩余 · 文件 · 分块。
  *
  * 速度与剩余只在"还没传完"时展示：任务一旦结束（完成/失败/取消），这两个数就不再变化，
  * 留在界面上只会让人以为还在动。
@@ -77,14 +142,13 @@ export function uploadEtaText(t: I18nApi['t'], seconds: number | undefined): str
  * 确实落盘并校验通过了"。服务端在上传过程中逐文件回报（不是等整库传完一次性校验），
  * 于是这个数字会一路往上走 —— 100GB 的任务也不会看起来像卡住。
  *
- * 「写入母盘 N%」为什么必须在这里：进入建库（completing）后字节进度已经满了，速度与剩余
- * 也随之失去意义（不再有网络传输），此时唯一还在动的是服务端把整棵树写进虚拟盘的进度。
- * 不展示它就只剩一句"建库中"钉在 100% 的进度条上 —— 30G 的库要几十分钟，用户只会认为卡死。
+ * 收尾（completing）阶段不再展示速度和剩余时间：字节已经传完，这两个数不再变动，
+ * 留在界面上只会让人以为还在动。以前这里还要展示一段「写入母盘 N%」，那是因为旧流程
+ * 在收尾时才开始往虚拟盘里拷整棵树；现在上传即写盘，收尾只剩卸载与登记，没有第二段进度。
  */
 export function UploadMeta({ upload }: { upload: UploadState }): JSX.Element {
   const { t } = useI18n()
   const building = upload.state === 'completing'
-  const buildProgress = upload.build_progress ?? 0
   const running = upload.state === 'scanning' || upload.state === 'creating' ||
     upload.state === 'uploading' || upload.state === 'completing'
 
@@ -101,11 +165,6 @@ export function UploadMeta({ upload }: { upload: UploadState }): JSX.Element {
       {running && !building ? (
         <Typography.Text type="secondary">
           {`${t('upload.eta')} ${uploadEtaText(t, upload.eta_seconds)}`}
-        </Typography.Text>
-      ) : null}
-      {building && buildProgress > 0 ? (
-        <Typography.Text type="secondary">
-          {t('upload.task.buildProgress', { percent: String(buildProgress) })}
         </Typography.Text>
       ) : null}
       {upload.files_total > 0 ? (

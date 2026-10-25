@@ -122,12 +122,12 @@ type UploadState struct {
 	// 静默做完对用户不公平 —— "上次失败那次的痕迹被清掉了 / 同名库正在被重建"必须看得见。
 	// 传的是码不是句子：文案要跟着界面语言走（前端 uploadNoticeText）。
 	Notice string `json:"notice,omitempty"`
-	// BuildProgress 是服务端建库任务的进度（0~100，只在 completing 阶段有意义）。
+	// BuildProgress 是服务端收尾任务的进度（0~100，只在 completing 阶段有意义）。
 	//
-	// 为什么要单独一个字段而不是把它并进字节进度：上传的字节数在提交建库的那一刻就已经满了
-	// （进度条 100%），而建库是**另一件活**——把刚上传的整棵树再写一份进新建的虚拟盘，
-	// 30G 的库就是 30G 的读 + 30G 的写。以前客户端只盯任务状态、把这个进度丢掉，
-	// 用户看到的就是"100% + 校验中"钉死几十分钟（真实反馈：上传 30G，等了半小时）。
+	// 新流程下分块在上传时就**直接写进母盘**，收尾只剩核对、卸载、贴标签与预分配差异盘池，
+	// 秒级到分钟级。界面因此坚持一条进度（字节走完就停在 100），不再把它当成第二段进度条
+	// 从 0 重数 —— 那正是用户看到的"传完了又倒退"。字段本身保留：预分配池这类步骤仍可能
+	// 花时间，日志与诊断需要知道服务端走到哪一步。
 	BuildProgress int    `json:"build_progress,omitempty"`
 	JobID         string `json:"job_id,omitempty"`
 	RepoID        string `json:"repo_id,omitempty"`
@@ -1366,8 +1366,8 @@ func uploadJobFinished(j *serverJob) bool {
 
 // reportBuildProgress 把服务端建库任务的进度写进上传状态，并在变化时推给界面。
 //
-// 只在数值真的变了才推：进度来自服务端事件（变化驱动）+ 兜底查询，而建库任务的进度粒度是
-// 1%（拷入阶段每两秒采样一次），无脑推送只会让前端白白重渲染。
+// 只在数值真的变了才推：进度来自服务端事件（变化驱动）+ 兜底查询，而收尾任务的进度粒度是
+// 1%（按步骤采样），无脑推送只会让前端白白重渲染。
 func (a *Agent) reportBuildProgress(task *uploadTask, j *serverJob) {
 	if task == nil || j == nil || j.Progress <= 0 {
 		return
