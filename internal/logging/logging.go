@@ -2,6 +2,9 @@
 //
 // 依据用户偏好：日志只输出到文件，不接入 OTel / 链路追踪。
 // 这里用 log/slog 输出 JSON，按天切分文件，并保留最近 N 天。
+//
+// 多语言：日志文件里的 msg 固定为英文，并附 msg_key（见 messages.go / localize.go）；
+// 前端日志页按用户当前语言渲染 msg_key，文件本身不随用户语言变化。
 package logging
 
 import (
@@ -118,7 +121,7 @@ func New(opt Options) (*Logger, error) {
 		out = io.MultiWriter(writers...)
 	}
 
-	handler := slog.NewJSONHandler(out, &slog.HandlerOptions{
+	var handler slog.Handler = slog.NewJSONHandler(out, &slog.HandlerOptions{
 		Level: level,
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			// 时间统一为毫秒时间戳，便于与 DB 中的 INTEGER 时间字段对齐。
@@ -130,6 +133,9 @@ func New(opt Options) (*Logger, error) {
 			return a
 		},
 	})
+	// 日志收敛 + 英文正文 + msg_key（见 messages.go / localize.go）。
+	// debug 级别保留未收录的原始日志，默认级别只输出约 60 种可翻译事件。
+	handler = newLocalizeHandler(handler, level <= slog.LevelDebug)
 
 	logger := slog.New(handler)
 	if singleFileErr != nil {

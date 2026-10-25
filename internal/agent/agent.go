@@ -708,7 +708,15 @@ func (a *Agent) updateHostState(next HostState) {
 	a.hub.Publish(Event{Type: "host", Data: next})
 }
 
-// runHostRecheckLoop 在未就绪期间低频复检（就绪后不再探测）。
+// publishHostState 广播当前主机状态快照（即使状态没变）。
+//
+// 用于修复"事件早于渲染层事件流建立而被丢掉，界面永远停在未就绪"的问题：
+// runHostRecheckLoop 每 30s 重播一次，界面最多 30s 内回到真实状态。
+func (a *Agent) publishHostState() {
+	a.hub.Publish(Event{Type: "host", Data: a.hostState()})
+}
+
+// runHostRecheckLoop 在未就绪期间低频复检，并周期性重播状态快照。
 //
 // 目的：管理员按提示 `Start-Service MSiSCSI` 后，界面横幅能自动消失 —— 而不是
 // "重启客户端才消失"（这类提示最容易变成噪音）。
@@ -721,12 +729,14 @@ func (a *Agent) runHostRecheckLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 		}
-		if a.hostState().ISCSIReady {
-			continue
+		if !a.hostState().ISCSIReady {
+			probeCtx, cancel := context.WithTimeout(ctx, defaultProbeTimeout)
+			a.refreshHostState(probeCtx)
+			cancel()
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, defaultProbeTimeout)
-		a.refreshHostState(probeCtx)
-		cancel()
+		// 不论是否就绪都重播一次当前快照：首次探测可能发生在渲染层事件流建立之前，
+		// 只靠"变化才推送"会让界面永远停在旧的未就绪状态。
+		a.publishHostState()
 	}
 }
 

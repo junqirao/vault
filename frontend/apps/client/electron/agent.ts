@@ -61,9 +61,9 @@ export interface AgentRequestResult {
 
 /** 代理事件流（SSE）推送到渲染进程的消息。 */
 export type AgentStreamMessage =
-  | { kind: 'open' }
-  | { kind: 'error' }
-  | { kind: 'event'; type: string; data: string }
+  | { kind: 'open'; stream?: string }
+  | { kind: 'error'; stream?: string }
+  | { kind: 'event'; type: string; data: string; stream?: string }
 
 const READY_TIMEOUT_MS = 15000
 const MAX_RESTARTS_PER_WINDOW = 5
@@ -412,7 +412,7 @@ export class AgentManager {
    *
    * 返回取消函数。连接中断只上报一次 `error`，重连由渲染进程侧的退避逻辑发起。
    */
-  openEventStream(onMessage: (message: AgentStreamMessage) => void): () => void {
+  openEventStream(path: string, onMessage: (message: AgentStreamMessage) => void): () => void {
     const { available, baseUrl, token } = this.info
     if (!available || !baseUrl || !token) {
       onMessage({ kind: 'error' })
@@ -428,7 +428,7 @@ export class AgentManager {
     }
 
     request = http.get(
-      `${baseUrl}/agent/events`,
+      `${baseUrl}${path}`,
       { headers: { Accept: 'text/event-stream', 'X-Vault-Agent-Token': token } },
       (response) => {
         if (closed) {

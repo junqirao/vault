@@ -499,6 +499,30 @@ CacheTargetStatus = {
   否则仍在飞的命令会失败）。
 
 ```
+GET /agent/performance            # 我的存储库首页「性能指标」
+  ↑ {
+    interval_sec,                 # 采样间隔（当前 5 秒）
+    l1_limit_bytes, l2_limit_bytes,   # 当前客户端缓存预算
+    points: [{                     # 近 5 分钟，按时间升序
+      t,
+      read_iops, write_iops,       # 经过代理的读/写命令数每秒
+      read_bytes_per_sec, write_bytes_per_sec,
+      hit_rate,                    # 本采样区间的缓存命中率（0..1）
+      l1_used_bytes, l2_used_bytes, cache_used_bytes
+    }]
+  }
+  # 采样与差分由代理每 5 秒在 sampleLoop 里完成；本接口只复制缓存，
+  # 前端定时读取即可，不在请求里重新扫目标或计算速率。
+```
+
+```
+GET /agent/performance/events       # 性能页专用 SSE（页面挂载才连接）
+  event: performance
+  data: PerformanceHistory          # 建连先推一份当前快照，之后每次采样推一条
+  # 页面卸载立即断开；全局 /agent/events 不承载性能事件。
+```
+
+```
 POST /agent/cache/clear            # 存储库设置里的"清空缓存"
   ↓ {repo_id} | {allocation_id}    # 二者其一；都省略 → 400 system.invalid_param
   ↑ {cleared:bool, allocation_ids:[string]}

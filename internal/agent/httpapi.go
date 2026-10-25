@@ -53,6 +53,13 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/media-type", a.handleMediaType)
 	// 近 5 分钟的缓存指标采样（存储库页面"缓存指标曲线"弹窗）。
 	mux.HandleFunc("GET /agent/cache/history", a.handleCacheHistory)
+	// 近 5 分钟的全局性能曲线（IOPS / 吞吐 / 缓存占用 / 命中率）。
+	//
+	// 数据由缓存代理每 5 秒采样并算好；这里只返回缓存，前端不在请求里做差分。
+	mux.HandleFunc("GET /agent/performance", a.handlePerformance)
+	// 性能页专用 SSE：页面挂载时连接，关闭时断开。连接建立先推一份完整快照，
+	// 之后每次采样推一条增量快照（都是已算好的点）。
+	mux.HandleFunc("GET /agent/performance/events", a.handlePerformanceEvents)
 	// 清空某个库的本地读缓存内容（两级都清，会话与门户目标都留着）——存储库设置里的
 	// "清空缓存"。POST 而非 DELETE 的理由同上：主进程按方法放行。
 	mux.HandleFunc("POST /agent/cache/clear", a.handleCacheClear)
@@ -518,6 +525,75 @@ func (a *Agent) handleCacheHistory(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, a.cache.History())
 }
 
+// handlePerformance 返回近 5 分钟的全局性能曲线（已由代理侧采样计算好）。
+func (a *Agent) handlePerformance(w http.ResponseWriter, _ *http.Request) {
+	a.writeJSON(w, http.StatusOK, a.cache.Performance())
+}
+
+// handlePerformanceEvents 是性能页专用 SSE：连接时先推完整快照，之后随采样推送。
+func (a *Agent) handlePerformanceEvents(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		a.writeError(w, apperr.New(apperr.CodeUnavailable, http.StatusInternalServerError))
+		return
+	}
+	hub := a.cache.PerformanceHub()
+	if hub == nil {
+		a.writeError(w, apperr.New(apperr.CodeUnavailable, http.StatusServiceUnavailable))
+		return
+	}
+
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream; charset=utf-8")
+	h.Set("Cache-Control", "no-store")
+	h.Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	writeEvent := func(data any) bool {
+		payload, err := json.Marshal(data)
+		if err != nil {
+			return true
+		}
+		if _, err := fmt.Fprintf(w, "event: %s\ndata: %s\n\n", localPerformanceEventType, payload); err != nil {
+			return false
+		}
+		flusher.Flush()
+		return true
+	}
+
+	// 先给一份当前快照：页面不必等下一个 5 秒采样才有内容。
+	if !writeEvent(a.cache.Performance()) {
+		return
+	}
+
+	id, ch := hub.Subscribe()
+	defer hub.Unsubscribe(id)
+
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case ev, open := <-ch:
+			if !open {
+				return
+			}
+			if !writeEvent(ev.Data) {
+				return
+			}
+		case <-ticker.C:
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
 // cacheClearRequest 是清空缓存的入参：给 repo_id（界面手里只有库 ID）或
 // allocation_id，至少一个。
 type cacheClearRequest struct {
@@ -699,6 +775,15 @@ func (a *Agent) handleEvents(w http.ResponseWriter, r *http.Request) {
 	h.Set("Connection", "keep-alive")
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+
+	// 建连先补一条当前主机状态：首次探测/状态变化可能发生在渲染层订阅之前，
+	// 只靠事件会让界面一直停在旧的"未就绪"提示。
+	if data, err := json.Marshal(a.hostState()); err == nil {
+		if _, err := fmt.Fprintf(w, "event: host\ndata: %s\n\n", data); err != nil {
+			return
+		}
+		flusher.Flush()
+	}
 
 	id, ch := a.hub.Subscribe()
 	defer a.hub.Unsubscribe(id)

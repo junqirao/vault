@@ -25,6 +25,7 @@ import type {
   AgentMountMode,
   AgentMountState,
   AgentMountVolumeUsage,
+  AgentPerformanceHistory,
   AgentRepoEvent,
   AgentRepoMountPref,
   AgentServerState,
@@ -87,9 +88,9 @@ export interface AgentRequestResult {
 
 /** 代理事件流（SSE）消息。 */
 export type AgentStreamMessage =
-  | { kind: 'open' }
-  | { kind: 'error' }
-  | { kind: 'event'; type: string; data: string }
+  | { kind: 'open'; stream?: string }
+  | { kind: 'error'; stream?: string }
+  | { kind: 'event'; type: string; data: string; stream?: string }
 
 /** 系统目录选择结果（`canceled` 为用户取消）。 */
 export interface DirectorySelection {
@@ -109,8 +110,8 @@ export interface VaultBridge {
   getAgent: () => Promise<VaultAgentInfo>
   onAgentChanged: (cb: (info: VaultAgentInfo) => void) => (() => void) | void
   agentRequest?: (options: AgentRequestOptions) => Promise<AgentRequestResult>
-  agentEventsStart?: () => Promise<boolean>
-  agentEventsStop?: () => Promise<boolean>
+  agentEventsStart?: (path?: string) => Promise<boolean>
+  agentEventsStop?: (path?: string) => Promise<boolean>
   onAgentEvent?: (cb: (message: AgentStreamMessage) => void) => (() => void) | void
   /** 把某个服务端的证书指纹登记为可信（TOFU）；见 trustServerCertificate。 */
   trustCertificate?: (serverUrl: string, sha256: string) => Promise<boolean>
@@ -386,9 +387,10 @@ const MOUNT_TIMEOUT_MS = 300000
  * 换成 IPC 后无需改动它们的用法。
  */
 function ipcEventStream(
-  start: () => Promise<boolean>,
-  stop: () => Promise<boolean>,
-  onEvent: (cb: (message: AgentStreamMessage) => void) => (() => void) | void
+  start: (path?: string) => Promise<boolean>,
+  stop: (path?: string) => Promise<boolean>,
+  onEvent: (cb: (message: AgentStreamMessage) => void) => (() => void) | void,
+  path: string
 ): AgentEventStream {
   const listeners = new Map<string, Set<(event: Event) => void>>()
   let detach: () => void = () => undefined
@@ -413,18 +415,21 @@ function ipcEventStream(
     },
     close: () => {
       detach()
-      void stop()
+      void stop(path)
     }
   }
 
   const off = onEvent((message) => {
+    // 主进程可能同时转发多条流；只接自己这条，避免性能事件串到全局流。
+    if (message.stream && message.stream !== path) return
+    if (!message.stream && path !== '/agent/events') return
     if (message.kind === 'open') stream.onopen?.(new Event('open'))
     else if (message.kind === 'error') stream.onerror?.(new Event('error'))
     else emit(message.type, message.data)
   })
   if (typeof off === 'function') detach = off
 
-  void start()
+  void start(path)
   return stream
 }
 
@@ -797,6 +802,15 @@ export const agentApi = {
   },
 
   /**
+   * 读取代理侧已经算好的近 5 分钟性能曲线（IOPS / 吞吐 / 缓存占用 / 命中率）。
+   *
+   * 采样与速率计算都在代理的定时任务里完成，本接口只返回缓存。
+   */
+  getPerformance(): Promise<AgentPerformanceHistory> {
+    return request<AgentPerformanceHistory>({ method: 'GET', path: '/agent/performance' })
+  },
+
+  /**
    * 清空某个存储库的本地读缓存内容（L1 内存缓存 + L2 文件两级一起丢），用于存储库设置里的
    * "清空缓存"。**不**关缓存、不断会话：门户目标与挂载都留着，后续读照常重新填充。
    *
@@ -917,18 +931,23 @@ export const agentApi = {
    * 浏览器 dev：直连 EventSource，令牌走查询参数（EventSource 无法自定义请求头）。
    * 需先完成一次探针调用（resolveTransport），否则同步抛出 AgentUnavailableError。
    */
-  subscribe(): AgentEventStream {
+  subscribe(path = '/agent/events'): AgentEventStream {
     const host = hostBridge()
     const start = host?.agentEventsStart
     const stop = host?.agentEventsStop
     const onEvent = host?.onAgentEvent
-    if (start && stop && onEvent) return ipcEventStream(start, stop, onEvent)
+    if (start && stop && onEvent) return ipcEventStream(start, stop, onEvent, path)
     if (!transport || transport.kind !== 'http') throw new AgentUnavailableError()
     // ⚠️ 浏览器回退分支不支持 SSE 鉴权：代理的 tokenMiddleware 只认 `X-Vault-Agent-Token`
     // 请求头，而 EventSource 无法设置请求头，因此本分支恒返回 401、事件通道不可用。
     // 仅 Electron 主进程通道（ipcEventStream）才能真正建立事件流，此处保留只为开发环境不崩溃。
     const query = new URLSearchParams({ token: transport.token })
-    return new EventSource(`${transport.baseUrl}/agent/events?${query.toString()}`)
+    return new EventSource(`${transport.baseUrl}${path}?${query.toString()}`)
+  },
+
+  /** 性能页专用事件流：只在页面挂载时建立，卸载即断开。 */
+  subscribePerformance(): AgentEventStream {
+    return this.subscribe('/agent/performance/events')
   },
 
   /** 打开挂载目录（Electron 下走 shell.openPath）。 */

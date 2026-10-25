@@ -1,7 +1,8 @@
 {
   "name": "@vault/client",
-  "version": "0.1.182",
+  "version": "0.1.192",
   "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "description": "Vault",
   "main": "dist-electron/main.js",
   "scripts": {

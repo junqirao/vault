@@ -76,6 +76,8 @@ export function App(): JSX.Element {
   const setLanguage = useAppStore((state) => state.setLanguage)
   const setActiveServer = useAppStore((state) => state.setActive)
   const upsertServer = useAppStore((state) => state.upsertServer)
+  const addServer = useAppStore((state) => state.addServer)
+  const updateServer = useAppStore((state) => state.updateServer)
   const removeServer = useAppStore((state) => state.removeServer)
   const updateActiveServer = useAppStore((state) => state.updateActiveServer)
   const updateServerToken = useAppStore((state) => state.updateServerToken)
@@ -163,7 +165,14 @@ export function App(): JSX.Element {
    */
   const pushAgentSession = useCallback(async (): Promise<void> => {
     const store = useAppStore.getState()
-    const targets = store.servers
+    // 只把"开启自动连接的服务端"与"当前活动服务端"推给代理：
+    // 关闭自动连接的非活动服务端不预热会话、不自动挂载（用户可能在设置里只是保留备用）。
+    const targets = store.servers.filter((entry) => entry.key === store.activeKey || entry.autoConnect !== false)
+    const disabled = store.servers.filter((entry) => entry.key !== store.activeKey && entry.autoConnect === false)
+    // 关掉自动连接后，把代理侧可能残留的会话/自动挂载撤掉；失败不影响当前连接。
+    await Promise.all(
+      disabled.map((entry) => agentApi.clearSession(entry.key).catch(() => undefined))
+    )
     if (targets.length === 0) return
     // 当前活动服务端：它就是"主服务端"。代理的更新源（检查更新/自更新）等"没有服务端上下文"
     // 的操作默认打在主服务端上，而主服务端只认**客户端显式的选择**（代理侧别无途径知道用户
@@ -335,7 +344,8 @@ export function App(): JSX.Element {
         baseUrl: effective,
         serverName: probe.server_name || '',
         instanceId: probe.server_instance_id || undefined,
-        certSha256
+        certSha256,
+        autoConnect: true
       }
       upsertServer(entry)
       if (useAppStore.getState().activeKey === before) flow.recheck()
@@ -388,7 +398,9 @@ export function App(): JSX.Element {
    * 未记住我的会话只改内存里那一份 —— 角色不落盘，否则下次启动会出现"没令牌却像已登录"。
    */
   useEffect(() => {
-    if (!active) return
+    // 启动流程本身会先拿需要认证的接口验证令牌；在它判定 ready 之前再发一次 /auth/me，
+    // 只会在令牌过期/服务端刚重启时多打一发注定 401 的请求。等 ready 后再刷新角色。
+    if (!hydrated || flow.phase.kind !== 'ready' || !active) return
     const volatile = volatileSessionRef.current
     const sameKey = volatile?.key === active.key
     if (!active.token && !sameKey) return
@@ -414,7 +426,7 @@ export function App(): JSX.Element {
     return () => {
       cancelled = true
     }
-  }, [active, api, updateServerUser])
+  }, [active, api, flow.phase.kind, hydrated, updateServerUser])
 
   const handleLogin = useCallback(
     async (values: { username: string; password: string; remember: boolean }): Promise<void> => {
@@ -591,6 +603,8 @@ export function App(): JSX.Element {
                 active,
                 setActive: setActiveServer,
                 upsert: upsertServer,
+                addServer,
+                updateServer,
                 remove: removeServer,
                 updateActive: updateActiveServer
               }}

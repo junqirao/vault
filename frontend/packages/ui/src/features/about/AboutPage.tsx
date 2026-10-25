@@ -24,6 +24,10 @@ import { fontSize, palette, radius, spacing } from '../../tokens'
  */
 const LICENSE_LINKS: ReadonlyArray<{ labelKey: string; url: string }> = [
   {
+    labelKey: 'about.licenseProject',
+    url: 'https://github.com/junqirao/vault/blob/main/LICENSE'
+  },
+  {
     labelKey: 'about.licenseElectron',
     url: 'https://github.com/electron/electron/blob/main/LICENSE'
   },
@@ -32,6 +36,9 @@ const LICENSE_LINKS: ReadonlyArray<{ labelKey: string; url: string }> = [
     url: 'https://chromium.googlesource.com/chromium/src/+/refs/heads/main/LICENSE'
   }
 ]
+
+/** 项目主页：放在「关于」里，方便直接找到源码与问题反馈入口。 */
+const PROJECT_URL = 'https://github.com/junqirao/vault'
 
 export interface AboutPageProps {
   /**
@@ -168,6 +175,17 @@ export function AboutPage({ clientVersion }: AboutPageProps): JSX.Element {
             {infoQuery.isLoading ? '…' : serverVersion}
           </Descriptions.Item>
           <Descriptions.Item label={t('about.platform')}>{platform}</Descriptions.Item>
+          <Descriptions.Item label={t('about.projectUrl')}>
+            <Typography.Link
+              href={PROJECT_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="selectable"
+              style={{ fontSize: fontSize.sm }}
+            >
+              {PROJECT_URL}
+            </Typography.Link>
+          </Descriptions.Item>
         </Descriptions>
       </SectionCard>
 

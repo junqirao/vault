@@ -268,6 +268,9 @@ const (
 	localManifestEventType   = "manifest"
 	localVerifyDiffEventType = "verifydiff"
 	localRepoEventType       = "repo"
+	// localPerformanceEventType 是"我的存储库 → 性能指标"专用 SSE 事件名。
+	// 与全局 /agent/events 分开：只在该页面挂载时建立订阅，页面关闭即断开。
+	localPerformanceEventType = "performance"
 	// serverVerifyDiffEventType 是服务端上传核对细粒度进度的 SSE topic。
 	serverVerifyDiffEventType = "verifydiff"
 )

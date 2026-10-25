@@ -581,6 +581,35 @@ export interface AgentCacheHistory {
   targets: Record<string, AgentCacheSample[]>
 }
 
+/** GET /agent/performance 的一条性能点（代理侧已算好速率）。 */
+export interface AgentPerformancePoint {
+  /** 采样时刻（Unix 秒）。 */
+  t: number
+  /** 读写命令数每秒。 */
+  read_iops: number
+  write_iops: number
+  /** 读写吞吐（字节/秒）。 */
+  read_bytes_per_sec: number
+  write_bytes_per_sec: number
+  /** 本区间缓存命中率（0..1）。 */
+  hit_rate: number
+  /** 当前 L1 / L2 / 合计缓存占用（字节）。 */
+  l1_used_bytes: number
+  l2_used_bytes: number
+  cache_used_bytes: number
+}
+
+/** GET /agent/performance 的响应：近 5 分钟全局性能曲线。 */
+export interface AgentPerformanceHistory {
+  /** 采样间隔（秒）。 */
+  interval_sec: number
+  /** 当前 L1 / L2 缓存预算（字节）；0 表示未配置/未启用。 */
+  l1_limit_bytes: number
+  l2_limit_bytes: number
+  /** 按时间升序。 */
+  points: AgentPerformancePoint[]
+}
+
 /** GET /agent/identity 与 POST /agent/identity/install 的响应（永不含私钥与证书原文）。 */
 export interface AgentIdentity {
   installed: boolean

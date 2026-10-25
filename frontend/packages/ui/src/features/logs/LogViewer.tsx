@@ -13,7 +13,7 @@ import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
-import { useI18n } from '../../i18n'
+import { hasKey, useI18n } from '../../i18n'
 import { fontSize, palette, radius, spacing } from '../../tokens/palette'
 
 /**
@@ -39,7 +39,11 @@ interface LogEntry {
   ts: number | null
   level: string
   msg: string
-  /** 除 ts_ms/level/msg 之外的结构化字段（保持原始顺序）。 */
+  /** 服务端写入的稳定消息键；前端据此把 msg 渲染成当前语言。 */
+  msgKey: string | null
+  /** 当前界面的展示文案（有翻译用翻译，否则回退英文 msg）。 */
+  display: string
+  /** 除 ts_ms/level/msg/msg_key 之外的结构化字段（保持原始顺序）。 */
   fields: [string, unknown][]
   /** 原始对象，供展开行展示完整 JSON。 */
   json: Record<string, unknown> | null
@@ -56,6 +60,8 @@ function parseEntry(line: string, index: number): LogEntry {
     ts: null,
     level: '',
     msg: line,
+    msgKey: null,
+    display: line,
     fields: [],
     json: null,
     raw: line,
@@ -73,10 +79,22 @@ function parseEntry(line: string, index: number): LogEntry {
   const ts = typeof record.ts_ms === 'number' ? record.ts_ms : null
   const level = typeof record.level === 'string' ? record.level : ''
   const msg = typeof record.msg === 'string' ? record.msg : ''
+  const msgKey = typeof record.msg_key === 'string' && record.msg_key !== '' ? record.msg_key : null
   delete record.ts_ms
   delete record.level
   delete record.msg
-  return { ...base, parsed: true, ts, level, msg, fields: Object.entries(record), json: value as Record<string, unknown> }
+  delete record.msg_key
+  return {
+    ...base,
+    parsed: true,
+    ts,
+    level,
+    msg,
+    msgKey,
+    display: msg,
+    fields: Object.entries(record),
+    json: value as Record<string, unknown>
+  }
 }
 
 /** 把原始日志文本（JSON Lines）解析成结构化记录。 */
@@ -89,6 +107,30 @@ function parseEntries(text: string): LogEntry[] {
     out.push(parseEntry(line, index))
   }
   return out
+}
+
+/** 把日志字段转成模板参数（只取可安全插值的标量）。 */
+function logMessageParams(entry: LogEntry): Record<string, string> {
+  const params: Record<string, string> = {}
+  for (const [key, value] of entry.fields) {
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+      params[key] = String(value)
+    }
+  }
+  return params
+}
+
+/**
+ * 按当前界面语言渲染日志消息。
+ *
+ * 服务端写入的 msg 是英文、msg_key 是稳定事件键；这里优先用 msg_key 查 i18n，
+ * 查不到（含英文界面）就回退英文原文——绝不把裸 key 显示给用户。
+ */
+function localizeLogMessage(entry: LogEntry, t: (key: string, args?: Record<string, unknown>) => string): string {
+  if (!entry.msgKey) return entry.msg
+  const key = `log.event.${entry.msgKey}`
+  if (!hasKey(key)) return entry.msg
+  return t(key, logMessageParams(entry))
 }
 
 /** 字段值 → 单行摘要（字符串原样，对象/数组用紧凑 JSON）。 */
@@ -144,7 +186,7 @@ export interface LogViewerProps {
  */
 export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
   const api = useApi()
-  const { t } = useI18n()
+  const { t, language } = useI18n()
   const fromServer = source === 'server'
   /** 选中的日期；空串表示"当天"（由代理回填 data.day）。 */
   const [day, setDay] = useState('')
@@ -165,20 +207,29 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
   const data = logQuery.data
 
   const entries = useMemo(() => parseEntries(data?.text ?? ''), [data?.text])
+  // 语言切换要立刻重译（t 依赖模块级当前语言，不把 language 放进依赖不会重算）。
+  const displayEntries = useMemo(
+    () => entries.map((entry) => ({ ...entry, display: localizeLogMessage(entry, t) })),
+    [entries, language, t]
+  )
 
   const filtered = useMemo(() => {
     const kw = keyword.trim().toLowerCase()
     const from = range ? range[0].valueOf() : null
     const to = range ? range[1].valueOf() : null
-    return entries.filter((entry) => {
+    return displayEntries.filter((entry) => {
       if (level !== 'all' && entry.level.toLowerCase() !== level) return false
       // 时间范围只对能解析出时间的行生效：无时间戳的行不该被"筛掉了却看不出来"。
       if (from !== null && (entry.ts === null || entry.ts < from)) return false
       if (to !== null && (entry.ts === null || entry.ts > to)) return false
-      if (kw !== '' && !entry.search.includes(kw)) return false
+      if (kw !== '') {
+        // 中英文都能搜：英文原文在 search 里，当前语言的译文在 display 里。
+        const haystack = `${entry.search} ${entry.display.toLowerCase()}`
+        if (!haystack.includes(kw)) return false
+      }
       return true
     })
-  }, [entries, keyword, level, range])
+  }, [displayEntries, keyword, level, range])
 
   const rows = useMemo(() => (newestFirst ? [...filtered].reverse() : filtered), [filtered, newestFirst])
 
@@ -221,7 +272,7 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
         key: 'msg',
         ellipsis: true,
         // 日志正文是"需要被复制"的内容（贴到工单/群里排查），显式放开选中。
-        render: (value: string) => <span className="selectable">{value}</span>
+        render: (_: unknown, entry: LogEntry) => <span className="selectable">{entry.display}</span>
       },
       {
         title: t('log.col.fields'),

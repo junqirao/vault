@@ -17,18 +17,18 @@ import {
 } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { AppstoreOutlined, ArrowLeftOutlined, BarsOutlined, FolderOutlined, SettingOutlined } from '@ant-design/icons'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { StatusTag } from '../../components/StatusTag'
-import { usageColor } from '../../components/UsageBar'
+import { UsageBar, usageColor } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { AgentMountState, UploadState } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
-import { isActiveUpload, pickMountUsage, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
+import { isActiveUpload, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { useAuth } from '../../hooks/useAuth'
 import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
@@ -37,6 +37,7 @@ import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
 import { GroupMountSettingsModal, RepoMountSettingsModal } from './RepoMountSettings'
+import { PerformanceMonitor } from './PerformanceMonitor'
 import { StorageUsageCard } from '../storage/StorageUsage'
 import { isPlaceholderRepoId, uploadPlaceholderRepo } from './uploadView'
 
@@ -191,7 +192,14 @@ function RepoGroupHeader({
  * 取不到时整块不渲染：老服务端没有 /v1/auth/me，或请求失败时，页面照常用，
  * 不能因为一块统计把整个列表带崩。
  */
-function QuotaOverview({ repos }: { repos: RepoDTO[] }): JSX.Element | null {
+function QuotaOverview({
+  repos,
+  embedded = false
+}: {
+  repos: RepoDTO[]
+  /** 嵌在「用量」大模块里时不再套一层 Card。 */
+  embedded?: boolean
+}): JSX.Element | null {
   const api = useApi()
   const { t } = useI18n()
   const meQuery = useQuery({ queryKey: ['me'], queryFn: () => api.me() })
@@ -203,8 +211,8 @@ function QuotaOverview({ repos }: { repos: RepoDTO[] }): JSX.Element | null {
   const percent = unlimited ? 0 : Math.min(100, Math.round((user.used_bytes / user.quota_bytes) * 100))
   const creating = repos.filter((repo) => repo.state === 'creating').length
 
-  return (
-    <Card styles={{ body: { padding: spacing.md } }}>
+  const content = (
+    <>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
         <Typography.Text strong>{t('repo.quota.title')}</Typography.Text>
         <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
@@ -246,6 +254,74 @@ function QuotaOverview({ repos }: { repos: RepoDTO[] }): JSX.Element | null {
           </Typography.Text>
         ) : null}
       </Space>
+    </>
+  )
+
+  if (embedded) {
+    return (
+      <div style={{ height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}>
+        {content}
+      </div>
+    )
+  }
+
+  return (
+    <Card styles={{ body: { padding: spacing.md } }} style={{ height: '100%' }}>
+      {content}
+    </Card>
+  )
+}
+
+/** 首页右上角的「用量」大模块：存储 + 配额两个子模块合成一张卡片。 */
+function UsageOverviewCard({
+  onOpenStorages,
+  repos
+}: {
+  onOpenStorages?: () => void
+  repos: RepoDTO[]
+}): JSX.Element {
+  const { t } = useI18n()
+  return (
+    <Card
+      title={t('repo.usage.title')}
+      style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}
+      styles={{
+        body: {
+          padding: spacing.md,
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: spacing.md
+        }
+      }}
+    >
+      {onOpenStorages ? (
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            display: 'flex',
+            flexDirection: 'column',
+            justifyContent: 'center',
+            paddingBlock: spacing.xs
+          }}
+        >
+          <StorageUsageCard onOpen={onOpenStorages} embedded />
+        </div>
+      ) : null}
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          justifyContent: 'center',
+          paddingBlock: spacing.xs
+        }}
+      >
+        <QuotaOverview repos={repos} embedded />
+      </div>
     </Card>
   )
 }
@@ -442,10 +518,15 @@ function buildGroups(entries: RepoListEntry[], ungroupedLabel: string): RepoGrou
  */
 interface GroupOpState {
   busy: boolean
+  /**
+   * 操作开始时固定的类型：挂载过程中已挂载数量会一格格增长，
+   * 如果按钮继续用 `mountedCount > 0` 判断，就会从"正在挂载"变成"正在卸载"。
+   */
+  kind: 'mount' | 'unmount' | null
   progress: { done: number; total: number }
 }
 
-const GROUP_OP_IDLE: GroupOpState = { busy: false, progress: { done: 0, total: 0 } }
+const GROUP_OP_IDLE: GroupOpState = { busy: false, kind: null, progress: { done: 0, total: 0 } }
 const groupOps = new Map<string, GroupOpState>()
 const groupOpListeners = new Set<() => void>()
 
@@ -488,7 +569,7 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
     if (groupOps.get(groupKey)?.busy) return
     const targets = repos.filter((repo) => repo.state === 'active' && !isPlaceholderRepoId(repo.id))
     if (targets.length === 0) return
-    setGroupOp(groupKey, { busy: true, progress: { done: 0, total: targets.length } })
+    setGroupOp(groupKey, { busy: true, kind: 'mount', progress: { done: 0, total: targets.length } })
     let ok = 0
     let fail = 0
     for (const repo of targets) {
@@ -517,12 +598,13 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
       }
       setGroupOp(groupKey, {
         busy: true,
+        kind: 'mount',
         progress: { done: (groupOps.get(groupKey)?.progress.done ?? 0) + 1, total: targets.length }
       })
     }
     await queryClient.invalidateQueries({ queryKey: ['repo-allocations'] })
     await queryClient.invalidateQueries({ queryKey: ['leases'] })
-    setGroupOp(groupKey, { busy: false, progress: { done: 0, total: 0 } })
+    setGroupOp(groupKey, GROUP_OP_IDLE)
     if (fail > 0) message.warning(t('repo.group.mountPartial', { ok, fail }))
     else message.success(t('repo.group.mountDone', { count: ok }))
   }, [active?.baseUrl, active?.key, agent, api, currentUserId, groupKey, queryClient, repos, t])
@@ -534,7 +616,7 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
       .map((repo) => mountOfRepo(mounted, repo))
       .filter((item): item is NonNullable<typeof item> => Boolean(item))
     if (targets.length === 0) return
-    setGroupOp(groupKey, { busy: true, progress: { done: 0, total: targets.length } })
+    setGroupOp(groupKey, { busy: true, kind: 'unmount', progress: { done: 0, total: targets.length } })
     let ok = 0
     let fail = 0
     for (const item of targets) {
@@ -546,17 +628,18 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
       }
       setGroupOp(groupKey, {
         busy: true,
+        kind: 'unmount',
         progress: { done: (groupOps.get(groupKey)?.progress.done ?? 0) + 1, total: targets.length }
       })
     }
     await queryClient.invalidateQueries({ queryKey: ['repo-allocations'] })
     await queryClient.invalidateQueries({ queryKey: ['leases'] })
-    setGroupOp(groupKey, { busy: false, progress: { done: 0, total: 0 } })
+    setGroupOp(groupKey, GROUP_OP_IDLE)
     if (fail > 0) message.warning(t('repo.group.unmountPartial', { ok, fail }))
     else message.success(t('repo.group.unmountDone', { count: ok }))
   }, [agent, groupKey, queryClient, repos, t])
 
-  return { busy: op.busy, progress: op.progress, mountAll, unmountAll }
+  return { busy: op.busy, kind: op.kind, progress: op.progress, mountAll, unmountAll }
 }
 
 /** 某条挂载记录是否属于这个库（repo_id 优先，旧记录缺 repo_id 时退回库名匹配）。 */
@@ -566,7 +649,36 @@ function mountOfRepo(mounts: AgentMountState[], repo: RepoDTO): AgentMountState 
   )
 }
 
-/** 分组总览卡片：组名 + 库数 + 挂载/卸载 + 分组挂载设置。 */
+/** 分组卡片里的一行紧凑指标：标签 + 数值 + 短条，三者横向排布。 */
+function GroupMetric({
+  label,
+  value,
+  percent,
+  color,
+  loading
+}: {
+  label: string
+  value: string
+  percent: number
+  color?: string
+  loading?: boolean
+}): JSX.Element {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xxs, flexShrink: 0 }}>
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, whiteSpace: 'nowrap' }}>
+        {label}
+      </Typography.Text>
+      <Typography.Text
+        style={{ fontSize: fontSize.xs, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}
+      >
+        {value}
+      </Typography.Text>
+      <UsageBar percent={percent} color={color} loading={loading} style={{ width: 64, marginTop: 0 }} />
+    </div>
+  )
+}
+
+/** 分组总览卡片：组名 + 两个紧凑指标（已挂载 / 差异盘占用）+ 挂载/卸载 + 分组设置。 */
 function RepoGroupCard({
   bucket,
   currentUserId,
@@ -579,74 +691,118 @@ function RepoGroupCard({
   onSettings: () => void
 }): JSX.Element {
   const { t } = useI18n()
+  const api = useApi()
   const agent = useAgent()
   const repos = bucket.items.map((entry) => entry.repo)
-  const { busy, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
+  const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
   const mounts = agent.state?.mounts ?? []
-  const mountedRepos = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined)
-  const mountedCount = mountedRepos.length
+  const mountedCount = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined).length
   const activeCount = repos.filter((repo) => repo.state === 'active').length
-  const totalBytes = repos.reduce((sum, repo) => sum + (repo.capacity_bytes || 0), 0)
-  const mountedBytes = mountedRepos.reduce(
-    (sum, repo) => sum + (pickMountUsage(agent.usage, repo.id)?.total_bytes || repo.capacity_bytes || 0),
-    0
-  )
-  // 一个按钮承载挂载 / 卸载：只要组内有库挂载着，就提供"卸载"；否则是"挂载"。
-  const hasMounted = mountedCount > 0
-  const percent = totalBytes > 0 ? Math.min(100, Math.round((mountedBytes / totalBytes) * 100)) : 0
+
+  // 差异盘占用按盘聚合：repo.used_bytes 是"已分配容量"的计费口径，
+  // 只有 listRepoDisks 的 diff 盘 physical_bytes 才是真正吃掉的空间。
+  const diskQueries = useQueries({
+    queries: repos.map((repo) => ({
+      queryKey: ['repo-disks', repo.id],
+      queryFn: () => api.listRepoDisks(repo.id),
+      enabled: !isPlaceholderRepoId(repo.id)
+    }))
+  })
+  const diffUsage = useMemo(() => {
+    let used = 0
+    let total = 0
+    for (const query of diskQueries) {
+      for (const disk of query.data?.items ?? []) {
+        if (disk.kind !== 'diff') continue
+        used += disk.physical_bytes || 0
+        total += disk.size_bytes || 0
+      }
+    }
+    return { used, total }
+  }, [diskQueries])
+  const diffLoading = diskQueries.some((query) => query.isPending)
+
+  // 操作开始后按固定的 kind 出文案：挂载过程中 mountedCount 会增长，
+  // 不能再用它判断"这一次到底是在挂载还是卸载"。
+  const activeKind = kind ?? (mountedCount > 0 ? 'unmount' : 'mount')
+  const mountedPercent = repos.length > 0 ? Math.round((mountedCount / repos.length) * 100) : 0
+  const diffPercent = diffUsage.total > 0 ? Math.min(100, Math.round((diffUsage.used / diffUsage.total) * 100)) : 0
 
   return (
     <Card
       hoverable
       onClick={onOpen}
-      style={{ height: '100%', minHeight: 184 }}
-      styles={{ body: { padding: spacing.md, display: 'flex', flexDirection: 'column', height: '100%' } }}
+      style={{ height: '100%' }}
+      styles={{
+        body: {
+          padding: `${spacing.sm}px ${spacing.md}px`,
+          display: 'flex',
+          alignItems: 'center',
+          gap: spacing.sm,
+          height: '100%',
+          // 与「列表形态」的库行同高：库行是 16px 标题 + 12px 次要信息（含 4px 间距）
+          // 再加大小的上下内边距；分组卡片沿用同一套节奏，切视图时纵向节奏一致。
+          minHeight: 48
+        }
+      }}
     >
-      {/* 标题行：图标与组名保持常规字号，只有卡片本身更大；数量贴右。 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs }}>
-        <FolderOutlined style={{ color: palette.accent }} />
-        <Typography.Text strong ellipsis style={{ minWidth: 0, fontSize: fontSize.lg }}>
+      <div
+        style={{
+          width: 32,
+          height: 32,
+          borderRadius: 8,
+          background: palette.neutralFill,
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          flexShrink: 0
+        }}
+      >
+        <FolderOutlined style={{ color: palette.accent, fontSize: 16 }} />
+      </div>
+
+      <div style={{ minWidth: 0, flex: '1 1 120px' }}>
+        <Typography.Text strong ellipsis style={{ display: 'block', fontSize: fontSize.lg }}>
           {bucket.title}
         </Typography.Text>
-        <Typography.Text type="secondary" style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
-          {t('repo.group.repoCount', { count: repos.length })}
+        <Typography.Text
+          type="secondary"
+          ellipsis
+          style={{ display: 'block', fontSize: fontSize.xs, marginTop: spacing.xxs }}
+        >
+          {t('repo.group.repoCount', { count: repos.length })} · {t('repo.group.activeCount', { count: activeCount })}
         </Typography.Text>
       </div>
 
-      <div style={{ marginTop: spacing.md, marginBottom: spacing.sm, flex: 1 }}>
-        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-            {t('repo.group.mountedStorage')}
-          </Typography.Text>
-          <Typography.Text style={{ fontSize: fontSize.sm }}>
-            {formatBytes(mountedBytes)} / {formatBytes(totalBytes)}
-          </Typography.Text>
-        </div>
-        <Progress
-          percent={percent}
-          showInfo={false}
-          size="small"
-          strokeColor={usageColor(percent)}
-          trailColor={palette.neutralFill}
-          style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-        />
-      </div>
+      <GroupMetric
+        label={t('repo.group.mountedStorage')}
+        value={`${mountedCount} / ${repos.length}`}
+        percent={mountedPercent}
+        // 已挂载数量不是"用量"，不随占比变色：一路主色蓝。
+        color={palette.accent}
+      />
+      <GroupMetric
+        label={t('repo.group.usedSpace')}
+        value={diffLoading ? '-' : `${formatBytes(diffUsage.used)} / ${formatBytes(diffUsage.total)}`}
+        percent={diffPercent}
+        loading={diffLoading}
+      />
 
-      {/* 动作放右下：挂载/卸载一个按钮，设置只留图标、不要边框。 */}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: spacing.xs }}>
+      {/* 动作放最右：挂载/卸载一个按钮，设置只留图标、不要边框。 */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xxs, flexShrink: 0 }}>
         <Button
           size="small"
-          type={hasMounted ? 'default' : 'primary'}
+          type={activeKind === 'unmount' ? 'default' : 'primary'}
           loading={busy}
-          disabled={repos.length === 0 || (!hasMounted && activeCount === 0)}
+          disabled={repos.length === 0 || (activeKind === 'mount' && activeCount === 0)}
           onClick={(event) => {
             event.stopPropagation()
-            void (hasMounted ? unmountAll() : mountAll())
+            void (activeKind === 'unmount' ? unmountAll() : mountAll())
           }}
         >
           {busy && progress.total > 0
-            ? `${t(hasMounted ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
-            : hasMounted
+            ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
+            : activeKind === 'unmount'
               ? t('repo.group.unmountAll')
               : t('repo.group.mountAll')}
         </Button>
@@ -698,11 +854,12 @@ function RepoGroupDetail({
   // 刚出现的「返回」按钮上，表现为"一点进去就弹回总览"。这里忽略挂载后极短时间内的返回。
   const mountedAt = useRef(Date.now())
   const repos = bucket.items.map((entry) => entry.repo)
-  const { busy, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
+  const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
   const mounts = agent.state?.mounts ?? []
   const mountedCount = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined).length
   const activeCount = repos.filter((repo) => repo.state === 'active').length
-  const hasMounted = mountedCount > 0
+  // 与总览卡片同一处修复：操作期间固定 kind，避免按钮文案随 mountedCount 翻转。
+  const activeKind = kind ?? (mountedCount > 0 ? 'unmount' : 'mount')
 
   return (
     <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
@@ -724,15 +881,15 @@ function RepoGroupDetail({
         <span style={{ marginLeft: 'auto' }}>
           <Space wrap>
             <Button
-              type={hasMounted ? 'default' : 'primary'}
+              type={activeKind === 'unmount' ? 'default' : 'primary'}
               size="small"
               loading={busy}
-              disabled={repos.length === 0 || (!hasMounted && activeCount === 0)}
-              onClick={() => void (hasMounted ? unmountAll() : mountAll())}
+              disabled={repos.length === 0 || (activeKind === 'mount' && activeCount === 0)}
+              onClick={() => void (activeKind === 'unmount' ? unmountAll() : mountAll())}
             >
               {busy && progress.total > 0
-                ? `${t(hasMounted ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
-                : hasMounted
+                ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
+                : activeKind === 'unmount'
                   ? t('repo.group.unmountAll')
                   : t('repo.group.mountAll')}
             </Button>
@@ -976,11 +1133,24 @@ export function RepoList({
   const renderUserRepos = (): JSX.Element => {
     if (reposQuery.isLoading) return <RepoListSkeleton viewMode={viewMode} />
 
+    // 顶部总览：左侧 2/3 性能指标，右侧 1/3 存储 + 配额上下排列。
+    // 存储/配额卡沿用原来的整卡点击与文案，只改宽度与位置。
+    const overview = (quotaRepos: RepoDTO[]): JSX.Element => (
+      <Row gutter={[spacing.md, spacing.md]} style={{ alignItems: 'stretch' }}>
+        <Col xs={24} lg={16} style={{ display: 'flex' }}>
+          <PerformanceMonitor />
+        </Col>
+        <Col xs={24} lg={8} style={{ display: 'flex' }}>
+          <UsageOverviewCard onOpenStorages={onOpenStorages} repos={quotaRepos} />
+        </Col>
+      </Row>
+    )
+
     // 上传中的占位库已经算在 entries 里，所以这里不必再单独判一次"有没有在上传"。
     if (entries.length === 0) {
       return (
         <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
-          {onOpenStorages ? <StorageUsageCard onOpen={onOpenStorages} /> : null}
+          {overview([])}
           <EmptyState
             title={t('repo.empty')}
             description={t('repo.empty.desc')}
@@ -1014,13 +1184,22 @@ export function RepoList({
 
     return (
       <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
-        {/* 「存储」总览：整卡点击进入只读存储页，右上角箭头进管理端（仅超管）。 */}
-        {onOpenStorages ? <StorageUsageCard onOpen={onOpenStorages} /> : null}
-        {/* 配额总览只认服务端的库：还没建成的上传中库不算"一个存储库"，也不占容量。 */}
-        <QuotaOverview repos={entries.filter((entry) => !isPlaceholderRepoId(entry.repo.id)).map((entry) => entry.repo)} />
+        {/* 顶部总览：性能指标（左 2/3） + 存储/配额（右 1/3）。 */}
+        {overview(entries.filter((entry) => !isPlaceholderRepoId(entry.repo.id)).map((entry) => entry.repo))}
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs }}>
+          <Typography.Title level={5} style={{ margin: 0 }}>
+            {t('repo.group.title')}
+          </Typography.Title>
+        </div>
         <Row gutter={[spacing.md, spacing.md]}>
           {groups.map((bucket) => (
-            <Col key={bucket.key || '__ungrouped__'} xs={24} sm={12} xl={12} xxl={8}>
+            <Col
+              key={bucket.key || '__ungrouped__'}
+              xs={24}
+              sm={24}
+              xl={groups.length === 1 ? 24 : 12}
+              xxl={groups.length === 1 ? 24 : 12}
+            >
               <RepoGroupCard
                 bucket={bucket}
                 currentUserId={userId}

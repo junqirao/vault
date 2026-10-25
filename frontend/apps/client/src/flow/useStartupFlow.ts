@@ -21,6 +21,7 @@ export type StartupPhase =
   | { kind: 'compat'; check: ClientCheckResponse }
   | { kind: 'bootstrap'; status: BootstrapStatus }
   | { kind: 'login' }
+  | { kind: 'select-server' }
   | { kind: 'ready' }
 
 export interface StartupFlow {
@@ -31,6 +32,8 @@ export interface StartupFlow {
   /** 重新执行检查（重试 / 保存地址后）。 */
   recheck: () => void
   setPhase: (phase: StartupPhase) => void
+  /** 服务端选择页：显式选择一台服务器（即使它没开启自动连接）。 */
+  selectServer: (key: string) => void
   /** 光标处于不兼容提示页时，允许"仍然继续（只读查看）"。 */
   continueAfterCompat: (check: ClientCheckResponse) => void
 }
@@ -85,10 +88,17 @@ export function useStartupFlow(api: VaultApi): StartupFlow {
       const token = ++runTokenRef.current
       setPhase({ kind: 'loading' })
       setChecking(true)
-      const active = selectActiveServer(useAppStore.getState())
+
+      const state = useAppStore.getState()
+      const active = selectActiveServer(state)
+
+      // 自动连接规则在持久化加载时（parsePersisted）已经决定好了 activeKey：
+      //   - 有开启自动连接的 → 选第一台/保留原来的；
+      //   - 全都没开 → activeKey 为 null，这里进入服务端选择页。
+      // 用户从选择页显式选了某台后 activeKey 就有值了，直接继续，不会又被弹回选择页。
       if (!active) {
         setChecking(false)
-        setPhase({ kind: 'config' })
+        setPhase(state.servers.length > 0 ? { kind: 'select-server' } : { kind: 'config' })
         return
       }
 
@@ -115,7 +125,14 @@ export function useStartupFlow(api: VaultApi): StartupFlow {
         }
 
         const current = selectActiveServer(useAppStore.getState())
-        if (current?.token) {
+        // 本地已经知道过期的令牌不再拿去探针：那一发必然 401（服务端重启也会清空内存
+        // 会话），除了日志噪音没有任何信息量。直接清掉，走登录 / 证书免密流程。
+        // 兼容老配置：过期时间可能是秒，也可能是毫秒。
+        const rawExpiry = current?.tokenExpiresAt
+        const expiresAtMs =
+          typeof rawExpiry === 'number' && rawExpiry > 0 ? (rawExpiry < 1e12 ? rawExpiry * 1000 : rawExpiry) : 0
+        const tokenExpired = expiresAtMs > 0 && expiresAtMs <= Date.now()
+        if (current?.token && !tokenExpired) {
           try {
             // system/info 是匿名接口，无法校验令牌；这里用需要认证的 repos 列表做探针。
             await api.listRepos({ limit: 1 })
@@ -135,6 +152,14 @@ export function useStartupFlow(api: VaultApi): StartupFlow {
               role: undefined
             })
           }
+        } else if (current?.token) {
+          useAppStore.getState().updateActiveServer({
+            token: undefined,
+            tokenExpiresAt: undefined,
+            userId: undefined,
+            username: undefined,
+            role: undefined
+          })
         }
         if (runTokenRef.current === token) setPhase({ kind: 'login' })
       } catch (error) {
@@ -170,7 +195,12 @@ export function useStartupFlow(api: VaultApi): StartupFlow {
     [run]
   )
 
-  return { phase, checking, autoMount, recheck, setPhase, continueAfterCompat }
+  const selectServer = useCallback((key: string) => {
+    // 显式选择：直接设为活动服务端；下一次检查会沿用它（不会按 autoConnect 再筛一次）。
+    useAppStore.getState().setActive(key)
+  }, [])
+
+  return { phase, checking, autoMount, recheck, setPhase, selectServer, continueAfterCompat }
 }
 
 function errorMessage(error: unknown): string {

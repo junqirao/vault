@@ -214,14 +214,35 @@ function publicAgentInfo(): Omit<ReturnType<AgentManager['getInfo']>, 'token'> {
   return rest
 }
 
-/** 每个渲染进程各持有一条代理事件流（SSE）；key 为 webContents.id。 */
-const agentStreams = new Map<number, () => void>()
+/** 每个渲染进程可以同时开多条 SSE（全局事件流 + 页面级性能流）；key 为 webContents.id:path。 */
+const agentStreams = new Map<string, () => void>()
 
-function closeAgentStream(id: number): void {
-  const close = agentStreams.get(id)
+function agentStreamKey(id: number, path: string): string {
+  return `${id}:${path}`
+}
+
+function closeAgentStream(key: string): void {
+  const close = agentStreams.get(key)
   if (!close) return
-  agentStreams.delete(id)
+  agentStreams.delete(key)
   close()
+}
+
+/** 关闭某个渲染进程的全部 SSE（页面关闭/刷新时调用）。 */
+function closeAgentStreams(id: number): void {
+  const prefix = `${id}:`
+  for (const key of [...agentStreams.keys()]) {
+    if (key.startsWith(prefix)) closeAgentStream(key)
+  }
+}
+
+/** 只允许渲染进程访问本代理的 /agent/ 路径；非法值退回全局事件流。 */
+function normalizeAgentStreamPath(value: unknown): string {
+  const path = typeof value === 'string' ? value : ''
+  if (!path.startsWith('/agent/') || path.startsWith('//') || path.includes('..')) {
+    return '/agent/events'
+  }
+  return path
 }
 
 /** 只允许渲染进程访问代理的 /agent/ 前缀路径，避免借主进程之手访问任意地址。 */
@@ -255,20 +276,22 @@ function registerIpc(): void {
     if (!parsed) return { status: 0, error: 'network', message: 'invalid_request' }
     return agent.request(parsed)
   })
-  ipcMain.handle('vault:agent-events-start', (event) => {
+  ipcMain.handle('vault:agent-events-start', (event, pathArg: unknown) => {
     const id = event.sender.id
-    closeAgentStream(id)
-    const close = agent.openEventStream((message) => {
+    const path = normalizeAgentStreamPath(pathArg)
+    const key = agentStreamKey(id, path)
+    closeAgentStream(key)
+    const close = agent.openEventStream(path, (message) => {
       if (event.sender.isDestroyed()) return
-      event.sender.send('vault:agent-event', message)
+      event.sender.send('vault:agent-event', { ...message, stream: path })
     })
-    agentStreams.set(id, close)
-    // 渲染进程销毁（关闭窗口/刷新）时释放长连接，避免连接泄漏。
-    event.sender.once('destroyed', () => closeAgentStream(id))
+    agentStreams.set(key, close)
+    // 渲染进程销毁（关闭窗口/刷新）时释放该进程的所有长连接，避免连接泄漏。
+    event.sender.once('destroyed', () => closeAgentStreams(id))
     return true
   })
-  ipcMain.handle('vault:agent-events-stop', (event) => {
-    closeAgentStream(event.sender.id)
+  ipcMain.handle('vault:agent-events-stop', (event, pathArg: unknown) => {
+    closeAgentStream(agentStreamKey(event.sender.id, normalizeAgentStreamPath(pathArg)))
     return true
   })
   // 登记服务端证书指纹（TOFU 首次信任）；只有指纹与登记值一致的自签证书才会被放行。

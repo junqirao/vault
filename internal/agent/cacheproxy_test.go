@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 	"vault/internal/platform/iscsiinitiator"
 )
 
@@ -421,5 +422,43 @@ func TestMountCacheSatisfied(t *testing.T) {
 				t.Fatalf("mountCacheSatisfied = %v，期望 %v", got, c.want)
 			}
 		})
+	}
+}
+
+// TestPerformanceReturnsPrecomputedHistory 锁定"前端只读缓存"的口径：
+// Performance() 只复制 sampleLoop 预先算好的点，不在请求里重新做差分。
+func TestPerformanceReturnsPrecomputedHistory(t *testing.T) {
+	store := newCacheTestStore(t)
+	l1, l2 := int64(4)<<30, int64(16)<<30
+	if _, err := store.Patch(ConfigPatch{CacheL1Bytes: &l1, CacheL2Bytes: &l2}); err != nil {
+		t.Fatalf("Patch 缓存预算失败：%v", err)
+	}
+	m := newCacheManager(store, testLogger())
+	m.perf = []PerfPoint{{
+		T:                123,
+		ReadIOPS:         42,
+		WriteIOPS:        7,
+		ReadBytesPerSec:  1 << 20,
+		WriteBytesPerSec: 2 << 20,
+		HitRate:          0.75,
+		L1UsedBytes:      1 << 20,
+		L2UsedBytes:      2 << 20,
+		CacheUsedBytes:   3 << 20,
+	}}
+
+	got := m.Performance()
+	if got.IntervalSec != int64(cacheHistoryInterval/time.Second) {
+		t.Fatalf("采样间隔 = %d，期望 %d", got.IntervalSec, int64(cacheHistoryInterval/time.Second))
+	}
+	if got.L1LimitBytes != l1 || got.L2LimitBytes != l2 {
+		t.Fatalf("缓存预算 = %d/%d，期望 %d/%d", got.L1LimitBytes, got.L2LimitBytes, l1, l2)
+	}
+	if len(got.Points) != 1 || got.Points[0].ReadIOPS != 42 || got.Points[0].HitRate != 0.75 {
+		t.Fatalf("性能点未按缓存返回：%+v", got.Points)
+	}
+	// 返回的是副本：前端/调用方改它不能污染下一次采样。
+	got.Points[0].ReadIOPS = 0
+	if m.Performance().Points[0].ReadIOPS != 42 {
+		t.Fatal("Performance() 必须返回副本，不能暴露内部切片")
 	}
 }

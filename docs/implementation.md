@@ -3050,6 +3050,13 @@ Vault-Server sign release -artifact agent=... -artifact client_web=dist.zip
 
 - 语言包为纯 KV：`locales/{zh-CN,en-US,ja-JP,ko-KR}.json`，扁平 key（如 `repo.create.title`）。
 - **服务端只返回错误码与参数**，前端用 `t(code, args)` 翻译；避免服务端维护多语言文案。
+- 日志同样不把多语言文案写进文件：服务端只输出英文 `msg` + 稳定 `msg_key`（事件表见
+  `internal/logging/messages.go`），日志页按当前语言用 `log.event.<msg_key>` 渲染；
+  单条日志的字段可直接作为模板参数（如 `{type}`）。
+- 为了控制日志体积，事件表只保留约 60 种高价值事件；未收录的 Info 默认不落盘，
+  未收录的 Warn/Error 收敛为 `system.warning` / `system.error`，并附带英文 `detail`
+  （底层错误原因 / 稳定错误码 / 字段摘要；不参与多语言渲染）。
+  排查底层问题时把 `log.level` 调到 `debug` 即可看到全部原始日志。
 - 前端（客户端 + 管理页）共用同一套 locale 包。
 - 语言切换即时生效（zustand/jotai 全局 store + React Context）。
 

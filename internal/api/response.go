@@ -57,9 +57,17 @@ func (r *Router) writeError(w http.ResponseWriter, req *http.Request, err error)
 		// 业务错误必须按级别落到默认就能看见的地方：只记 Debug 时，
 		// 真机日志里只剩下一句 "status":400，是哪个字段被拒无从判断。
 		// 带上 args（如 field=size_bytes）才能直接从日志定位。
+		//
+		// 401 例外：凭据缺失、会话过期（服务端重启后内存会话即失效）或客户端证书不匹配
+		// 都是客户端侧的常态。尤其是客户端启动时的 /v1/auth/me 探测，会让日志里每次
+		// 都多一条 "Unexpected warning"，却没有可处置的服务端故障。降为 Debug：
+		// 响应体里仍然带完整错误码，客户端侧与审计日志都能看到。
 		log := r.deps.Log.Warn
-		if status >= http.StatusInternalServerError {
+		switch {
+		case status >= http.StatusInternalServerError:
 			log = r.deps.Log.Error
+		case status == http.StatusUnauthorized:
+			log = r.deps.Log.Debug
 		}
 		log("请求返回业务错误",
 			"method", req.Method, "path", req.URL.Path,

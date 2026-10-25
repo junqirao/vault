@@ -96,6 +96,7 @@ export {
 export { PasswordStrength, type PasswordStrengthProps } from './components/PasswordStrength'
 export { SectionCard, type SectionCardProps } from './components/SectionCard'
 export { StorageOption, type StorageOptionProps } from './components/StorageOption'
+export { StorageSelect, type StorageSelectProps } from './components/StorageSelect'
 export { StatusTag, type StatusTagProps } from './components/StatusTag'
 export { SystemDepsBanner } from './components/SystemDepsBanner'
 
@@ -111,6 +112,10 @@ export {
   type OfflineNoticeProps,
   type ServerChoice
 } from './features/bootstrap/StartupNotice'
+export {
+  ServerSelectionPage,
+  type ServerSelectionPageProps
+} from './features/bootstrap/ServerSelectionPage'
 export {
   BootstrapWizard,
   type BootstrapInputValues,
@@ -146,6 +151,7 @@ export { StorageUsagePage } from './features/storage/StorageUsage'
 export { DiskImport, type DiskImportProps } from './features/system/DiskImport'
 export { SystemSettings, type SystemSettingsProps } from './features/system/SystemSettings'
 export { ClientSettings, type ClientSettingsProps } from './features/settings/ClientSettings'
+export { ServerManagementCard } from './features/settings/ServerManagementCard'
 
 // 工具
 export { formatBytes, formatTime, maskSecret, remainingSeconds, shortId } from './utils/format'

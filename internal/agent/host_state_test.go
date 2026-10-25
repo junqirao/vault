@@ -111,4 +111,11 @@ func TestUpdateHostStatePublishesOnlyOnChange(t *testing.T) {
 	if ev, ok := takeMountEvent(t, events); !ok || ev.Type != "host" {
 		t.Fatalf("状态变化应广播 host 事件，实际 %+v (ok=%v)", ev, ok)
 	}
+
+	// 即使状态没变，复检循环也会周期性重播快照：弥补"首次事件早于渲染层订阅"的丢失，
+	// 避免界面永远停在未就绪提示。
+	a.publishHostState()
+	if ev, ok := takeMountEvent(t, events); !ok || ev.Type != "host" {
+		t.Fatalf("周期性重播应广播 host 快照，实际 %+v (ok=%v)", ev, ok)
+	}
 }

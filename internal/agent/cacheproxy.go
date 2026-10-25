@@ -118,6 +118,11 @@ type cacheManager struct {
 	historyMu sync.Mutex
 	// history 按库（分配）保留近 5 分钟的采样点，见 CacheHistory。
 	history map[string][]CacheSample
+	// perf 是**已算好**的全局性能曲线（IOPS / 吞吐 / 缓存占用 / 命中率），
+	// 由 sampleLoop 每 5 秒写一次；GET /agent/performance 只做复制，不在请求里计算。
+	perf []PerfPoint
+	// perfHub 只服务"性能指标"页的 SSE 订阅：页面不在时没有订阅者，发布成本可忽略。
+	perfHub *EventHub
 
 	// repoSizeMu 保护 repoSize：本机**已知的库容量索引**（库 ID → 字节）。
 	//
@@ -172,6 +177,40 @@ type CacheHistory struct {
 	Targets map[string][]CacheSample `json:"targets"`
 }
 
+// PerfPoint 是一条**已在代理侧算好**的全局性能点（每 5 秒一个，保留 5 分钟）。
+//
+// 前端只读它，不再对累计计数做差分；所有速率都来自 sampleLoop 的定时采样。
+type PerfPoint struct {
+	T int64 `json:"t"`
+	// ReadIOPS / WriteIOPS 经过缓存代理的读/写命令数每秒。
+	ReadIOPS  float64 `json:"read_iops"`
+	WriteIOPS float64 `json:"write_iops"`
+	// ReadBytesPerSec / WriteBytesPerSec 读写吞吐（字节/秒）。
+	ReadBytesPerSec  float64 `json:"read_bytes_per_sec"`
+	WriteBytesPerSec float64 `json:"write_bytes_per_sec"`
+	// HitRate 本采样区间的缓存命中率（0..1）。
+	HitRate float64 `json:"hit_rate"`
+	// L1UsedBytes / L2UsedBytes / CacheUsedBytes 当前缓存占用。
+	L1UsedBytes    int64 `json:"l1_used_bytes"`
+	L2UsedBytes    int64 `json:"l2_used_bytes"`
+	CacheUsedBytes int64 `json:"cache_used_bytes"`
+
+	// hits / reads 是本采样区间的增量，只用于在代理侧计算 5 分钟滚动命中率，不对外输出。
+	hits  float64
+	reads float64
+}
+
+// PerformanceHistory 是 GET /agent/performance 的响应：近 5 分钟的全局性能曲线。
+type PerformanceHistory struct {
+	// IntervalSec 采样间隔（当前固定 5 秒）。
+	IntervalSec int64 `json:"interval_sec"`
+	// L1LimitBytes / L2LimitBytes 当前缓存预算，供前端显示"已用 / 上限"。
+	L1LimitBytes int64 `json:"l1_limit_bytes"`
+	L2LimitBytes int64 `json:"l2_limit_bytes"`
+	// Points 按时间升序。
+	Points []PerfPoint `json:"points"`
+}
+
 // newCacheManager 构造缓存代理管理器（此时不打开任何监听）。
 func newCacheManager(cfg *ConfigStore, logger *slog.Logger) *cacheManager {
 	if logger == nil {
@@ -181,6 +220,8 @@ func newCacheManager(cfg *ConfigStore, logger *slog.Logger) *cacheManager {
 		cfg:           cfg,
 		logger:        logger,
 		history:       map[string][]CacheSample{},
+		perf:          []PerfPoint{},
+		perfHub:       NewEventHub(),
 		repoSize:      map[string]int64{},
 		activeTargets: map[string]string{},
 	}
@@ -328,15 +369,27 @@ func (m *cacheManager) sampleLoop(ctx context.Context) {
 	}
 }
 
-// sample 记录一轮采样。
+// sample 记录一轮采样，并把算好的全局性能快照推给性能页的 SSE 订阅者。
 func (m *cacheManager) sample(now time.Time) {
 	p := m.runningPortal()
 	if p == nil {
 		return
 	}
+	m.updateHistory(now, p)
+	if m.perfHub != nil && m.perfHub.HasSubscribers() {
+		// 页面不在时没有订阅者，连快照复制都省掉；性能快照每 5 秒一次，开销可忽略。
+		m.perfHub.Publish(Event{Type: localPerformanceEventType, Data: m.Performance()})
+	}
+}
+
+// updateHistory 在锁内更新按库历史与全局性能点。
+func (m *cacheManager) updateHistory(now time.Time, p *iscsiproxy.Portal) {
 	m.historyMu.Lock()
 	defer m.historyMu.Unlock()
 	alive := map[string]bool{}
+	// 全局性能点：按目标分别差分后求和（不同目标的上一采样时间可能不同）。
+	var readIOPS, writeIOPS, readBPS, writeBPS, reads, hits float64
+	var l1Used, l2Used int64
 	for _, key := range p.Keys() {
 		stats, ok := p.Stats(key)
 		if !ok {
@@ -359,6 +412,29 @@ func (m *cacheManager) sample(now time.Time) {
 		if stats.BlockSize > 0 {
 			point.L2UsedBytes = int64(stats.L2Used) * int64(stats.BlockSize)
 		}
+		l1Used += point.L1UsedBytes
+		l2Used += point.L2UsedBytes
+
+		if prevSeries := m.history[key]; len(prevSeries) > 0 {
+			prev := prevSeries[len(prevSeries)-1]
+			dt := now.Unix() - prev.T
+			if dt > 0 {
+				dr := stats.Proxy.Reads - prev.Reads
+				dw := stats.Proxy.Writes - prev.Writes
+				drb := stats.Proxy.ReadBytes - prev.ReadBytes
+				dwb := stats.Proxy.WriteBytes - prev.WriteBytes
+				dh := cs.RequestHits - prev.Hits
+				if dr >= 0 && dw >= 0 && drb >= 0 && dwb >= 0 && dh >= 0 {
+					readIOPS += float64(dr) / float64(dt)
+					writeIOPS += float64(dw) / float64(dt)
+					readBPS += float64(drb) / float64(dt)
+					writeBPS += float64(dwb) / float64(dt)
+					reads += float64(dr)
+					hits += float64(dh)
+				}
+			}
+		}
+
 		series := append(m.history[key], point)
 		if len(series) > cacheHistoryPoints {
 			series = series[len(series)-cacheHistoryPoints:]
@@ -369,6 +445,38 @@ func (m *cacheManager) sample(now time.Time) {
 		if !alive[key] {
 			delete(m.history, key)
 		}
+	}
+
+	hitRate := 0.0
+	if reads > 0 {
+		hitRate = hits / reads
+	}
+	m.perf = append(m.perf, PerfPoint{
+		T:                now.Unix(),
+		ReadIOPS:         readIOPS,
+		WriteIOPS:        writeIOPS,
+		ReadBytesPerSec:  readBPS,
+		WriteBytesPerSec: writeBPS,
+		HitRate:          hitRate,
+		L1UsedBytes:      l1Used,
+		L2UsedBytes:      l2Used,
+		CacheUsedBytes:   l1Used + l2Used,
+		hits:             hits,
+		reads:            reads,
+	})
+	if len(m.perf) > cacheHistoryPoints {
+		m.perf = m.perf[len(m.perf)-cacheHistoryPoints:]
+	}
+	// 命中率显示"近 5 分钟窗口"的滚动值，比单个 5 秒区间稳定（单个区间很容易 0/100% 跳）。
+	var windowHits, windowReads float64
+	for i := range m.perf {
+		windowHits += m.perf[i].hits
+		windowReads += m.perf[i].reads
+	}
+	if windowReads > 0 {
+		m.perf[len(m.perf)-1].HitRate = windowHits / windowReads
+	} else {
+		m.perf[len(m.perf)-1].HitRate = 0
 	}
 }
 
@@ -412,6 +520,40 @@ func (m *cacheManager) History() CacheHistory {
 		out[key] = cp
 	}
 	return CacheHistory{IntervalSec: int64(cacheHistoryInterval / time.Second), Targets: out}
+}
+
+// Performance 返回代理侧已经算好的近 5 分钟全局性能曲线（GET /agent/performance）。
+//
+// 这里只做复制，不做任何差分/聚合：采样与计算全部在 sampleLoop 完成，
+// 前端定时读取缓存即可（避免每个页面请求都重新扫一遍目标）。
+func (m *cacheManager) Performance() PerformanceHistory {
+	interval := int64(cacheHistoryInterval / time.Second)
+	if m == nil {
+		return PerformanceHistory{IntervalSec: interval}
+	}
+	var l1Limit, l2Limit int64
+	if m.cfg != nil {
+		cfg := m.cfg.Get()
+		l1Limit, l2Limit = cfg.CacheL1Bytes, cfg.CacheL2Bytes
+	}
+	m.historyMu.Lock()
+	points := make([]PerfPoint, len(m.perf))
+	copy(points, m.perf)
+	m.historyMu.Unlock()
+	return PerformanceHistory{
+		IntervalSec:  interval,
+		L1LimitBytes: l1Limit,
+		L2LimitBytes: l2Limit,
+		Points:       points,
+	}
+}
+
+// PerformanceHub 返回性能页专用的 SSE 广播器；页面挂载时才订阅，关闭即退订。
+func (m *cacheManager) PerformanceHub() *EventHub {
+	if m == nil {
+		return nil
+	}
+	return m.perfHub
 }
 
 // Close 停止门户并回收所有目标（会 flush L2 文件、logout 后端）。

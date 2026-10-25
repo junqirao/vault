@@ -42,6 +42,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -756,10 +757,21 @@ func runServe(configPath *string, migrateOnly *bool) int {
 				serveErr <- err
 				return
 			}
+			// 只广告本服务端的 CA：浏览器在收到 CertificateRequest 时会按 CA 过滤候选证书。
+			// 不设 ClientCAs 时，Windows 证书库里任何没有 EKU 限制的自签证书都可能被自动
+			// 选中（客户端并未使用它），服务端只能回 401 auth.cert_invalid，日志里每次启动
+			// 都会出现一条莫名其妙的 "missing_client_auth_eku"。
+			clientCAs := x509.NewCertPool()
+			if !clientCAs.AppendCertsFromPEM(ca.CAPEM()) {
+				serveErr <- fmt.Errorf("cert: 解析 CA 证书失败，无法配置客户端证书校验")
+				return
+			}
+
 			server.TLSConfig = &tls.Config{
 				Certificates: []tls.Certificate{pair},
 				// 请求客户端证书但不强制：管理页用会话令牌，客户端用 mTLS。
 				ClientAuth: tls.RequestClientCert,
+				ClientCAs:  clientCAs,
 				MinVersion: tls.VersionTLS12,
 			}
 			log.Info("HTTP 服务已启动（TLS）", "listen", raw.HTTP.Listen,

@@ -16,6 +16,7 @@ import { useServerConfig } from '../../hooks/useServerConfig'
 import { LANGUAGE_LABELS, LANGUAGES, useI18n, type Language } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
 import { bytesToMegabytes, formatBytes, formatTime, megabytesToBytes } from '../../utils/format'
+import { ServerManagementCard } from './ServerManagementCard'
 
 /**
  * 本地读缓存代理的 L1/L2 上限（客户端总量，单位 MiB）。
@@ -403,6 +404,8 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     >
       {disabled ? <Alert type="warning" showIcon message={t('settings.agent.notAvailable')} style={{ marginBottom: spacing.md }} /> : null}
       {error ? <ErrorNotice error={error} /> : null}
+
+      <ServerManagementCard />
 
       <SectionCard title={t('settings.agent.title')}>
         <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>

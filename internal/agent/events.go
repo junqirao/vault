@@ -45,6 +45,16 @@ func (h *EventHub) Subscribe() (int, <-chan Event) {
 	return id, ch
 }
 
+// HasSubscribers 返回当前是否有订阅者（用于跳过昂贵的快照构造）。
+func (h *EventHub) HasSubscribers() bool {
+	if h == nil {
+		return false
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subs) > 0
+}
+
 // Unsubscribe 注销订阅者并关闭其通道。
 func (h *EventHub) Unsubscribe(id int) {
 	h.mu.Lock()

@@ -1,7 +1,8 @@
 {
   "name": "vault-frontend",
-  "version": "0.1.182",
+  "version": "0.1.192",
   "private": true,
+  "license": "PolyForm-Noncommercial-1.0.0",
   "description": "Vault 桌面客户端（内含用户功能与管理功能）前端工程",
   "scripts": {
     "typecheck": "pnpm -r typecheck",

@@ -1,6 +1,9 @@
 package logging
 
 import (
+	"bytes"
+	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +15,7 @@ import (
 // 末尾且不漏最后几条。
 func TestReadDayAndPathForDay(t *testing.T) {
 	dir := t.TempDir()
-	l, err := New(Options{Dir: dir, FileName: "Vault-Agent", KeepDays: 7})
+	l, err := New(Options{Level: "debug", Dir: dir, FileName: "Vault-Agent", KeepDays: 7})
 	if err != nil {
 		t.Fatalf("构造 Logger 失败：%v", err)
 	}
@@ -67,7 +70,7 @@ func TestReadDayAndPathForDay(t *testing.T) {
 // ReadDay 能读到昨天那份。
 func TestDaysAndReadDayHistorical(t *testing.T) {
 	dir := t.TempDir()
-	l, err := New(Options{Dir: dir, FileName: "Vault-Agent", KeepDays: 7})
+	l, err := New(Options{Level: "debug", Dir: dir, FileName: "Vault-Agent", KeepDays: 7})
 	if err != nil {
 		t.Fatalf("构造 Logger 失败：%v", err)
 	}
@@ -121,5 +124,123 @@ func TestReadDayWithoutDaily(t *testing.T) {
 	}
 	if _, err := l.ReadDay("", 1024); err == nil {
 		t.Fatal("未启用文件日志时 ReadDay 应报错")
+	}
+}
+
+// TestLogEventCatalogIsWellFormed 防止日志事件表出现重复 ID / 重复旧文案。
+// 重复会让某个事件被另一个事件覆盖，线上表现为"消息翻错"或直接消失。
+func TestLogEventCatalogIsWellFormed(t *testing.T) {
+	ids := map[string]bool{}
+	sources := map[string]string{}
+	for _, ev := range logEvents {
+		if ev.ID == "" || ev.English == "" {
+			t.Fatalf("日志事件缺少 ID 或英文模板：%+v", ev)
+		}
+		if ids[ev.ID] {
+			t.Fatalf("日志事件 ID 重复：%s", ev.ID)
+		}
+		ids[ev.ID] = true
+		for _, match := range ev.Match {
+			if match == "" {
+				t.Fatalf("事件 %s 含空匹配文案", ev.ID)
+			}
+			if prev, ok := sources[match]; ok && prev != ev.ID {
+				t.Fatalf("旧文案同时匹配两个事件：%q → %s / %s", match, prev, ev.ID)
+			}
+			sources[match] = ev.ID
+		}
+	}
+}
+
+// TestLocalizeHandler 钉住日志收敛行为：
+//   - 收录消息输出英文模板 + msg_key；
+//   - 未收录 Info 默认不落盘；
+//   - 未收录 Warn/Error 收敛为兜底事件（不把无法翻译的原文写进普通日志）。
+func TestLocalizeHandler(t *testing.T) {
+	var buf bytes.Buffer
+	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})
+	logger := slog.New(newLocalizeHandler(inner, false))
+
+	logger.With("type", "repo_prepare").Error("任务失败且已达最大尝试次数", "job_id", "j1")
+	logger.Info("一条未映射的日志内容")
+	logger.Warn("一条未映射的警告内容")
+	logger.Error("一条未映射的错误内容")
+
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("应只落盘 3 条（任务失败 + 兜底警告 + 兜底错误），实际 %d 条：\n%s", len(lines), buf.String())
+	}
+
+	type entry struct {
+		Level  string `json:"level"`
+		Msg    string `json:"msg"`
+		MsgKey string `json:"msg_key"`
+		Detail string `json:"detail"`
+		Type   string `json:"type"`
+	}
+	parse := func(line string) entry {
+		var e entry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("日志行不是合法 JSON：%v\n%s", err, line)
+		}
+		return e
+	}
+
+	first := parse(lines[0])
+	if first.Msg != "Job failed: repo_prepare" || first.MsgKey != "job.failed" {
+		t.Fatalf("任务失败日志应输出英文模板与 msg_key，实际 msg=%q msg_key=%q", first.Msg, first.MsgKey)
+	}
+
+	warn := parse(lines[1])
+	if warn.Msg != "Unexpected warning" || warn.MsgKey != "system.warning" {
+		t.Fatalf("未收录警告应收敛为 system.warning，实际 %+v", warn)
+	}
+	if warn.Detail != "unmapped log event" {
+		t.Fatalf("未收录警告应附带英文 detail，实际 %q", warn.Detail)
+	}
+
+	failure := parse(lines[2])
+	if failure.Msg != "Unexpected error" || failure.MsgKey != "system.error" {
+		t.Fatalf("未收录错误应收敛为 system.error，实际 %+v", failure)
+	}
+	if failure.Detail != "unmapped log event" {
+		t.Fatalf("未收录错误应附带英文 detail，实际 %q", failure.Detail)
+	}
+}
+
+// TestLocalizeHandlerKeepsUnknownAtDebug 明确 debug 是排查逃生口：未收录消息原样保留。
+func TestLocalizeHandlerKeepsUnknownAtDebug(t *testing.T) {
+	var buf bytes.Buffer
+	inner := slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	logger := slog.New(newLocalizeHandler(inner, true))
+	logger.Debug("底层调试日志", "k", "v")
+	if !strings.Contains(buf.String(), "底层调试日志") {
+		t.Fatalf("debug 级别应保留未收录日志：%s", buf.String())
+	}
+}
+
+// TestFallbackDetailIsEnglish 钉住 detail 的英文兜底口径：
+// 优先底层错误码，其次字段摘要；不把原中文文案写进 detail。
+func TestFallbackDetailIsEnglish(t *testing.T) {
+	if got := fallbackDetail(map[string]string{"error.code": "agent.mount_failed"}, ""); got != "agent.mount_failed" {
+		t.Fatalf("应优先使用稳定错误码，实际 %q", got)
+	}
+	if got := fallbackDetail(map[string]string{"repo_id": "r1", "stage": "mount"}, ""); got != "repo_id=r1 stage=mount" {
+		t.Fatalf("无错误码时应给出英文 key=value 摘要，实际 %q", got)
+	}
+	if got := fallbackDetail(nil, ""); got != "unmapped log event" {
+		t.Fatalf("无字段时应给出英文兜底说明，实际 %q", got)
+	}
+	if got := fallbackDetail(nil, "cache: l2 read failed"); got != "cache: l2 read failed" {
+		t.Fatalf("原本就是英文的底层日志应原样作为 detail，实际 %q", got)
+	}
+	if got := fallbackDetail(nil, "写入本地状态失败"); got != "failed to write local state" {
+		t.Fatalf("中文日志应转成可读英文 detail，实际 %q", got)
+	}
+	if got := englishErrorDetail(map[string]string{"error.cause": "access denied", "error.code": "agent.mount_failed"}); got != "access denied" {
+		t.Fatalf("英文 cause 应优先，实际 %q", got)
+	}
+	if got := englishErrorDetail(map[string]string{"error.cause": "拒绝访问", "error.code": "agent.mount_failed"}); got != "agent.mount_failed" {
+		t.Fatalf("非英文 cause 应退回英文错误码，实际 %q", got)
 	}
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Select, Skeleton, Space, Tabs, Tooltip, Typography, message } from 'antd'
+import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Skeleton, Space, Tabs, Tooltip, Typography, message } from 'antd'
 import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -9,6 +9,7 @@ import { LoadingState } from '../../components/LoadingState'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
+import { StorageSelect } from '../../components/StorageSelect'
 import { UsageBar, UsageValueText } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { JobDTO, ParentAction, RepoDTO, StorageDTO, UpdateRepoRequest } from '../../api/types'
@@ -740,15 +741,12 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
           ) : targetStorages.length === 0 ? (
             <Alert type="info" showIcon message={t('repo.move.noTargets')} />
           ) : (
-            <Select
+            <StorageSelect
               style={{ width: '100%' }}
               placeholder={t('repo.move.targetPlaceholder')}
-              value={moveStorageID || undefined}
-              onChange={setMoveStorageID}
-              options={targetStorages.map((storage) => ({
-                value: storage.id,
-                label: `${storage.name} · ${storage.path}`
-              }))}
+              value={moveStorageID}
+              onChange={(storageID) => setMoveStorageID(storageID ?? '')}
+              storages={targetStorages}
             />
           )}
         </Space>

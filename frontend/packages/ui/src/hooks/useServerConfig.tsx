@@ -21,6 +21,13 @@ export interface ServerEntry {
   userId?: string
   username?: string
   role?: 'super_admin' | 'user'
+  /**
+   * 是否在启动时自动连接这台服务端。
+   *
+   * 缺省视为 true（老配置没有这个字段，保持原有"启动即连"的行为）。
+   * 只有开启的才会在启动时自动连接；全部关闭时进入服务端选择页。
+   */
+  autoConnect?: boolean
 }
 
 export interface ServerConfigValue {
@@ -28,8 +35,12 @@ export interface ServerConfigValue {
   activeKey: string | null
   active: ServerEntry | null
   setActive: (key: string) => void
-  /** 新增或更新条目（按 key 匹配）。 */
+  /** 新增或更新条目（按 key 匹配），并把该条目设为活动服务端。 */
   upsert: (entry: ServerEntry) => void
+  /** 新增条目：已有活动服务端时**不**切换过去（设置页新增服务器用）。 */
+  addServer: (entry: ServerEntry) => void
+  /** 按 key 更新条目（允许同时修改 key；用于改名/地址/自动连接开关）。 */
+  updateServer: (key: string, patch: Partial<ServerEntry>) => void
   remove: (key: string) => void
   /** 更新当前活动服务端（如保存令牌、名称、实例 ID）。 */
   updateActive: (patch: Partial<ServerEntry>) => void

@@ -7,7 +7,7 @@ import { ErrorNotice } from '../../components/ErrorNotice'
 import { SectionCard } from '../../components/SectionCard'
 import { useApi } from '../../api/provider'
 import type { ConfigField, ConfigResponse } from '../../api/types'
-import { useI18n } from '../../i18n'
+import { useI18n, hasKey } from '../../i18n'
 import { fontSize } from '../../tokens/palette'
 
 /**
@@ -132,17 +132,23 @@ export function ServerConfigCard({ isSuperAdmin }: { isSuperAdmin: boolean }): J
     {
       title: t('system.config.desc'),
       dataIndex: 'desc',
-      render: (_value, field) => (
-        <Space direction="vertical" size={2}>
-          <Typography.Text style={{ fontSize: fontSize.sm }}>{field.desc}</Typography.Text>
-          <Space size={4} wrap>
-            {field.needs_restart ? <Tag color="orange">{t('system.config.needsRestart')}</Tag> : null}
-            {field.sensitive ? <Tag>{t('system.config.sensitive')}</Tag> : null}
-            {field.source === 'env' ? <Tag color="blue">{t('system.config.sourceEnv')}</Tag> : null}
-            {!field.editable ? <Tag>{t('system.config.readonly')}</Tag> : null}
+      render: (_value, field) => {
+        // 服务端只返回中文 desc（避免维护多语言文案）；前端按配置 key 查本地化说明，
+        // 查不到（新加的配置项）再回退服务端原文，保证不会出现空白。
+        const descKey = `system.config.field.${field.key}`
+        const description = hasKey(descKey) ? t(descKey) : field.desc
+        return (
+          <Space direction="vertical" size={2}>
+            <Typography.Text style={{ fontSize: fontSize.sm }}>{description}</Typography.Text>
+            <Space size={4} wrap>
+              {field.needs_restart ? <Tag color="orange">{t('system.config.needsRestart')}</Tag> : null}
+              {field.sensitive ? <Tag>{t('system.config.sensitive')}</Tag> : null}
+              {field.source === 'env' ? <Tag color="blue">{t('system.config.sourceEnv')}</Tag> : null}
+              {!field.editable ? <Tag>{t('system.config.readonly')}</Tag> : null}
+            </Space>
           </Space>
-        </Space>
-      )
+        )
+      }
     }
   ]
 

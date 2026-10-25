@@ -44,10 +44,12 @@ const api = {
   /** 经主进程转发一次代理请求（令牌不进入渲染进程）。 */
   agentRequest: (options: AgentRequestOptions): Promise<AgentRequestResult> =>
     ipcRenderer.invoke('vault:agent-request', options),
-  /** 让主进程订阅代理事件流，并把事件推给本渲染进程。 */
-  agentEventsStart: (): Promise<boolean> => ipcRenderer.invoke('vault:agent-events-start'),
-  /** 关闭主进程为本渲染进程建立的代理事件流。 */
-  agentEventsStop: (): Promise<boolean> => ipcRenderer.invoke('vault:agent-events-stop'),
+  /** 让主进程订阅代理事件流（可指定页面级路径），并把事件推给本渲染进程。 */
+  agentEventsStart: (path?: string): Promise<boolean> =>
+    ipcRenderer.invoke('vault:agent-events-start', path),
+  /** 关闭主进程为本渲染进程建立的指定代理事件流。 */
+  agentEventsStop: (path?: string): Promise<boolean> =>
+    ipcRenderer.invoke('vault:agent-events-stop', path),
   /** 订阅代理事件流消息（open/error/event）；返回取消订阅函数。 */
   onAgentEvent: (callback: (message: AgentStreamMessage) => void): (() => void) => {
     const listener = (_event: IpcRendererEvent, message: AgentStreamMessage): void => callback(message)

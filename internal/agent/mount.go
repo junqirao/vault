@@ -291,8 +291,10 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	//     （会话/磁盘/挂载点）时才需要，而那种情况恰恰是清理失败的情况。
 	// 因此：能清理干净就抹掉记录；清理不干净才保留一条 error 记录作为人工处理入口。
 	failWithDetail := func(stage string, cause error, detail string, extra map[string]any) (*MountState, error) {
+		// 原始诊断只随错误响应 / 本地挂载记录返回，不写进日志：它是平台返回的原文，
+		// 无法做多语言。日志保留稳定的 stage 与错误码即可（排查时看 LastErrorDetail）。
 		e.a.logger.Error("挂载失败",
-			"allocation_id", allocationID, "stage", stage, "detail", detail, "error", cause)
+			"allocation_id", allocationID, "stage", stage, "error", cause)
 
 		// 原始报错（如 Connect-IscsiTarget 的 .NET 异常）也随错误响应带回：失败记录会被抹掉
 		// （见下），若不带回，用户界面上就再也看不到真因（真实反馈："根本没法定位错误 /

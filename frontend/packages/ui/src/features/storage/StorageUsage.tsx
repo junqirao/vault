@@ -117,7 +117,14 @@ function StorageUsageRow({
  * 不在首页罗列每个存储，明细只在只读存储页看。整卡点击进入只读存储页；
  * 管理入口挪到只读存储页右上角（见 StorageUsagePage）。
  */
-export function StorageUsageCard({ onOpen }: { onOpen: () => void }): JSX.Element {
+export function StorageUsageCard({
+  onOpen,
+  embedded = false
+}: {
+  onOpen: () => void
+  /** 嵌在「用量」大模块里时不再套一层 Card，由外层负责边框与留白。 */
+  embedded?: boolean
+}): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const storagesQuery = useQuery({
@@ -128,43 +135,61 @@ export function StorageUsageCard({ onOpen }: { onOpen: () => void }): JSX.Elemen
   const aggregate = aggregateStorageUsage(storages)
   const percent = Math.round(aggregate.percent)
 
+  const content = storagesQuery.isLoading ? (
+    <Skeleton active title={false} paragraph={{ rows: 2 }} />
+  ) : storagesQuery.error ? (
+    <Typography.Text type="danger">{t('storage.loadFailed')}</Typography.Text>
+  ) : storages.length === 0 ? (
+    <Typography.Text type="secondary">{t('storage.empty')}</Typography.Text>
+  ) : (
+    <>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
+        <Typography.Text strong>{t('storage.title')}</Typography.Text>
+        <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
+          {`${t('storage.usage.used')} ${formatBytes(aggregate.used)} / ${formatBytes(aggregate.total)}`}
+        </Typography.Text>
+        <Typography.Text strong style={{ fontSize: fontSize.sm }}>
+          {`${percent}%`}
+        </Typography.Text>
+      </div>
+      <Progress
+        percent={percent}
+        showInfo={false}
+        size="small"
+        strokeColor={usageColor(aggregate.percent)}
+        trailColor={palette.neutralFill}
+        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
+      />
+      <Space size={spacing.md} wrap style={{ marginTop: spacing.sm }}>
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+          {t('storage.usage.remaining')} {formatBytes(Math.max(0, aggregate.total - aggregate.used))}
+        </Typography.Text>
+        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+          {t('storage.usage.count', { count: storages.length })}
+        </Typography.Text>
+      </Space>
+    </>
+  )
+
+  if (embedded) {
+    return (
+      <div
+        onClick={onOpen}
+        style={{ cursor: 'pointer', height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}
+      >
+        {content}
+      </div>
+    )
+  }
+
   return (
-    <Card hoverable onClick={onOpen} styles={{ body: { padding: spacing.md } }} style={{ cursor: 'pointer' }}>
-      {storagesQuery.isLoading ? (
-        <Skeleton active title={false} paragraph={{ rows: 2 }} />
-      ) : storagesQuery.error ? (
-        <Typography.Text type="danger">{t('storage.loadFailed')}</Typography.Text>
-      ) : storages.length === 0 ? (
-        <Typography.Text type="secondary">{t('storage.empty')}</Typography.Text>
-      ) : (
-        <>
-          <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
-            <Typography.Text strong>{t('storage.title')}</Typography.Text>
-            <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
-              {`${t('storage.usage.used')} ${formatBytes(aggregate.used)} / ${formatBytes(aggregate.total)}`}
-            </Typography.Text>
-            <Typography.Text strong style={{ fontSize: fontSize.sm }}>
-              {`${percent}%`}
-            </Typography.Text>
-          </div>
-          <Progress
-            percent={percent}
-            showInfo={false}
-            size="small"
-            strokeColor={usageColor(aggregate.percent)}
-            trailColor={palette.neutralFill}
-            style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-          />
-          <Space size={spacing.md} wrap style={{ marginTop: spacing.sm }}>
-            <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-              {t('storage.usage.remaining')} {formatBytes(Math.max(0, aggregate.total - aggregate.used))}
-            </Typography.Text>
-            <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-              {t('storage.usage.count', { count: storages.length })}
-            </Typography.Text>
-          </Space>
-        </>
-      )}
+    <Card
+      hoverable
+      onClick={onOpen}
+      styles={{ body: { padding: spacing.md } }}
+      style={{ cursor: 'pointer', height: '100%' }}
+    >
+      {content}
     </Card>
   )
 }

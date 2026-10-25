@@ -16,7 +16,7 @@ import {
   TeamOutlined,
   UserOutlined
 } from '@ant-design/icons'
-import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Tooltip, Typography } from 'antd'
+import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import { useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
@@ -24,7 +24,7 @@ import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 // 侧边栏品牌处展示的版本号取自 package.json（构建期注入），与发布包版本同源。
 import { CLIENT_VERSION } from '../config'
 // 与本地条目比对服务端地址用同一口径：代理回传的 url 与本地 baseUrl 可能差一个尾斜杠。
-import { normalizeUrl } from '../store/appStore'
+import { normalizeUrl, rememberManualServerSwitch } from '../store/appStore'
 
 import {
   LanguageSwitcher,
@@ -128,6 +128,9 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
       }
       // 点当前这台不用刷新（否则等于无故重载一次）。
       if (key === activeKey) return
+      // 手动切换后马上会整页重载；标记本次选择，避免目标服务端没开自动连接时
+      // 重载后又被自动连接规则重置。
+      rememberManualServerSwitch(key)
       setActive(key)
       // 换服务端后整页重载：hash 路由保留（仍停在当前页面），但 React Query 缓存与页面内部
       // 状态全部重建。只改 activeKey 是不够的——查询缓存键里没有服务端标识，
@@ -402,60 +405,55 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
             <Space size={spacing.xs}>
               <Dropdown menu={serverMenu} trigger={['click']}>
                 <Button type="text">
-                  {/* 悬停提示的锚点必须是 DOM 节点（Tooltip 拿它做悬停判定与定位），
-                      所以里面用 span 而不是 Space；按钮本身的点击（开服务端下拉）不受影响。 */}
-                  <Tooltip title={serverTip} placement="bottomLeft" mouseEnterDelay={0.3}>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                    {/* 悬停信息放在右侧展开（不再用 Tooltip 压在切换器上）：
+                        实例 ID / 地址 / 延迟口径都较长，右侧浮层不遮挡当前选择。
+                        点击 ms 不再弹任何浮层；排障详情由右侧独立的信息按钮打开。 */}
+                    <Popover
+                      trigger="hover"
+                      placement="rightTop"
+                      mouseEnterDelay={0.3}
+                      content={serverTip}
+                    >
                       <span>{active?.serverName || active?.baseUrl || t('settings.server.noName')}</span>
-                      {/* 延迟指标：数字即状态，同时兼作排障面板的入口 —— 顶栏不再为它单独占一个图标位。
-                          点它要拦掉冒泡，否则服务端下拉会跟着一起弹出来。
-                          刷新按钮跟着面板标题走：面板内容会被"最近一次挂载失败"原文撑长，
-                          按钮放底部既难找、又会被内容推走；无障碍语义由 aria-label 兜住。
-                          等宽数字：免得每 10 秒刷新时整条顶栏左右微跳。 */}
-                      <Popover
-                        content={agentDetail}
-                        trigger="click"
-                        placement="bottomLeft"
-                        title={
-                          <Space size={spacing.xs}>
-                            <span>{t('agent.troubleshoot.title')}</span>
-                            <Button
-                              type="text"
-                              size="small"
-                              icon={<ReloadOutlined />}
-                              title={t('common.refresh')}
-                              aria-label={t('common.refresh')}
-                              onClick={() => void agent.refresh()}
-                            />
-                          </Space>
-                        }
-                      >
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          aria-label={t('agent.troubleshoot.title')}
-                          onClick={(event) => event.stopPropagation()}
-                          onKeyDown={(event) => {
-                            if (event.key !== 'Enter' && event.key !== ' ') return
-                            // 空格会滚页面、回车会"点"外层的按钮：都拦掉，只手动补一次 click。
-                            event.preventDefault()
-                            event.stopPropagation()
-                            event.currentTarget.click()
-                          }}
-                          style={{
-                            color: latencyColor,
-                            cursor: 'pointer',
-                            fontVariantNumeric: 'tabular-nums'
-                          }}
-                        >
-                          {latencyText}
-                        </span>
-                      </Popover>
-                      <DownOutlined style={{ fontSize: 10 }} />
+                    </Popover>
+                    {/* 延迟指标：数字即状态。点击它只作为普通读数，不弹出任何浮层，
+                        也不触发服务端下拉（否则会被当成"点 ms 出来 tooltip"）。 */}
+                    <span
+                      onClick={(event) => event.stopPropagation()}
+                      style={{ color: latencyColor, fontVariantNumeric: 'tabular-nums' }}
+                    >
+                      {latencyText}
                     </span>
-                  </Tooltip>
+                    <DownOutlined style={{ fontSize: 10 }} />
+                  </span>
                 </Button>
               </Dropdown>
+              <Popover
+                content={agentDetail}
+                trigger="click"
+                placement="bottomLeft"
+                title={
+                  <Space size={spacing.xs}>
+                    <span>{t('agent.troubleshoot.title')}</span>
+                    <Button
+                      type="text"
+                      size="small"
+                      icon={<ReloadOutlined />}
+                      title={t('common.refresh')}
+                      aria-label={t('common.refresh')}
+                      onClick={() => void agent.refresh()}
+                    />
+                  </Space>
+                }
+              >
+                <Button
+                  type="text"
+                  size="small"
+                  icon={<InfoCircleOutlined />}
+                  aria-label={t('agent.troubleshoot.title')}
+                />
+              </Popover>
               {serverExhausted ? (
                 <Button size="small" type="link" loading={serverRetrying} onClick={handleServerRetry}>
                   {t('agent.server.retry')}

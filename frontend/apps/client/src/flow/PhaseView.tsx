@@ -10,6 +10,7 @@ import {
   LoginForm,
   OfflineNotice,
   ServerEndpointForm,
+  ServerSelectionPage,
   agentApi,
   useI18n,
   useServerConfig,
@@ -111,7 +112,7 @@ export function PhaseView({
           setConfiguring(false)
         }}
         submitting={checking}
-        onCancel={activeBaseUrl ? () => setConfiguring(false) : undefined}
+        onCancel={activeBaseUrl || phase.kind === 'select-server' ? () => setConfiguring(false) : undefined}
       />
     )
   }
@@ -121,6 +122,19 @@ export function PhaseView({
       <>
         <LanguageCorner language={language} onLanguageChange={onLanguageChange} />
         <LoadingState fullscreen text={t('boot.checking')} />
+      </>
+    )
+  }
+
+  if (phase.kind === 'select-server') {
+    return (
+      <>
+        <LanguageCorner language={language} onLanguageChange={onLanguageChange} />
+        <ServerSelectionPage
+          servers={servers}
+          onSelect={flow.selectServer}
+          onAdd={() => setConfiguring(true)}
+        />
       </>
     )
   }
