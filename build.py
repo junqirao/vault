@@ -1077,6 +1077,40 @@ def build_client_app(args) -> Path | None:
     return None
 
 
+def build_client_artifact(version: str) -> Path | None:
+    """把客户端**程序目录**打成 zip（client 产物的载体，供客户端本体自动更新）。
+
+    与 client_web 的分工：
+      - client_web 只替换渲染层资源，不重启进程；
+      - client 是整份程序目录（Vault.exe + resources/app.asar + Chromium 运行时），
+        代理下载校验后解压到 %ProgramData%\\Vault\\client\\<版本>\\，
+        由客户端主进程在下一次启动时切换（见 internal/agent/updateclient.go）。
+
+    内容**平铺**（不加顶层目录）：解压后即为程序目录，Vault.exe 直接位于根。
+    产物命名 Vault-Client-<version>.zip（符合 updatepkg 的产物名白名单 [A-Za-z0-9._-]）。
+    """
+    app_dir = find_client_app_dir()
+    if not is_complete_app_dir(app_dir):
+        warn("未找到完整可用的客户端程序目录，本次不生成 client 产物（客户端本体无法自动更新）")
+        return None
+    if _client_app_stale(app_dir):
+        # 宁可不出 client 产物，也不发布"版本号是新的、界面却是旧的"客户端包：
+        # 本体更新后用户会看到界面毫无变化，且极难自查（这是真实踩过的坑）。
+        warn(f"客户端程序目录（{app_dir.relative_to(ROOT)}）早于当前渲染层产物，"
+             "本次不生成 client 产物")
+        return None
+    DIST_DIR.mkdir(parents=True, exist_ok=True)
+    out = DIST_DIR / f"Vault-Client-{version}.zip"
+    if out.exists():
+        out.unlink()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in sorted(app_dir.rglob("*")):
+            if path.is_file():
+                zf.write(path, path.relative_to(app_dir).as_posix())
+    ok(f"客户端程序目录包：{out.name}（{out.stat().st_size:,} 字节）")
+    return out
+
+
 def build_client_web_artifact(version: str) -> Path | None:
     """把前端渲染层产物（Vite 产出的 dist/）打成 zip（client_web 产物的载体）。
 
@@ -1197,17 +1231,17 @@ def make_update_package(version: str, channel: str, out_dir: Path, args) -> bool
 
     client_artifact = None
     if args.with_client:
-        app_dir = build_client_app(args)
-        if app_dir:
-            # 单文件形态（portable / 安装包）才适合放进更新清单；
-            # 目录形态（win-unpacked）不作为更新产物，随客户端 zip 整体分发。
-            single = [p for p in sorted((CLIENT_APP_DIR / "release").glob("*.exe"))]
-            if single:
-                client_artifact = single[0]
+        # 先确保程序目录是本次构建的（必要时重打），再整体打成 zip 放进更新清单。
+        # 客户端本体自动更新靠的就是这份产物（见 internal/agent/updateclient.go）。
+        build_client_app(args)
+        client_artifact = build_client_artifact(version)
     if client_artifact:
         cmd += ["-artifact", f"client={client_artifact}"]
     else:
-        info("更新清单中不含客户端产物（仅含 agent；Electron 本体更新尚未接入）")
+        # 明确告警而不是 info：更新清单里没有 client 产物，客户端本体就永远升不上去，
+        # 表现为"代理版本一直在涨、Vault.exe 停在旧版本"，排查成本极高。
+        warn("更新清单中不含客户端产物（client）：本次发布**不会**自动更新客户端本体；"
+             "需要客户端本体自动更新时请加 --with-client")
 
     # 渲染层资源包（client_web）：热更 Electron 的渲染层（Vite 产出的 dist/），不替换本体。
     web_artifact = build_client_web_artifact(version)

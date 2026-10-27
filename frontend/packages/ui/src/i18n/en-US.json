@@ -1287,6 +1287,8 @@
   "settings.update.title": "Client update",
   "settings.update.check": "Check for updates",
   "settings.update.checking": "Checking…",
+  "settings.update.auto": "Automatic updates",
+  "settings.update.autoHint": "Check for and install updates automatically after sign-in; when off, only Check for updates above runs it.",
   "settings.update.available": "New version {version} is available",
   "settings.update.upToDate": "You are on the latest version",
   "settings.update.apply": "Update now",

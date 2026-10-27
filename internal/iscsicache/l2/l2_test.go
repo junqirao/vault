@@ -306,7 +306,7 @@ func TestLayoutPutsStampsInTheirOwnRegion(t *testing.T) {
 			t.Fatalf("stamp %d at %d, want %d", num, got, want)
 		}
 	}
-	// And the index region starts after both, so nothing overlaps.
+	// And the index pages start after both, so nothing overlaps.
 	if got, want := f.indexOffset(f.slotCount, 0), f.stampOffset(f.slotCount-1)+int64(stampSize); got != want {
 		t.Fatalf("index region at %d, want %d", got, want)
 	}
@@ -786,5 +786,30 @@ func TestTornIndexPageIsIgnored(t *testing.T) {
 	again := openTestL2(t, store, "ns")
 	if again.UsedSlots() != 0 {
 		t.Fatalf("used slots = %d from a torn page, want 0", again.UsedSlots())
+	}
+}
+
+// TestBoundSize pins the budget against the LUN: a cache larger than the device
+// it fronts can only hold data that does not exist, and sizing one for it is
+// how a handful of libraries came to reserve hundreds of gigabytes.
+func TestBoundSize(t *testing.T) {
+	const gib = int64(1) << 30
+	cases := []struct {
+		name      string
+		size, lun int64
+		want      int64
+	}{
+		{"budget above the LUN is capped", 4 * gib, gib, gib},
+		{"budget below the LUN is kept", gib / 4, gib, gib / 4},
+		{"equal sizes are kept", gib, gib, gib},
+		{"unset budget is left to layout", 0, gib, 0},
+		{"unknown LUN leaves the budget alone", 4 * gib, 0, 4 * gib},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := BoundSize(tc.size, tc.lun); got != tc.want {
+				t.Fatalf("BoundSize(%d, %d) = %d, want %d", tc.size, tc.lun, got, tc.want)
+			}
+		})
 	}
 }

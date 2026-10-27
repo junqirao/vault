@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"vault/internal/apperr"
@@ -84,6 +85,13 @@ type MountRequest struct {
 // mountEngine 实现挂载/卸载状态机（含幂等与串行化）。
 type mountEngine struct {
 	a *Agent
+	// mountDirMu 串行化"目录模式挂载点：查空位 → 占位"这一步。
+	//
+	// 单库逐个挂载时不需要它（前一个结束后目录已落库）；但分组挂载/自动挂载是**并发**的，
+	// 两个同名库（不同服务端或不同分组，聚合视图里可以同时挂）会各自算出同一个
+	// `<挂载根>\<库名>`：晚到的那个要么撞 dir_not_empty 报错，要么两块卷抢同一个挂载点。
+	// 见 mountAt 里的占位说明。
+	mountDirMu sync.Mutex
 }
 
 // mount 执行完整挂载流程。
@@ -387,7 +395,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	}
 	// 服务已确认在运行：主机状态直接置为就绪（界面横幅自动消失），不再跑一次 PowerShell。
 	e.a.markISCSIServiceRunning()
-	if err := e.a.iscsi.EnsurePortal(ctx, effectivePortalAddr, effectivePortalPort); err != nil {
+	if err := e.ensurePortalWithRetry(ctx, effectivePortalAddr, effectivePortalPort); err != nil {
 		return fail("portal", err)
 	}
 	// 单会话硬前提：把**非生效**目标的残留会话断掉（v1 升级残留的旧代理 IQN 等）。
@@ -546,6 +554,45 @@ func (a *Agent) CancelMount(allocationID string) bool {
 //
 // 调用方有两处：挂载引擎自身（本机各步骤），以及服务端阶段事件（SSE event: mount）。
 // 服务端事件是异步到达的，可能与本机步骤交错，故用 mountPhaseRank 定序。
+// portalRetryDelays 是"确保门户"失败后的退避序列（合计约 4s）。
+//
+// 依据：MSiSCSI 的 WMI 提供程序会瞬时拒绝门户操作（"The target does not have enough
+// resources to process the given request."），门户列表正被写入、或刚释放的会话还在清理时
+// 都会出现，过一会儿再试就能成。真实现场：分组挂载 6 个存储库，挂了 3 个之后剩下的全部
+// 卡在 portal 阶段 —— 用户看到的就是"只挂载了 3 个就不继续了"。
+var portalRetryDelays = []time.Duration{
+	400 * time.Millisecond,
+	1200 * time.Millisecond,
+	2500 * time.Millisecond,
+}
+
+// ensurePortalWithRetry 确保门户存在，瞬时失败按 portalRetryDelays 退避重试。
+//
+// 幂等：脚本先查后建（已存在直接返回 exists），重试不会产生重复门户；成功路径不额外耗时。
+// 真正失败时最多多花约 4s，然后原样上报最后一次错误 —— 比"整批挂载只成一半"划算得多。
+func (e *mountEngine) ensurePortalWithRetry(ctx context.Context, address string, port int) error {
+	var err error
+	for attempt := 0; ; attempt++ {
+		if err = e.a.iscsi.EnsurePortal(ctx, address, port); err == nil {
+			return nil
+		}
+		if attempt >= len(portalRetryDelays) || ctx.Err() != nil {
+			return err
+		}
+		delay := portalRetryDelays[attempt]
+		e.a.logger.Warn("确保 iSCSI 门户失败，稍后重试",
+			"portal", net.JoinHostPort(address, strconv.Itoa(port)),
+			"attempt", attempt+1,
+			"delay", delay.String(),
+			"error", err)
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(delay):
+		}
+	}
+}
+
 func (e *mountEngine) setPhase(allocationID, phase string) {
 	if strings.TrimSpace(phase) == "" {
 		return
@@ -1177,7 +1224,19 @@ func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, 
 		e.labelVolume(ctx, diskNumber, repoNameOf(req, spec))
 		return letter, nil
 	}
+	// 「算目录 → 占位」必须是一步原子操作：分组挂载是并发下发的，两个同名库会各自算出
+	// 同一个 `<挂载根>\<库名>`。把结果先写进挂载记录（mounting 也算占用，见 uniqueMountDir），
+	// 后来者才会顺延到 `-2`；否则可能两块卷抢同一个挂载点、或一个报 dir_not_empty。
+	e.mountDirMu.Lock()
 	dir, err := e.resolveMountDir(req, spec)
+	if err == nil {
+		e.a.store.UpdateMount(req.AllocationID, func(m *MountState, _ *mountRuntime) {
+			if m.State == MountStateMounting {
+				m.MountPath = dir
+			}
+		})
+	}
+	e.mountDirMu.Unlock()
 	if err != nil {
 		return "", err
 	}

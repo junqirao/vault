@@ -50,12 +50,34 @@ try {
     }
 
     $errors = @()
+    $iscsicli = Join-Path $env:SystemRoot 'System32\iscsicli.exe'
     foreach ($portal in $portals) {
-        try {
-            Remove-IscsiTargetPortal -TargetPortalAddress $PortalAddress -TargetPortalPortNumber $PortalPort -Confirm:$false -ErrorAction Stop | Out-Null
-        } catch {
-            $errors += $_.Exception.Message
+        # 用管道传入门户对象，而不是回传 -TargetPortalAddress/-TargetPortalPortNumber：
+        # 后者在部分系统上会因 CIM 参数类型不匹配直接失败（真实现场：
+        # "参数“TargetPortalPortNumber”的类型不匹配"，门户永远删不掉，
+        # 于是在 iSCSI 发起程序里越积越多）。
+        # 与新增门户同理：WMI 偶尔瞬时拒绝（文案随语言本地化，不按文案匹配），短退避重试 2 次。
+        $lastError = $null
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                $portal | Remove-IscsiTargetPortal -Confirm:$false -ErrorAction Stop | Out-Null
+                $lastError = $null
+                break
+            } catch {
+                $lastError = $_
+                if ($attempt -lt 2) { Start-Sleep -Milliseconds 250 }
+            }
         }
+        if (-not $lastError) { continue }
+
+        # cmdlet 彻底失败时用 iscsicli 兜底：上面那个"CIM 参数类型不匹配"是 cmdlet 自身
+        # 的缺陷（管道传对象同样会撞上），而 iscsicli 直接调 MSiSCSI 服务，没有这层校验。
+        # 删没删掉由下面的复核决定，这里不看 iscsicli 的输出（本地化文本不可解析）。
+        if (Test-Path $iscsicli) {
+            & $iscsicli DeleteTargetPortal $PortalAddress ([string]$PortalPort) 2>&1 | Out-Null
+            Start-Sleep -Milliseconds 200
+        }
+        $errors += $lastError.Exception.Message
     }
 
     # 复核：门户必须真的没了（避免"报成功却没删掉"）。

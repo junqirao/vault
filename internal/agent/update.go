@@ -72,13 +72,17 @@ const (
 	webVersionsKept = 2
 	// webExtractSlackBytes 解压总大小上限的固定余量（1 MiB）。
 	webExtractSlackBytes = 1 << 20
-	// webExtractSizeRatioNum/Den 解压总大小上限系数：产物声明 size 的 1.5 倍。
+	// webExtractSizeRatio 解压总大小上限相对产物（zip）字节数的系数。
 	//
-	// 依据：zip 解压后总体积会大于压缩包，但正常 Vite 产物（index.html + assets/*.js/css）
-	// 的膨胀比例有限，1.5x + 1MiB 足以容纳任何真实产物；同时为损坏/恶意 zip（zip bomb）
-	// 设定硬上界，避免把客户端磁盘写满。
-	webExtractSizeRatioNum = 3
-	webExtractSizeRatioDen = 2
+	// 依据：产物是 deflate 压缩包，**解压后会比压缩包大数倍**，实测 Vite 渲染层
+	// dist/（index.html + assets/*.js）约为压缩包体积的 3.2 倍；纯文本类资源
+	// （CSS / sourcemap / 大段 JSON）能到 10 倍以上。历史取值 1.5 倍把关系算反了，
+	// 任何真实产物都会在解压途中被判 extract_too_large，热更必然失败（真实工单）。
+	// 这里放宽到 12 倍，绝对上界由 webExtractHardCapBytes 兜住，zip bomb 仍被挡住。
+	webExtractSizeRatio = 12
+	// webExtractHardCapBytes 解压总大小的绝对硬上界（1 GiB）：
+	// 不论压缩比如何，渲染层静态资源解压后都不该超过它。
+	webExtractHardCapBytes = 1 << 30
 )
 
 // UpdateInfo 是自更新状态（GET /agent/state 的 update 字段）。
@@ -265,6 +269,16 @@ func (a *Agent) resolveUpdate(ctx context.Context) (*updateCandidate, *UpdateChe
 //     这不是错误，前端展示为"无可用更新"，避免把"暂时查不到"变成刺眼的报错；
 //   - (nil, nil, err)：**硬失败**（验签失败 / 清单非法），必须原样上报，绝不降级。
 func (a *Agent) resolveUpdateKind(ctx context.Context, kind updatepkg.ArtifactKind) (*updateCandidate, *UpdateCheckResult, error) {
+	return a.resolveUpdateKindAgainst(ctx, kind, a.version)
+}
+
+// resolveUpdateKindAgainst 与 resolveUpdateKind 相同，但显式传入"版本单调性的基准"。
+//
+// 自更新（agent）的基准是代理自身版本；客户端本体更新（client）的基准必须是**当前运行的
+// Electron 客户端版本**。两者虽然通常同批次发布，但落后程度可以不同——真实场景：代理已自
+// 更新到 0.1.211，而 Vault.exe 还停在 0.1.208。若拿代理版本当基准，这份"客户端该更新"的
+// 清单会被判成 not_newer，客户端本体就永远升不上去（这正是版本不一致提示一直消不掉的原因）。
+func (a *Agent) resolveUpdateKindAgainst(ctx context.Context, kind updatepkg.ArtifactKind, baseline string) (*updateCandidate, *UpdateCheckResult, error) {
 	// ① 更新源：**主服务端**（多服务端下更新源只能有一个，见 §7.4.1）。
 	//
 	// TODO(多服务端回退)：设计目标是 primary → 其他 COMPATIBLE 服务端按配置顺序回退（§7.4.1）。
@@ -339,7 +353,7 @@ func (a *Agent) resolveUpdateKind(ctx context.Context, kind updatepkg.ArtifactKi
 		return nil, nil, err
 	}
 
-	// ④ 版本单调性：agent 必须严格新于当前**代理版本**。
+	// ④ 版本单调性：目标版本必须严格新于 baseline。
 	//
 	// 这是防**降级攻击**的关键一步：被控服务端可以下发一份"签名合法但版本更旧"的清单
 	// （例如含已修复漏洞的旧版），若不校验单调性，客户端就会自己把自己降级。
@@ -347,16 +361,22 @@ func (a *Agent) resolveUpdateKind(ctx context.Context, kind updatepkg.ArtifactKi
 	// client_web 例外：渲染层资源的单调性应针对"当前已激活的渲染层版本"判定，
 	// 不能拿代理 exe 的版本来卡它（两者并非同一序列）；该判定在 runWebUpdate 中完成。
 	if kind != updatepkg.KindClientWeb {
-		newer, err := isNewer(manifest.Version, a.version)
-		if err != nil {
-			return nil, a.unavailable("bad_version"), nil
-		}
-		if !newer {
-			a.logger.Info("更新清单版本不高于当前版本，忽略（防降级）",
-				"manifest_version", manifest.Version, "current", a.version)
-			res := a.unavailable("not_newer")
-			res.Version = manifest.Version
-			return nil, res, nil
+		if strings.TrimSpace(baseline) == "" {
+			// 没有基准（首次安装、客户端版本未知）：无法判断是否降级，放行。
+			// 完整性仍由"发布方签名 + 产物 sha256"保证，不存在被投毒的风险。
+			a.logger.Info("缺少版本基准，跳过单调性判断", "kind", string(kind), "manifest_version", manifest.Version)
+		} else {
+			newer, err := isNewer(manifest.Version, baseline)
+			if err != nil {
+				return nil, a.unavailable("bad_version"), nil
+			}
+			if !newer {
+				a.logger.Info("更新清单版本不高于当前版本，忽略（防降级）",
+					"kind", string(kind), "manifest_version", manifest.Version, "current", baseline)
+				res := a.unavailable("not_newer")
+				res.Version = manifest.Version
+				return nil, res, nil
+			}
 		}
 	}
 
@@ -1521,14 +1541,24 @@ func verifyArtifactFile(path string, art *updatepkg.Artifact) error {
 	return nil
 }
 
-// webExtractMaxBytes 返回解压后允许的总字节上限：产物声明 size 的 1.5 倍 + 1MiB。
+// webExtractMaxBytes 返回解压后允许的总字节上限：产物声明 size 的 webExtractSizeRatio 倍
+// + webExtractSlackBytes，且不超过 webExtractHardCapBytes。
 //
-// 依据见 webExtractSizeRatioNum 的说明；size 未知（<=0）时只给固定余量。
+// 依据见 webExtractSizeRatio 的说明；size 未知（<=0）时无法外推，直接用硬上界兜底
+// （旧实现在这里只给 1MiB，等于必然失败）。
 func webExtractMaxBytes(artifactSize int64) int64 {
 	if artifactSize <= 0 {
-		return webExtractSlackBytes
+		return webExtractHardCapBytes
 	}
-	return artifactSize*webExtractSizeRatioNum/webExtractSizeRatioDen + webExtractSlackBytes
+	// 先判上限再做乘法：极端 size 下乘法溢出会得到负数，等于完全不设防。
+	if artifactSize > webExtractHardCapBytes/webExtractSizeRatio {
+		return webExtractHardCapBytes
+	}
+	max := artifactSize*webExtractSizeRatio + webExtractSlackBytes
+	if max > webExtractHardCapBytes {
+		return webExtractHardCapBytes
+	}
+	return max
 }
 
 // extractWebZip 把 zip 解压到 destDir，拒绝路径穿越（zip slip）并限制解压总大小。
@@ -1559,7 +1589,7 @@ func extractWebZip(zipPath, destDir string, maxBytes int64) error {
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return errWebUpdateFailed("extract", err)
 		}
-		if err := writeZipEntry(f, target, &remaining); err != nil {
+		if err := writeZipEntry(f, target, &remaining, maxBytes); err != nil {
 			return err
 		}
 	}
@@ -1605,7 +1635,8 @@ func isWithinDir(dir, target string) bool {
 // writeZipEntry 写出单个 zip 条目，并从共享预算中扣减已写字节（防 zip bomb）。
 //
 // 用 LimitReader 而非信任 zip 头声明的 UncompressedSize：即便头部谎报也无法越过上限。
-func writeZipEntry(f *zip.File, target string, remaining *int64) error {
+// maxBytes 只用于在超限时把"上限 / 已写"写进日志（对外仍只暴露稳定错误码 + stage）。
+func writeZipEntry(f *zip.File, target string, remaining *int64, maxBytes int64) error {
 	rc, err := f.Open()
 	if err != nil {
 		return errWebUpdateFailed("extract_open_entry", err)
@@ -1626,7 +1657,8 @@ func writeZipEntry(f *zip.File, target string, remaining *int64) error {
 	}
 	*remaining -= n
 	if *remaining < 0 {
-		return errWebUpdateFailed("extract_too_large", nil)
+		return errWebUpdateFailed("extract_too_large",
+			fmt.Errorf("解压后总体积超过上限（上限 %d 字节，已写 %d 字节）", maxBytes, maxBytes-*remaining))
 	}
 	return nil
 }

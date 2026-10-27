@@ -4,6 +4,7 @@ import path from 'node:path'
 import { BrowserWindow, Menu, Tray, app, dialog, ipcMain, nativeImage, shell } from 'electron'
 
 import { AgentManager, listProcesses, runPowerShell, type AgentRequestOptions, type NamedProcess } from './agent'
+import { maybeHandoffOnStartup, startClientUpdateWatch } from './clientUpdate'
 import { resolveBundledVersion, resolveWebappEntry } from './webapp'
 
 /**
@@ -25,12 +26,29 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
 const WINDOW_STATE_FILE = path.join(CONFIG_DIR, 'window-state.json')
 /** 记录"上次清理渲染缓存时的应用版本"（与用户配置同目录，不受缓存清理影响）。 */
 const CACHE_VERSION_FILE = path.join(CONFIG_DIR, 'renderer-cache-version.json')
+/** 内置渲染层入口（随 exe 打包）：热更层不可用、或加载失败时的兜底。 */
+const BUNDLED_RENDERER = path.join(__dirname, '../dist/index.html')
+/**
+ * 热更切换时的过渡页（vite 把 public/loading.html 原样复制到 dist/）。
+ *
+ * 纯静态、无外部资源，见 showLayerLoading 的说明。
+ */
+const LOADING_PAGE = path.join(__dirname, '../dist/loading.html')
 
 const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let quitting = false
+/** 客户端本体更新的运行期守护（见 clientUpdate.ts）；退出时停掉，避免往回连。 */
+let stopClientUpdateWatch: (() => void) | null = null
+/**
+ * 是否正在切换渲染层。
+ *
+ * loadFile 是"整页替换"：两次切换并发时后一次会把前一次的加载打断，窗口可能停在
+ * 过渡页上。所以同一时刻只允许一次切换，后来的调用直接返回 in_flight。
+ */
+let applyingLayer = false
 
 /**
  * 内置渲染层（随 exe 打包）的版本号：createWindow 时解析一次，之后用于热更层判定
@@ -44,6 +62,38 @@ let bundledVersion = ''
  * 这里用"解析出的文件 == 已加载文件"来判定无需切换，从而**杜绝重载循环**。
  */
 let loadedRendererFile = ''
+
+/**
+ * 判定为"启动不起来"的热更层版本记录（与用户配置同目录）。
+ *
+ * 热更资源是**在现有客户端里**运行的新界面，与当前 exe 的 preload / 代理接口未必兼容；
+ * 新层若一启动就崩（JS 异常），窗口就是白板，而 loadFile 本身是成功的，主进程无从得知。
+ * 记下坏版本后，之后启动直接跳过它，用户不会每次都被白屏挡在门外。
+ */
+const BAD_LAYER_FILE = path.join(CONFIG_DIR, 'renderer-bad-layer.json')
+
+/** 切到新层后等待渲染层上报"已启动"的最长时间；超时即判定该层不可用。 */
+const LAYER_READY_TIMEOUT_MS = 10_000
+
+/** 已知不可用的热更层版本（空 = 无）；启动时读盘，运行期判定后更新。 */
+let badLayerVersion = ''
+/** 已加载那一层的激活时间（current.json.activated_at）；同路径重新激活也要重载。 */
+let loadedLayerActivatedAt = 0
+/** 正在等 ready 上报的层（空 = 当前没有待确认的切换）。 */
+let pendingLayerFile = ''
+/** 待确认层的版本，判定坏层时写盘用。 */
+let pendingLayerVersion = ''
+let layerReadyTimer: ReturnType<typeof setTimeout> | null = null
+
+/**
+ * 最近一次整包更新请求的时间（毫秒）；代理重启就绪后据此重新加载界面。
+ *
+ * 用时间戳而不是布尔：代理替换 exe 时会**先退出再重启**，请求本身可能因连接中断而
+ * 拿不到响应；只要窗口期内看到代理重新可用，就认为更新已完成并刷新界面。
+ */
+let updateAppliedAt = 0
+/** 整包更新请求到界面重载之间认账的窗口：超出这个时间就不再把代理重启当成更新完成。 */
+const UPDATE_RELOAD_WINDOW_MS = 10 * 60 * 1000
 
 /** 本地代理守护器（单例）。 */
 const agent = new AgentManager()
@@ -263,6 +313,41 @@ function parseAgentRequest(value: unknown): AgentRequestOptions | null {
   return { method, path: requestPath, body: input.body, timeoutMs }
 }
 
+/** 过渡页支持的语言（与 @vault/ui 的 Language 一致）。 */
+const LOADING_LANGUAGES = ['zh-CN', 'en-US', 'ja-JP', 'ko-KR'] as const
+
+/**
+ * 过渡页用哪种语言：取自客户端配置（%APPDATA%/Vault/config.json 的 language）。
+ *
+ * 读不到、值不认识时用 zh-CN —— 过渡页自己也带一份中文兜底，绝不会空白。
+ */
+async function loadingLanguage(): Promise<string> {
+  const config = await readJson<{ language?: unknown }>(CONFIG_FILE)
+  const value = typeof config?.language === 'string' ? config.language.trim() : ''
+  return (LOADING_LANGUAGES as readonly string[]).includes(value) ? value : 'zh-CN'
+}
+
+/**
+ * 显示"正在切换到新版本界面"的过渡页。
+ *
+ * 为什么需要：renderer 热更生效时主进程直接 `loadFile(新层/index.html)`，这一下旧页面立刻就
+ * 被卸载，而新层的 index.html 与 bundle 还没解析完 —— 中间这段时间窗口就是**一块白板**
+ * （真实反馈："客户端在自动更新时白屏"）。过渡页是 dist 里的一个纯静态 HTML（内联样式与
+ * 脚本，零外部请求），加载即出画面，正好把这段空窗盖住。
+ *
+ * 过渡页缺失（例如开发态直接跑 vite dev，根本没有 dist）时不阻断切换：只打一行 WARN，
+ * 继续加载新层，行为与改造前一致。
+ */
+async function showLayerLoading(): Promise<void> {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  try {
+    await mainWindow.loadFile(LOADING_PAGE, { query: { lang: await loadingLanguage() } })
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    console.warn(`[vault] 过渡页加载失败（直接切换渲染层）：${reason}`)
+  }
+}
+
 function registerIpc(): void {
   ipcMain.handle('vault:get-config', async () => readJson<unknown>(CONFIG_FILE))
   ipcMain.handle('vault:set-config', async (_event, value: unknown) => {
@@ -274,7 +359,17 @@ function registerIpc(): void {
   ipcMain.handle('vault:agent-request', async (_event, options: unknown) => {
     const parsed = parseAgentRequest(options)
     if (!parsed) return { status: 0, error: 'network', message: 'invalid_request' }
-    return agent.request(parsed)
+    const isUpdateApply = parsed.path.startsWith('/agent/update/apply')
+    if (isUpdateApply) updateAppliedAt = Date.now()
+    const result = await agent.request(parsed)
+    // 没受理成功就不算更新（例如没有可用产物）：别让下一次无关的代理重启误触发刷新。
+    if (isUpdateApply && (result.status < 200 || result.status >= 300)) updateAppliedAt = 0
+    return result
+  })
+  // 渲染层上报"已启动"：撤掉热更层白屏看门狗（见 armLayerWatchdog）。
+  ipcMain.handle('vault:renderer-ready', () => {
+    clearLayerWatchdog()
+    return true
   })
   ipcMain.handle('vault:agent-events-start', (event, pathArg: unknown) => {
     const id = event.sender.id
@@ -369,19 +464,46 @@ function registerIpc(): void {
   // internal/agent 的 onSessionEstablished）。返回 applied=false 表示"当前已是最新层"
   // （或没有可用的热更层）——调用方据此无需做任何事，也不会形成重载循环。
   ipcMain.handle('vault:apply-web-layer', async () => {
-    if (!mainWindow) return { applied: false, reason: 'no_window' }
+    const win = mainWindow
+    if (!win || win.isDestroyed()) return { applied: false, reason: 'no_window' }
+    if (applyingLayer) return { applied: false, reason: 'in_flight' }
     const entry = await resolveWebappEntry(bundledVersion)
     if (!entry.ok) return { applied: false, reason: entry.reason }
-    if (entry.file === loadedRendererFile) return { applied: false, reason: 'already_loaded' }
+    // 已经判定跑不起来的版本不再尝试：否则每次激活都会白屏一次再回退。
+    if (entry.version === badLayerVersion) return { applied: false, reason: 'marked_bad' }
+    // 同路径但激活时间变了 = 服务端用同一版本号重发了资源（目录被重建），必须重载。
+    if (entry.file === loadedRendererFile && entry.activatedAt === loadedLayerActivatedAt) {
+      return { applied: false, reason: 'already_loaded' }
+    }
+    applyingLayer = true
     try {
-      await mainWindow.loadFile(entry.file)
+      // 先盖过渡页，再切新层：两段 loadFile 之间的空白由它顶住（见 showLayerLoading）。
+      await showLayerLoading()
+      await win.loadFile(entry.file)
       loadedRendererFile = entry.file
+      loadedLayerActivatedAt = entry.activatedAt
+      // 切完还不算数：等新层上报"已启动"，超时同样回退（见 armLayerWatchdog）。
+      armLayerWatchdog(entry.file, entry.version)
       console.info(`[vault] 已自动切换到新渲染层：${entry.dir}`)
       return { applied: true, version: entry.dir }
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
-      console.warn(`[vault] 切换渲染层失败（保持当前界面）：${reason}`)
+      console.warn(`[vault] 切换渲染层失败，回退内置资源：${reason}`)
+      await markLayerBad(entry.version, `load_failed:${reason}`)
+      // 过渡页已经把旧界面换掉了，失败时绝不能把它留在窗口上：回到随 exe 打包的界面。
+      clearLayerWatchdog()
+      try {
+        await win.loadFile(BUNDLED_RENDERER)
+        loadedRendererFile = BUNDLED_RENDERER
+        loadedLayerActivatedAt = 0
+      } catch (fallbackError) {
+        const fallbackReason =
+          fallbackError instanceof Error ? fallbackError.message : String(fallbackError)
+        console.warn(`[vault] 回退内置渲染层也失败：${fallbackReason}`)
+      }
       return { applied: false, reason }
+    } finally {
+      applyingLayer = false
     }
   })
 }
@@ -455,6 +577,21 @@ async function createWindow(): Promise<void> {
 
   mainWindow.on('resized', () => void persistState())
   mainWindow.on('moved', () => void persistState())
+  // 主框架加载失败 / 渲染进程崩溃：若正在确认的是热更层，回退内置资源，绝不把用户留在白板上。
+  mainWindow.webContents.on(
+    'did-fail-load',
+    (_event, errorCode, errorDescription, _url, isMainFrame) => {
+      // -3 = ERR_ABORTED：切层时主动中止上一次导航，属正常现象。
+      if (!isMainFrame || errorCode === -3) return
+      if (pendingLayerFile === '') return
+      void fallbackFromBadLayer(`did_fail_load(${errorCode}:${errorDescription})`)
+    }
+  )
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    if (pendingLayerFile === '') return
+    void fallbackFromBadLayer(`render_process_gone(${details.reason})`)
+  })
+
   mainWindow.on('closed', () => {
     mainWindow = null
   })
@@ -491,24 +628,108 @@ async function createWindow(): Promise<void> {
  */
 async function loadRendererLayer(): Promise<void> {
   if (!mainWindow) return
+  badLayerVersion = await readBadLayerVersion()
   const entry = await resolveWebappEntry(bundledVersion)
-  if (entry.ok) {
+  if (entry.ok && entry.version !== badLayerVersion) {
     try {
+      // 先盖过渡页：热更层万一启动即崩（见 armLayerWatchdog 的说明），用户看到的是
+      // "正在加载"而不是一块白板，10s 后自动回退内置层。
+      await showLayerLoading()
       await mainWindow.loadFile(entry.file)
       loadedRendererFile = entry.file
+      loadedLayerActivatedAt = entry.activatedAt
+      // loadFile 成功不代表界面能跑：等它上报"已启动"，超时就回退（见 fallbackFromBadLayer）。
+      armLayerWatchdog(entry.file, entry.version)
       console.info(`[vault] 已加载热更渲染层：${entry.dir}（内置版本 ${bundledVersion}）`)
       return
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error)
       console.warn(`[vault] 热更渲染层加载失败，回退内置资源：${reason}`)
+      // 记下坏版本：否则每次启动都会在这一个坏层上再失败一次。
+      await markLayerBad(entry.version, `load_failed:${reason}`)
     }
+  } else if (entry.ok) {
+    console.warn(`[vault] 跳过此前判定不可用的热更渲染层 ${entry.version}，使用内置资源`)
   } else {
     console.warn(`[vault] 未启用热更渲染层（${entry.reason}），使用内置资源`)
   }
-  const bundled = path.join(__dirname, '../dist/index.html')
-  await mainWindow.loadFile(bundled)
-  loadedRendererFile = bundled
+  await mainWindow.loadFile(BUNDLED_RENDERER)
+  loadedRendererFile = BUNDLED_RENDERER
+  loadedLayerActivatedAt = 0
   console.info(`[vault] 已加载内置渲染层（版本 ${bundledVersion}）`)
+}
+
+/** 读取已记录的坏层版本；无记录 / 读不到返回空串。 */
+async function readBadLayerVersion(): Promise<string> {
+  const record = await readJson<{ version?: unknown }>(BAD_LAYER_FILE)
+  return typeof record?.version === 'string' ? record.version.trim() : ''
+}
+
+/** 记录一个"启动不起来"的热更层版本，之后启动直接跳过。 */
+async function markLayerBad(version: string, reason: string): Promise<void> {
+  if (version === '') return
+  badLayerVersion = version
+  console.warn(`[vault] 渲染层 ${version} 判定不可用（${reason}），回退内置资源`)
+  try {
+    await writeJson(BAD_LAYER_FILE, { version, reason, at: new Date().toISOString() })
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    console.warn(`[vault] 坏层记录写入失败：${detail}`)
+  }
+}
+
+/** 撤掉待确认状态（收到 ready 上报、或已经处理完一次失败）。 */
+function clearLayerWatchdog(): void {
+  if (layerReadyTimer) {
+    clearTimeout(layerReadyTimer)
+    layerReadyTimer = null
+  }
+  pendingLayerFile = ''
+  pendingLayerVersion = ''
+}
+
+/**
+ * 新层就位后开始计时：限期内没等到渲染层上报"已启动"就认为它白屏了。
+ *
+ * 这是**唯一**能发现"loadFile 成功、页面却崩溃"的手段——Electron 不会因为渲染进程的
+ * JS 异常而让 loadFile 失败，窗口就那样停在白板上。
+ */
+function armLayerWatchdog(file: string, version: string): void {
+  clearLayerWatchdog()
+  pendingLayerFile = file
+  pendingLayerVersion = version
+  layerReadyTimer = setTimeout(() => {
+    layerReadyTimer = null
+    void fallbackFromBadLayer('ready_timeout')
+  }, LAYER_READY_TIMEOUT_MS)
+}
+
+/**
+ * 当前加载的热更层没跑起来：记为坏层并回退随 exe 打包的内置界面。
+ *
+ * 内置层是最后一道兜底，它再失败就无路可退，因此这里只处理热更层。
+ */
+async function fallbackFromBadLayer(reason: string): Promise<void> {
+  const file = pendingLayerFile
+  const version = pendingLayerVersion
+  // 没有待确认的切换 = 已经处理过（或本来就没切层），直接返回，杜绝回退循环。
+  if (file === '' || file === BUNDLED_RENDERER) {
+    clearLayerWatchdog()
+    return
+  }
+  clearLayerWatchdog()
+  await markLayerBad(version, reason)
+  const win = mainWindow
+  if (!win || win.isDestroyed()) return
+  try {
+    await showLayerLoading()
+    await win.loadFile(BUNDLED_RENDERER)
+    loadedRendererFile = BUNDLED_RENDERER
+    console.info('[vault] 已回退到内置渲染层')
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    console.warn(`[vault] 回退内置渲染层失败：${detail}`)
+  }
 }
 
 /**
@@ -721,12 +942,33 @@ function startPrimaryInstance(): void {
     await trustedCertificatesLoaded
     // 若本进程是"接管旧实例"后重启的，先继承旧安装目录，供代理清理陈旧进程。
     applyInheritedStaleRoots()
+    // 本体更新：代理可能已经把新版本程序目录准备好（%ProgramData%\Vault\client\<版本>），
+    // 这里拉起它。新进程会因为"版本更高 + 目录不同"接管并结束本进程（旧窗口一直可用，
+    // 新版本若启动即崩，本进程不会被结束）。
+    //
+    // 版本号用 resolveBundledVersion 解析，不直接用 app.getVersion()：后者在 app.asar 里
+    // 读不到 version 时会回退成 Electron 的大版本号（33.x），导致"新版本永远不比当前新"。
+    bundledVersion = await resolveBundledVersion(app.getAppPath(), app.getVersion())
+    await maybeHandoffOnStartup(bundledVersion)
     registerIpc()
-    agent.onChanged(broadcastAgentInfo)
+    agent.onChanged((info) => {
+      broadcastAgentInfo()
+      // 整包更新后代理会以新版本重新起来：此时重新加载界面（会重新解析热更层），
+      // 让前端与代理都回到同一版本，用户不需要手动重启。
+      if (info.available && updateAppliedAt > 0 && Date.now() - updateAppliedAt < UPDATE_RELOAD_WINDOW_MS) {
+        updateAppliedAt = 0
+        console.info('[vault] 代理已更新并就绪，重新加载界面')
+        // loadRendererLayer 内部在加载热更层前会先盖过渡页，这里直接调用即可。
+        void loadRendererLayer()
+      }
+    })
     await createWindow()
     createTray()
     // 代理在后台异步拉起；找不到可执行文件时进入降级模式，不影响窗口。
     agent.start()
+    // 客户端本体更新：请求代理准备新版本（下载/校验/解压），就绪且无活跃挂载时切换。
+    // 有挂载时绝不重启——重启会掐断 iSCSI 会话（见 docs/implementation.md §7.4.4）。
+    stopClientUpdateWatch = startClientUpdateWatch(agent, bundledVersion)
     app.on('activate', () => {
       if (BrowserWindow.getAllWindows().length === 0) void createWindow()
       else showWindow()
@@ -739,7 +981,11 @@ function startPrimaryInstance(): void {
   })
 
   // 应用退出时停止守护，避免代理成为孤儿进程。
-  app.on('will-quit', () => agent.stop())
+  app.on('will-quit', () => {
+    stopClientUpdateWatch?.()
+    stopClientUpdateWatch = null
+    agent.stop()
+  })
 }
 
 const gotLock = app.requestSingleInstanceLock()
@@ -757,6 +1003,12 @@ if (gotLock) {
       return
     }
     if (outcome.kind === 'blocked') {
+      // 本体更新拉起的进程只是"顺带试试"：接管不了就静默退出，旧实例继续正常使用。
+      // 这里弹"已有一个客户端在运行"只会让用户莫名其妙（他并没有手动开第二个）。
+      if (process.env.VAULT_CLIENT_HANDOFF === '1') {
+        app.exit(0)
+        return
+      }
       await app.whenReady()
       dialog.showMessageBoxSync({
         type: 'warning',

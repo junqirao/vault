@@ -78,7 +78,13 @@ const api = {
    * applied=false 表示当前已是最新层（或没有可用热更层），调用方无需处理。
    */
   applyWebLayer: (): Promise<{ applied: boolean; version?: string; reason?: string }> =>
-    ipcRenderer.invoke('vault:apply-web-layer')
+    ipcRenderer.invoke('vault:apply-web-layer'),
+  /**
+   * 告诉主进程"这一层界面已成功启动"。
+   *
+   * 主进程用它判断热更层是否白屏：切层后迟迟收不到就回退内置资源（见 main.ts 的看门狗）。
+   */
+  rendererReady: (): Promise<boolean> => ipcRenderer.invoke('vault:renderer-ready')
 } as const
 
 contextBridge.exposeInMainWorld('vault', api)

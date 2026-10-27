@@ -5,9 +5,12 @@ package l2
 import (
 	"bytes"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 // These tests are the only ones that exercise the real unbuffered Windows store
@@ -43,7 +46,7 @@ func storeSize(t *testing.T, s Store) int64 {
 
 func TestStoreFileRoundTrip(t *testing.T) {
 	path := realStorePath(t)
-	s, err := openStore(path, realSize, realBlock)
+	s, err := openStore(path, realBlock)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -60,14 +63,16 @@ func TestStoreFileRoundTrip(t *testing.T) {
 	if err := s.Sync(); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	if size := storeSize(t, s); size != realSize {
-		t.Fatalf("fileSize = %d, want %d", size, realSize)
+	// The file grows to what was written, not to the budget: an opened cache
+	// must not reserve the space it may never use.
+	if size, want := storeSize(t, s), int64(SuperBlockSize+stampSize+realBlock); size != want {
+		t.Fatalf("fileSize = %d, want %d", size, want)
 	}
 	if err := s.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	again, err := openStore(path, realSize, realBlock)
+	again, err := openStore(path, realBlock)
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -109,8 +114,7 @@ func TestStoreConcurrentTransfers(t *testing.T) {
 	// overlap each other or the stamp writer, or a "mismatch" would be a legal
 	// interleaving rather than a bug.
 	metaBase := int64(SuperBlockSize) + writers*stride
-	size := metaBase + metaOps*int64(realBlock)
-	s, err := openStore(realStorePath(t), size, realBlock)
+	s, err := openStore(realStorePath(t), realBlock)
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -234,5 +238,113 @@ func TestFileOnRealStore(t *testing.T) {
 	}
 	if !bytes.Equal(one, want[:realSect]) {
 		t.Fatal("the surviving sector of a partly invalidated slot is wrong")
+	}
+}
+
+// TestOpenDoesNotReserveBudget pins that opening a cache no longer extends the
+// file to its budget. A handful of libraries with large budgets used to take
+// that much disk before a single block had been read.
+func TestOpenDoesNotReserveBudget(t *testing.T) {
+	const budget = 64 << 20
+	path := filepath.Join(t.TempDir(), "l2.bin")
+	f, err := Open(Config{
+		Path:       path,
+		SizeBytes:  budget,
+		BlockSize:  64 << 10,
+		SectorSize: realSect,
+		Namespace:  "ns",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	closed := false
+	defer func() {
+		if !closed {
+			f.Close()
+		}
+	}()
+
+	stat := func(name string) int64 {
+		t.Helper()
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatalf("stat %s: %v", name, err)
+		}
+		return info.Size()
+	}
+
+	if got := stat(path); got != SuperBlockSize {
+		t.Fatalf("file after open = %d bytes, want just the superblock (%d)", got, SuperBlockSize)
+	}
+	// Sparse is what keeps a write near the end of the file from materialising
+	// everything between it and the start.
+	ptr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatalf("path: %v", err)
+	}
+	attrs, err := windows.GetFileAttributes(ptr)
+	if err != nil {
+		t.Fatalf("attributes: %v", err)
+	}
+	if attrs&windows.FILE_ATTRIBUTE_SPARSE_FILE == 0 {
+		t.Fatal("the cache file is not sparse")
+	}
+
+	if err := f.WriteSectors(0, 0, 1, bytes.Repeat([]byte{0xA5}, realSect)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// The file grows with the write, but stays far below the budget: one slot
+	// is 64 KiB against a 64 MiB budget.
+	after := stat(path)
+	if after <= SuperBlockSize {
+		t.Fatalf("file did not grow with the first write: %d", after)
+	}
+	if after >= budget {
+		t.Fatalf("file grew to the budget: %d >= %d", after, budget)
+	}
+
+	// The index lives in its own file, so closing writes its page there instead
+	// of stretching the data file to an offset near the end of the budget.
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	closed = true
+	if got := stat(path); got != after {
+		t.Fatalf("data file changed on close: %d -> %d", after, got)
+	}
+	idx := indexPath(path)
+	if got, want := stat(idx), int64(indexPageSize); got != want {
+		t.Fatalf("index file = %d bytes, want one page (%d)", got, want)
+	}
+}
+
+// TestDiscardedSnapshotGivesSpaceBack pins that a file whose contents are
+// discarded, as one written by an older layout is, does not keep the space it
+// held. That is what reclaims a preallocated cache of tens of gigabytes on the
+// first open under the new layout.
+func TestDiscardedSnapshotGivesSpaceBack(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "l2.bin")
+	// Eight megabytes of allocated bytes with no valid superblock: the shape an
+	// older, preallocated cache has from the new layout's point of view.
+	if err := os.WriteFile(path, bytes.Repeat([]byte{0x11}, 8<<20), 0o644); err != nil {
+		t.Fatalf("write old cache: %v", err)
+	}
+	f, err := Open(Config{
+		Path:       path,
+		SizeBytes:  64 << 20,
+		BlockSize:  64 << 10,
+		SectorSize: realSect,
+		Namespace:  "ns",
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Size() != SuperBlockSize {
+		t.Fatalf("file after discarding = %d bytes, want %d", info.Size(), SuperBlockSize)
 	}
 }

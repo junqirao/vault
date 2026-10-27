@@ -106,6 +106,8 @@ const (
 	CodeUpdaterMissing = "update.updater_missing"
 	// CodeWebUpdateFailed 渲染层资源（client_web）热更失败（500，args.stage 指明阶段）。
 	CodeWebUpdateFailed = "agent.web_update_failed"
+	// CodeClientUpdateFailed 客户端本体（client）更新失败（500，args.stage 指明阶段）。
+	CodeClientUpdateFailed = "agent.client_update_failed"
 	// CodeIdentityNotInstalled 本地尚未安装客户端身份（identity.json）（409）。
 	CodeIdentityNotInstalled = "agent.identity_not_installed"
 	// CodeIdentityInvalid 本地身份文件不可用或密钥对不匹配（409）。
@@ -244,6 +246,15 @@ func errDownloadFailed(stage string, cause error) *apperr.Error {
 // 仅暴露稳定错误码与 stage；底层原因只进日志（绝不回显内容/路径细节）。
 func errWebUpdateFailed(stage string, cause error) *apperr.Error {
 	e := apperr.New(CodeWebUpdateFailed, http.StatusInternalServerError).WithArg("stage", stage)
+	if cause != nil {
+		e = e.WithCause(cause)
+	}
+	return e
+}
+
+// errClientUpdateFailed 客户端本体（Electron 程序目录）更新失败，stage 指明失败阶段。
+func errClientUpdateFailed(stage string, cause error) *apperr.Error {
+	e := apperr.New(CodeClientUpdateFailed, http.StatusInternalServerError).WithArg("stage", stage)
 	if cause != nil {
 		e = e.WithCause(cause)
 	}

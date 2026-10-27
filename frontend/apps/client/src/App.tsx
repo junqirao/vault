@@ -23,6 +23,7 @@ import {
   isApiError,
   subscribeAgentSession,
   trustServerCertificate,
+  useAgent,
   type AgentIdentity,
   type AgentSessionState,
   type BootstrapResponse,
@@ -33,6 +34,7 @@ import {
 } from '@vault/ui'
 
 import { PhaseView, type CertLoginFailure } from './flow/PhaseView'
+import { useAutoUpdate } from './flow/useAutoUpdate'
 import { useStartupFlow } from './flow/useStartupFlow'
 import { normalizeUrl, selectActiveServer, useAppStore } from './store/appStore'
 
@@ -118,6 +120,9 @@ export function App(): JSX.Element {
   )
 
   const flow = useStartupFlow(api)
+  // 全自动更新：只要代理可用就开始检查，不等登录、也不用进设置页（设置页的手动入口保留）。
+  const agent = useAgent()
+  useAutoUpdate(agent.available)
   const { setPhase } = flow
 
   useEffect(() => {

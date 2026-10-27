@@ -141,6 +141,8 @@ type Agent struct {
 	updateServerReason string
 	// web 管理渲染层资源热更（client_web，见 update.go）。
 	web *webUpdateManager
+	// client 管理客户端本体更新（client，见 updateclient.go）。
+	client *clientUpdateManager
 	// updateStarted 标记"本次退出由自更新触发"：为 true 时退出流程不得卸载挂载
 	// （挂载由 updater 重启后的自动挂载恢复，见 update.go 的说明）。
 	updateStarted atomic.Bool
@@ -222,6 +224,7 @@ func New(opt Options) (*Agent, error) {
 		authRetryInFlight: make(map[string]*authRetryCall),
 	}
 	a.web = newWebUpdateManager(a)
+	a.client = newClientUpdateManager(a)
 	a.engine = &mountEngine{a: a}
 	// 清单进度走本地 SSE：界面不再轮询 /agent/fs/manifest/status。
 	a.manifests.publish = func(st ManifestStatus) {

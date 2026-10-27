@@ -285,3 +285,70 @@ func TestRepoCacheExplicitOffPersists(t *testing.T) {
 		t.Fatalf("cache_enabled 必须是 false，实际 %T(%v)", value, value)
 	}
 }
+
+// TestAutoUpdateDefaultsOn 覆盖"自动更新缺省即开启"。语义与 auto_login 完全一致：
+// 检测的是配置里**有没有 auto_update 这个键**，而不是它的零值 —— 旧配置没有该键时必须开启。
+func TestAutoUpdateDefaultsOn(t *testing.T) {
+	cases := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{name: "旧配置缺少 auto_update 键 → 开启", content: `{"auto_mount":false}`, want: true},
+		{name: "显式关闭 → 关闭", content: `{"auto_update":false}`, want: false},
+		{name: "显式开启 → 开启", content: `{"auto_update":true}`, want: true},
+		{name: "空对象 → 开启", content: `{}`, want: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "agent-config.json")
+			if err := os.WriteFile(path, []byte(c.content), 0o600); err != nil {
+				t.Fatalf("准备配置失败：%v", err)
+			}
+			store, err := NewConfigStore(path, testLogger())
+			if err != nil {
+				t.Fatalf("加载配置失败：%v", err)
+			}
+			if got := store.Get().AutoUpdate; got != c.want {
+				t.Fatalf("AutoUpdate = %v，期望 %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestAutoUpdatePatchPersists 显式关闭必须落盘，重启后不能被"缺省即开启"覆盖。
+func TestAutoUpdatePatchPersists(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agent-config.json")
+	store, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("加载配置失败：%v", err)
+	}
+	if !store.Get().AutoUpdate {
+		t.Fatal("全新安装应默认开启自动更新")
+	}
+
+	off := false
+	if _, err := store.Patch(ConfigPatch{AutoUpdate: &off}); err != nil {
+		t.Fatalf("关闭自动更新失败：%v", err)
+	}
+	reloaded, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("重新加载配置失败：%v", err)
+	}
+	if reloaded.Get().AutoUpdate {
+		t.Fatal("显式关闭必须持久化，重启后仍为关闭")
+	}
+
+	// 再打开一次并重新加载，确认双向都持久化。
+	on := true
+	if _, err := reloaded.Patch(ConfigPatch{AutoUpdate: &on}); err != nil {
+		t.Fatalf("开启自动更新失败：%v", err)
+	}
+	again, err := NewConfigStore(path, testLogger())
+	if err != nil {
+		t.Fatalf("再次加载配置失败：%v", err)
+	}
+	if !again.Get().AutoUpdate {
+		t.Fatal("显式开启必须持久化")
+	}
+}

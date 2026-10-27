@@ -23,25 +23,44 @@ try {
     if (-not $Address) { throw 'Address 参数不能为空' }
     if ($Port -le 0) { $Port = 3260 }
 
-    $existing = @(Get-IscsiTargetPortal -ErrorAction SilentlyContinue | Where-Object {
-        $_.TargetPortalAddress -eq $Address -and [int]$_.TargetPortalPortNumber -eq $Port
-    })
-
-    if ($existing.Count -gt 0) {
-        [pscustomobject]@{
-            ok      = $true
-            action  = 'exists'
-            address = $Address
-            port    = $Port
-        } | ConvertTo-Json -Compress -Depth 5
-        exit 0
+    # WMI 提供程序会瞬时拒绝："The target does not have enough resources to process the
+    # given request." —— 门户列表正被别的进程写入、或上一轮会话刚释放时都可能出现
+    # （真实现场：并发挂载 4 个库，3 个在同一毫秒内失败在此）。
+    # 该文案会随系统语言本地化，所以**不按错误文案匹配**：统一退避重试。
+    #
+    # 重试 5 次、退避 300/600/1200/2400ms（合计约 4.5s）：现场表明这类拒绝是"挤出式"的
+    # —— 同时有多个挂载在动门户时，前面的失败会拖到下一个窗口才恢复。3 次（0.75s）不够。
+    #
+    # 注意 **Get 也在重试范围内**：原来它带 -ErrorAction SilentlyContinue，瞬时失败会被
+    # 吞成"门户不存在"，接着 New 又失败（门户其实在），错误信息反而更误导。
+    $delays = @(300, 600, 1200, 2400)
+    $lastError = $null
+    $action = 'created'
+    for ($attempt = 1; $attempt -le ($delays.Count + 1); $attempt++) {
+        try {
+            $existing = @(Get-IscsiTargetPortal -ErrorAction Stop | Where-Object {
+                $_.TargetPortalAddress -eq $Address -and [int]$_.TargetPortalPortNumber -eq $Port
+            })
+            if ($existing.Count -gt 0) {
+                $action = 'exists'
+            } else {
+                New-IscsiTargetPortal -TargetPortalAddress $Address -TargetPortalPortNumber $Port -ErrorAction Stop | Out-Null
+                $action = 'created'
+            }
+            $lastError = $null
+            break
+        } catch {
+            $lastError = $_
+            if ($attempt -le $delays.Count) {
+                Start-Sleep -Milliseconds $delays[$attempt - 1]
+            }
+        }
     }
-
-    New-IscsiTargetPortal -TargetPortalAddress $Address -TargetPortalPortNumber $Port -ErrorAction Stop | Out-Null
+    if ($lastError) { throw $lastError }
 
     [pscustomobject]@{
         ok      = $true
-        action  = 'created'
+        action  = $action
         address = $Address
         port    = $Port
     } | ConvertTo-Json -Compress -Depth 5

@@ -55,6 +55,7 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   const [identityError, setIdentityError] = useState<unknown>(null)
   const [identityBusy, setIdentityBusy] = useState(false)
   const [autoLoginSaving, setAutoLoginSaving] = useState(false)
+  const [autoUpdateSaving, setAutoUpdateSaving] = useState(false)
   const [removeOpen, setRemoveOpen] = useState(false)
   // 待撤销的"其他服务端"证书；null 表示没有待确认的撤销。
   const [removeOther, setRemoveOther] = useState<AgentIdentity | null>(null)
@@ -389,6 +390,29 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     }
   }
 
+  /**
+   * 「自动更新」开关：和免密登录一样**即时生效**，不等页脚的"保存"。
+   *
+   * 先乐观改本地态再发 PATCH，失败回滚 —— 否则开关会停在用户刚点的位置，
+   * 与代理里实际生效的值不一致（下次打开设置又会跳回去）。
+   */
+  const toggleAutoUpdate = async (autoUpdate: boolean): Promise<void> => {
+    patch({ auto_update: autoUpdate })
+    setAutoUpdateSaving(true)
+    setError(null)
+    setNotice(null)
+    try {
+      const result = await agentApi.patchConfig({ auto_update: autoUpdate })
+      setConfig(result.config)
+      await agent.refresh()
+    } catch (err) {
+      patch({ auto_update: !autoUpdate })
+      setError(err)
+    } finally {
+      setAutoUpdateSaving(false)
+    }
+  }
+
   return (
     <PageShell
       title={t('page.settings.title')}
@@ -698,6 +722,21 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         }
       >
         <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
+          <div>
+            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+              {t('settings.update.auto')}
+            </Typography.Text>
+            <Switch
+              checked={config?.auto_update ?? true}
+              loading={autoUpdateSaving}
+              disabled={disabled}
+              onChange={(checked) => void toggleAutoUpdate(checked)}
+            />
+            <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+              {t('settings.update.autoHint')}
+            </Typography.Text>
+          </div>
+
           {/* 整包更新这一块只回答一个问题："要不要更新"。
               有可更新的版本才展开进度与安装按钮；没有就一个对勾说清楚，不再铺版本/来源/
               包大小/更新说明这些发布侧信息（用户在这一步用不到）。 */}

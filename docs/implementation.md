@@ -1309,6 +1309,15 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 > （`mountPhaseRank` 定序：服务端事件异步到达，可能晚于本机阶段）。事件是尽力而为的，
 > 丢了不影响挂载本身；权威结果以 mount 响应与磁盘状态为准。
 >
+> **并发挂载（分组批量）**：客户端「挂载分组」最多同时跑 4 个库（`RepoList.tsx` 的
+> `GROUP_OP_CONCURRENCY`），卸载同理。但**门户的新增/移除必须串行**（`iscsiinitiator.Manager.portalMu`）：
+> MSiSCSI 的 WMI 提供程序不抗并发，同时调 `New-IscsiTargetPortal` 会直接返回
+> "The target does not have enough resources to process the given request."
+> （真实现场：4 个并发挂载中 3 个在同一毫秒内失败在 `stage=portal`，单独重试即成功）。
+> 门户步骤是毫秒级 WMI 调用，串行化不影响整体并行度；脚本侧另有 3 次短退避重试兜住瞬时拒绝。
+> 目录模式的「算目录 → 占位」同样要原子（`mountEngine.mountDirMu`），否则同名库并发挂载会
+> 抢同一个挂载点。
+>
 > **本机预检（启动即告知）**：代理启动时**只读探测** iSCSI 发起端
 > （`iscsiinitiator.Probe`：IscsiInitiator 模块 + MSiSCSI 服务状态，**绝不启动服务** ——
 > 启动系统服务属于部署决策，只由用户点挂载时的 `EnsureService` 触发），结果写进

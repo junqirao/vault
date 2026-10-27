@@ -82,7 +82,27 @@ func (b *alignedBuf) free() {
 	b.buf = nil
 }
 
-func openStore(path string, size int64, maxIO int) (Store, error) {
+// fsctlSetSparse is FSCTL_SET_SPARSE. Without it Windows materialises every
+// cluster between the start of the file and each write, so a cache whose slots
+// and index pages sit far apart occupies its whole budget even though only a
+// few places were ever written. With it the file keeps only the clusters that
+// hold data, which is what makes a large budget cost what the cache actually
+// caches instead of what it is allowed to.
+const fsctlSetSparse = 0x000900C4
+
+// markSparse turns the file into a sparse one. A file system that does not
+// support it fails here, and that is not fatal: the cache works the same, it
+// only takes the disk its budget names.
+func markSparse(h windows.Handle) {
+	var ret uint32
+	_ = windows.DeviceIoControl(h, fsctlSetSparse, nil, 0, nil, 0, &ret, nil)
+}
+
+// openStore opens the L2 file. The file is deliberately not extended to a
+// budget here: Open grows it to the superblock and lets the slot and index
+// regions follow the writes, so opening a cache does not reserve the space it
+// may never use.
+func openStore(path string, maxIO int) (Store, error) {
 	s := &winStore{path: path}
 	for i := 0; i < storeShards; i++ {
 		sh := &winShard{}
@@ -94,6 +114,10 @@ func openStore(path string, size int64, maxIO int) (Store, error) {
 			s.Close()
 			return nil, err
 		}
+		// Every handle opens the same file, so the attribute is set once.
+		if i == 0 {
+			markSparse(h)
+		}
 		sh.h = h
 		buf, err := newAlignedBuf(maxIO)
 		if err != nil {
@@ -104,24 +128,11 @@ func openStore(path string, size int64, maxIO int) (Store, error) {
 		sh.scratch = buf
 		s.shards = append(s.shards, sh)
 	}
-	// Only ever grow here. The index region of the previous snapshot can sit
-	// past the size a smaller budget implies, and Open still has to read it
-	// before the file may be trimmed, so shrinking is left to Open.
-	if size > 0 {
-		cur, err := s.fileSize()
-		if err != nil {
-			s.Close()
-			return nil, err
-		}
-		if cur < size {
-			if err := s.Truncate(size); err != nil {
-				s.Close()
-				return nil, err
-			}
-		}
-	}
 	return s, nil
 }
+
+// Size implements Store.
+func (s *winStore) Size() (int64, error) { return s.fileSize() }
 
 func createStoreFile(path string) (windows.Handle, error) {
 	p, err := windows.UTF16PtrFromString(path)

@@ -117,6 +117,10 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/update/web", a.handleWebUpdateState)
 	mux.HandleFunc("POST /agent/update/web/apply", a.handleWebUpdateApply)
 
+	// 客户端本体更新（client）：下载并准备新程序目录，由客户端主进程重启切换。
+	mux.HandleFunc("GET /agent/update/client", a.handleClientUpdateState)
+	mux.HandleFunc("POST /agent/update/client/apply", a.handleClientUpdateApply)
+
 	mux.HandleFunc("POST /agent/shutdown", a.handleShutdown)
 
 	return a.corsMiddleware(a.tokenMiddleware(mux))
@@ -892,6 +896,37 @@ func (a *Agent) handleWebUpdateState(w http.ResponseWriter, _ *http.Request) {
 func (a *Agent) handleWebUpdateApply(w http.ResponseWriter, _ *http.Request) {
 	state := a.startWebUpdate()
 	a.writeJSON(w, http.StatusAccepted, map[string]any{"web_update": state})
+}
+
+// ---- 客户端本体更新（client） ----
+
+// handleClientUpdateState 返回客户端本体更新状态（GET /agent/update/client）。
+func (a *Agent) handleClientUpdateState(w http.ResponseWriter, _ *http.Request) {
+	a.writeJSON(w, http.StatusOK, map[string]any{"client_update": a.clientUpdateState()})
+}
+
+// clientUpdateApplyRequest 是 POST /agent/update/client/apply 的请求体。
+type clientUpdateApplyRequest struct {
+	// CurrentVersion 当前正在运行的客户端版本（Electron app.getVersion()）。
+	//
+	// 必须由客户端主进程传入：版本单调性的基准是**客户端版本**，不是代理版本。
+	// 代理可能已经自更新到 0.1.211，而 Vault.exe 还停在 0.1.208，拿代理版本当基准
+	// 会把"客户端该更新"判成 not_newer（真实工单：版本不一致提示一直消不掉）。
+	CurrentVersion string `json:"current_version"`
+}
+
+// handleClientUpdateApply 启动客户端本体更新（异步，立即返回 202）。
+//
+// 只做"下载 → 校验 → 解压 → 写激活指针"，**不重启客户端**：重启时机由客户端主进程决定
+// （有活跃挂载时必须等卸载，否则会打断用户的盘）。
+func (a *Agent) handleClientUpdateApply(w http.ResponseWriter, r *http.Request) {
+	var req clientUpdateApplyRequest
+	// 请求体可选：解析失败也不影响（退化为"无基准"，跳过单调性判断）。
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req)
+	}
+	state := a.startClientUpdate(req.CurrentVersion)
+	a.writeJSON(w, http.StatusAccepted, map[string]any{"client_update": state})
 }
 
 // ---- 退出 ----

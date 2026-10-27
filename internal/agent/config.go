@@ -160,6 +160,14 @@ type Config struct {
 	// 为什么默认开启：服务端会话只存在内存里，服务端一重启全部令牌失效；
 	// 若默认关闭，用户每次重启服务端都要重新输一遍密码——这正是要消除的现象。
 	AutoLogin bool `json:"auto_login"`
+	// AutoUpdate 是否在登录后自动检查并安装客户端更新。
+	//
+	// 默认**开启**，语义与 AutoLogin 完全一致：配置里没有 auto_update 这一项时按开启处理，
+	// 只有显式写成 false 才关闭（见 normalizeConfig 与 UnmarshalJSON）。
+	//
+	// 关掉后客户端登录不再自动检查/安装更新（含渲染层热更），只能用设置页的
+	// 「检查更新」手动执行。
+	AutoUpdate bool `json:"auto_update"`
 	// DefaultMountMode letter | directory。
 	//
 	// 只作为每库配置缺省时的兜底值（以及从未配过的库的初始形态），**不对用户开放**：
@@ -219,6 +227,11 @@ type Config struct {
 	// 不落盘、不出现在 JSON 里：只为区分"用户明确关掉了免密登录"与"配置里没这项"。
 	// 后者要按默认开启处理（见 AutoLogin 注释）。
 	autoLoginSet bool
+	// autoUpdateSet 记录 auto_update 是否被**显式**配置过。
+	//
+	// 同 autoLoginSet 的用意：不落盘、不出现在 JSON 里，只为区分"用户明确关掉了自动更新"
+	// 与"配置里没这项"。
+	autoUpdateSet bool
 	// cacheL2Set 记录 cache_l2_bytes 是否被**显式**配置过。
 	//
 	// 同 autoLoginSet 的用意：0 是合法取值（关闭 L2），必须与"配置里没这项"区分开，
@@ -243,6 +256,7 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 	}
 	*c = Config(parsed)
 	_, c.autoLoginSet = probe["auto_login"]
+	_, c.autoUpdateSet = probe["auto_update"]
 	_, c.cacheL2Set = probe["cache_l2_bytes"]
 	return nil
 }
@@ -253,8 +267,9 @@ func (c *Config) UnmarshalJSON(data []byte) error {
 // （repo_mounts，见 RepoMountPref），全局默认值只是代码里的兜底，不对用户开放 ——
 // 客户端设置页不再展示它们，API 也不接受（请求里带了就当没带）。
 type ConfigPatch struct {
-	AutoMount *bool `json:"auto_mount"`
-	AutoLogin *bool `json:"auto_login"`
+	AutoMount  *bool `json:"auto_mount"`
+	AutoLogin  *bool `json:"auto_login"`
+	AutoUpdate *bool `json:"auto_update"`
 	// DefaultDownloadDir 母盘内容下载的默认目标目录。
 	DefaultDownloadDir *string `json:"default_download_dir"`
 	// ShortcutDir 存储库快捷方式的默认存放目录；空串 = 系统桌面。
@@ -279,6 +294,7 @@ func defaultConfig() Config {
 		// 默认开启证书免密登录：服务端重启会清空会话，用户不该为此重新输密码。
 		// 这里不置 autoLoginSet，因此 normalizeConfig 也会把"未表态"归一为开启。
 		AutoLogin:        true,
+		AutoUpdate:       true,
 		DefaultMountMode: mountModeLetter,
 		DefaultMountDir:  `C:\Vault`,
 		// DefaultDownloadDir 与 DefaultMountDir 同风格：默认落在 C:\Vault 下。
@@ -339,6 +355,10 @@ func normalizeConfig(c Config) Config {
 	// 已显式配置过（autoLoginSet）则完全尊重用户选择。
 	if !c.autoLoginSet {
 		c.AutoLogin = true
+	}
+	// auto_update 同样缺省即开启（见 Config.AutoUpdate 注释）。
+	if !c.autoUpdateSet {
+		c.AutoUpdate = true
 	}
 	if strings.TrimSpace(c.DefaultMountMode) == "" {
 		c.DefaultMountMode = def.DefaultMountMode
@@ -550,6 +570,11 @@ func (s *ConfigStore) Patch(p ConfigPatch) (Config, error) {
 		s.cfg.AutoLogin = *p.AutoLogin
 		// 用户显式表过态了：此后不再套用"缺省即开启"。
 		s.cfg.autoLoginSet = true
+	}
+	if p.AutoUpdate != nil {
+		s.cfg.AutoUpdate = *p.AutoUpdate
+		// 同上：显式关闭后不能被"缺省即开启"重新打开。
+		s.cfg.autoUpdateSet = true
 	}
 	if p.DefaultDownloadDir != nil {
 		dir, err := validateAbsDir(*p.DefaultDownloadDir, "default_download_dir")

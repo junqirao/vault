@@ -418,6 +418,13 @@ export interface AgentConfig {
   /** 是否用本地客户端证书免密登录（identity.json 存在时生效）。 */
   auto_login: boolean
   /**
+   * 登录后是否自动检查并安装更新（默认开启）。
+   *
+   * 关闭后登录时不再自动检查/安装（含渲染层热更），只能用设置页的「检查更新」手动执行。
+   * 显式关闭会持久化，不会被"缺省即开启"重新打开（代理侧同样如此，见 Config.AutoUpdate）。
+   */
+  auto_update: boolean
+  /**
    * 本地读缓存代理的 **L1（内存）全局上限**（字节）：所有开了缓存的库共享这一个数，
    * 按各自**库容量占比**分摊（见 GET /agent/cache 的 recommend 与 targets[].l1_limit_bytes）。
    *
@@ -751,6 +758,13 @@ export interface UpdateInfo {
   server_reason?: string
   /** 服务端错误的插值参数。 */
   server_args?: Record<string, unknown>
+  /**
+   * 升级后将不再兼容的服务端（对应代理侧 UpdateCheckResult.breaks_servers）。
+   *
+   * 非空表示升级会让这些服务端在它们升级前无法协作，属于**必须由用户确认**的动作；
+   * 自动更新流程遇到非空会跳过整包安装（见 apps/client/src/flow/useAutoUpdate.ts）。
+   */
+  breaks_servers?: { server_name: string; max: string }[]
 }
 
 /** 渲染层资源热更状态（POST /agent/update/web/apply、GET /agent/update/web、web_update 事件）。 */

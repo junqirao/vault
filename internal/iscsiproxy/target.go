@@ -373,6 +373,17 @@ func (t *target) maybeBind() {
 		BlockSize:  t.blockSize,
 	}
 	cc := t.cc
+	// A cache larger than the LUN it caches can only hold data that does not
+	// exist, and sizing one for it is what turned a few libraries into hundreds
+	// of gigabytes of cache budget. The LUN capacity is only known once a READ
+	// CAPACITY has been seen; until then the configured size is left alone.
+	if lunBytes := int64(t.blockCount) * int64(t.blockSize); lunBytes > 0 {
+		if bounded := l2.BoundSize(cc.L2.SizeBytes, lunBytes); bounded != cc.L2.SizeBytes {
+			t.log.Info("iscsiproxy: L2 预算裁到后端容量",
+				"configured", cc.L2.SizeBytes, "lun_bytes", lunBytes, "using", bounded)
+			cc.L2.SizeBytes = bounded
+		}
+	}
 	t.mu.Unlock()
 
 	ns := desc.Namespace()

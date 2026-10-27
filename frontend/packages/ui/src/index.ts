@@ -44,6 +44,7 @@ export {
   parseAgentEvent,
   relaunchClient,
   selectDirectory,
+  signalRendererReady,
   subscribeAgentVersion,
   supportsDirectoryPicker,
   trustServerCertificate,

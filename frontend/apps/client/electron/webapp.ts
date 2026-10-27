@@ -49,10 +49,24 @@ export async function resolveBundledVersion(appPath: string, fallback: string): 
 interface CurrentPointer {
   dir?: unknown
   version?: unknown
+  activated_at?: unknown
 }
 
 export type WebappEntryResult =
-  | { ok: true; dir: string; file: string }
+  | {
+      ok: true
+      dir: string
+      file: string
+      version: string
+      /**
+       * 激活时间（current.json 的 activated_at，毫秒）。
+       *
+       * 主进程用它判断"同一路径的层是否被重新激活过"：服务端可能用**同一个版本号**
+       * 重发修正后的资源，代理会重建同名目录，入口路径不变但内容已换。只比较路径会
+       * 漏掉这种情况，热更便永远要用户手动重启才生效（真实反馈）。
+       */
+      activatedAt: number
+    }
   | { ok: false; reason: string }
 
 /** 把版本号解析为数字段；含非数字段（如 1.2.x）时返回 null。 */
@@ -144,5 +158,9 @@ export async function resolveWebappEntry(bundledVersion: string): Promise<Webapp
     return { ok: false, reason: 'index_missing' }
   }
 
-  return { ok: true, dir: dirPath, file }
+  const activatedAt =
+    typeof pointer.activated_at === 'number' && Number.isFinite(pointer.activated_at)
+      ? pointer.activated_at
+      : 0
+  return { ok: true, dir: dirPath, file, version: hotVersion, activatedAt }
 }

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Button, Checkbox, DatePicker, Input, Select, Space, Tag, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { ReloadOutlined } from '@ant-design/icons'
@@ -195,6 +195,21 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
   const [range, setRange] = useState<[Dayjs, Dayjs] | null>(null)
   /** 最新的排在最前（日志文件按时间正序写入，默认倒序看）。 */
   const [newestFirst, setNewestFirst] = useState(true)
+  /** 当前页（受控）：筛选条件变化时要回到第 1 页，否则会停在一个已不存在的页码上。 */
+  const [page, setPage] = useState(1)
+  /**
+   * 每页条数（受控，默认 10）。
+   *
+   * antd 的 pagination 一旦传了 pageSize 就是**受控属性**：用户在选择器里改完，
+   * 若父组件不把新值写回 state，下一次渲染又按旧值传下去，选择器会立刻弹回原值——
+   * 表现出来就是"每页条数选不动"。所以必须用 state 持有并回写。
+   */
+  const [pageSize, setPageSize] = useState(10)
+
+  // 换日期/级别/关键字/时间范围/排序后，旧页码已经失去意义，统一回到第 1 页。
+  useEffect(() => {
+    setPage(1)
+  }, [day, level, keyword, range, newestFirst])
 
   const logQuery = useQuery({
     // 两种来源的缓存互不覆盖（同一台机器上两个页面可能同时打开）。
@@ -390,7 +405,21 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
           loading={logQuery.isLoading}
           empty={<EmptyState title={t('log.empty')} description={t('log.emptyHint')} />}
           scroll={{ x: 1080 }}
-          pagination={{ pageSize: 50, showSizeChanger: true }}
+          pagination={{
+            current: page,
+            pageSize,
+            showSizeChanger: true,
+            pageSizeOptions: [10, 20, 50, 100],
+            // 条数切换必须回写 state（见 pageSize 的注释）；页码同时归位到第 1 页。
+            onChange: (nextPage, nextSize) => {
+              if (nextSize !== pageSize) {
+                setPageSize(nextSize)
+                setPage(1)
+                return
+              }
+              setPage(nextPage)
+            }
+          }}
           expandable={{
             expandedRowRender: (entry) => {
               const detail = entry.parsed ? JSON.stringify(entry.json, null, 2) : entry.raw

@@ -44,22 +44,24 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 const (
-	// SuperBlockSize is the reserved header at the start of the L2 file.
+	// SuperBlockSize is the reserved header at the start of the L2 data file.
 	SuperBlockSize = 4096
 	superBlockMag  = "VLTISCL2"
 	// superBlockVer 2 added the persisted index region and the snapshot marker;
 	// 3 added the per-slot stamp sector and the statically reserved index;
 	// 4 moved every stamp out of the slot area into one of its own, which is
-	// what makes the data of neighbouring slots neighbouring bytes. An older
-	// file has its stamps wedged between the slots, so it is discarded and
-	// rebuilt rather than migrated: see initSuperBlock.
-	superBlockVer = 4
+	// what makes the data of neighbouring slots neighbouring bytes; 5 moved the
+	// index pages into a file of their own, so the data file no longer has to
+	// reach the end of the budget to hold its first page. An older file is
+	// discarded and rebuilt rather than migrated: see initSuperBlock.
+	superBlockVer = 5
 )
 
 // Slot stamp. Every slot has one reserved sector describing the data it holds,
@@ -153,13 +155,21 @@ type Store interface {
 	ReadAt(p []byte, off int64) error
 	WriteAt(p []byte, off int64) error
 	Truncate(size int64) error
+	// Size reports the current end of the file. It is what lets Open leave a
+	// file that is smaller than its budget alone instead of extending it to the
+	// budget up front: both the data and the index file grow as they are written.
+	Size() (int64, error)
 	Sync() error
 	Close() error
 }
 
 // Config configures an L2 file.
 type Config struct {
-	Path       string
+	Path string
+	// SizeBytes is a ceiling, not an allocation: neither file is extended to it
+	// when the cache is opened, the slots and the index pages grow as they are
+	// written. A budget larger than the LUN it caches only wastes index space,
+	// so callers cap it with BoundSize first.
 	SizeBytes  int64
 	BlockSize  int
 	SectorSize int
@@ -177,8 +187,14 @@ type Config struct {
 	// reported and the in-memory index simply starts empty.
 	Namespace string
 	Logger    *slog.Logger
-	// Store overrides the platform store; used by tests.
+	// Store overrides the platform data store; used by tests. When it is set
+	// without IndexStore, the index pages are addressed after the data region
+	// of that same store instead of in a file of their own.
 	Store Store
+	// IndexStore overrides the store the index pages are written to. Zero
+	// shares Store when that is set, and otherwise takes Path with its extension
+	// replaced by .idx.
+	IndexStore Store
 }
 
 func (c *Config) normalize() error {
@@ -246,24 +262,35 @@ type slot struct {
 	stamped bool
 }
 
-// File is a fixed slot L2 cache held in a single file. A block is handed the
-// slot its LBA region owns rather than the next one free, so the blocks of a
-// region are always neighbours on disk and a range read of them is a streaming
-// read rather than one transfer per block.
+// File is a fixed slot L2 cache held in two files: the data file holds the
+// slots, and the index file holds the pages that describe them. A block is
+// handed the slot its LBA region owns rather than the next one free, so the
+// blocks of a region are always neighbours on disk and a range read of them is
+// a streaming read rather than one transfer per block.
 //
-// Layout: superblock, then the slots, then the slot stamps, then the index
-// region. Slots start at a fixed offset, so a session that gets a different
-// budget addresses the slots it already has in exactly the same place; the stamp
-// and index regions move with the slot count and are rewritten when they do. The
-// superblock records the slot count its index region belongs to, which is what
-// lets a later session find it, and the region size, because that decides which
-// slot a block belongs in.
+// Layout: in the data file, the superblock, then the slots, then the slot stamps.
+// Slot offsets depend only on the slot number, so a session that gets a different
+// budget addresses the slots it already has in exactly the same place. The index
+// pages live in their own file, one page per recsPerPage slots, which is what
+// keeps the data file from having to reach the end of the budget before its first
+// page can be written. The superblock records the slot count the snapshot belongs
+// to, which is how a later session knows how many pages to read, and the region
+// size, because that decides which slot a block belongs in.
 type File struct {
-	store      Store
-	slotSize   int
-	sectorSize int
-	secPerSlot int
-	slotCount  int
+	store Store
+	// idx holds the index pages. Because it is a file of its own, writing one
+	// page costs one 4 KiB allocation instead of a data file stretched to the
+	// page's offset near the end of the budget.
+	idx Store
+	// sharedIndex reports that one store serves both regions, which a test that
+	// injects a single store does. The pages then start after the data of the
+	// slot count they belong to, so they are addressed through that count
+	// instead of a fixed zero.
+	sharedIndex bool
+	slotSize    int
+	sectorSize  int
+	secPerSlot  int
+	slotCount   int
 	// maxIO is Config.MaxIOBytes clamped to the file. One transfer may cover
 	// this many bytes, which is what sets how long a run of neighbouring slots
 	// ReadBlocks can serve per IO.
@@ -272,7 +299,7 @@ type File struct {
 	log       *slog.Logger
 
 	indexPages int
-	// snapshotSlots is the slot count the index region on disk belongs to. It
+	// snapshotSlots is the slot count the index pages on disk belong to. It
 	// differs from slotCount after a budget change and until the next flush.
 	snapshotSlots int
 	generation    uint64
@@ -394,17 +421,22 @@ func Open(cfg Config) (*File, error) {
 	if regionBlocks > slotCount {
 		regionBlocks = slotCount
 	}
+	// The index pages are budgeted in fileSize but live in their own file, so
+	// the data region ends where they would have started.
+	dataSize := fileSize - int64(indexPages)*indexPageSize
 	// The store sizes its scratch once and reads through it, so the cap is
-	// clamped to the file it can never read past.
+	// clamped to the data it can never read past.
 	maxIO := cfg.MaxIOBytes
-	if int64(maxIO) > fileSize {
-		maxIO = int(fileSize)
+	if int64(maxIO) > dataSize {
+		maxIO = int(dataSize)
 	}
 	if maxIO < maxInt(slotSize, SuperBlockSize) {
 		maxIO = maxInt(slotSize, SuperBlockSize)
 	}
 
 	store := cfg.Store
+	idx := cfg.IndexStore
+	shared := false
 	if store == nil {
 		if cfg.Path == "" {
 			return nil, errors.New("l2: path is required")
@@ -414,54 +446,127 @@ func Open(cfg Config) (*File, error) {
 				return nil, fmt.Errorf("l2: create cache directory %s: %w", dir, err)
 			}
 		}
-		s, err := openStore(cfg.Path, fileSize, maxIO)
+		s, err := openStore(cfg.Path, maxIO)
 		if err != nil {
 			return nil, err
 		}
-		store = s
+		is, err := openStore(indexPath(cfg.Path), indexPageSize)
+		if err != nil {
+			s.Close()
+			return nil, err
+		}
+		store, idx = s, is
+	} else if idx == nil {
+		// One store for both regions: the pages go after the data so they can
+		// never overlap the slots.
+		idx, shared = store, true
 	}
 	// Counting from here on means every transfer the file issues goes through
 	// the wrapper, including the superblock read below, so the counters describe
 	// what the file really did rather than a list of paths someone remembered to
 	// instrument.
 	store = newStatStore(store)
+	if shared {
+		idx = store
+	}
 
 	f := &File{
-		store:      store,
-		slotSize:   slotSize,
-		sectorSize: cfg.SectorSize,
-		secPerSlot: slotSize / cfg.SectorSize,
-		slotCount:  slotCount,
-		maxIO:      maxIO,
-		namespace:  cfg.Namespace,
-		log:        cfg.Logger,
-		indexPages: indexPages,
-		index:      make(map[uint64]*slot),
-		slotsByNum: make([]*slot, slotCount),
-		dirty:      make(map[int]struct{}),
+		store:       store,
+		idx:         idx,
+		sharedIndex: shared,
+		slotSize:    slotSize,
+		sectorSize:  cfg.SectorSize,
+		secPerSlot:  slotSize / cfg.SectorSize,
+		slotCount:   slotCount,
+		maxIO:       maxIO,
+		namespace:   cfg.Namespace,
+		log:         cfg.Logger,
+		indexPages:  indexPages,
+		index:       make(map[uint64]*slot),
+		slotsByNum:  make([]*slot, slotCount),
+		dirty:       make(map[int]struct{}),
 
 		regionBlocks: regionBlocks,
 		homes:        slotCount / regionBlocks,
 	}
 	f.fullMask = sectorMask(0, f.secPerSlot)
 	f.initHomes()
-	if err := f.initSuperBlock(); err != nil {
-		store.Close()
+	// Neither file is extended to the budget up front. A cache configured for a
+	// large LUN that only ever reads a fraction of it would otherwise take the
+	// whole budget the moment it is opened, which is what made a handful of
+	// libraries account for hundreds of gigabytes of cache. A new data file
+	// only needs room for the superblock it is about to read; the slots follow
+	// the writes, and the index pages grow in a file that is a few megabytes at
+	// most.
+	cur, err := store.Size()
+	if err != nil {
+		f.closeStores()
+		return nil, fmt.Errorf("l2: size store: %w", err)
+	}
+	if cur < SuperBlockSize {
+		// A new file (or one truncated externally) has no header to keep, and
+		// initSuperBlock reads one, so the file starts at the superblock.
+		if err := store.Truncate(SuperBlockSize); err != nil {
+			f.closeStores()
+			return nil, fmt.Errorf("l2: size store: %w", err)
+		}
+	}
+	wiped, err := f.initSuperBlock()
+	if err != nil {
+		f.closeStores()
 		return nil, err
 	}
-	// Only now can the file be trimmed to the size this budget implies: the
-	// index region of the previous snapshot can sit past that size, and it had
-	// to be read first. A trimmed tail costs the part of the snapshot that no
-	// longer fits, which the next flush writes back at its new place.
-	if err := store.Truncate(fileSize); err != nil {
-		store.Close()
-		return nil, fmt.Errorf("l2: size store: %w", err)
+	// An existing file is left alone unless the budget shrank below it: the
+	// snapshot can sit past the new size and had to be read first, so the trim
+	// happens only now, costing the part of it that no longer fits.
+	limit := dataSize
+	if shared {
+		limit = fileSize
+	}
+	switch {
+	case wiped:
+		// The snapshot was discarded, either because the file is new or because
+		// it was written by an older layout. The space it held goes back to the
+		// volume instead of staying allocated for a cache that no longer exists:
+		// that is what reclaims the tens of gigabytes an old preallocated file
+		// left behind. Both regions grow again from empty as blocks are cached.
+		if err := store.Truncate(SuperBlockSize); err != nil {
+			f.closeStores()
+			return nil, fmt.Errorf("l2: size store: %w", err)
+		}
+		if !shared {
+			if err := idx.Truncate(0); err != nil {
+				f.closeStores()
+				return nil, fmt.Errorf("l2: size index: %w", err)
+			}
+		}
+	case cur > limit:
+		if err := store.Truncate(limit); err != nil {
+			f.closeStores()
+			return nil, fmt.Errorf("l2: size store: %w", err)
+		}
 	}
 	cfg.Logger.Info("l2 opened", "path", cfg.Path, "slots", slotCount,
 		"slot_size", slotSize, "max_io", maxIO, "namespace", shortHash(cfg.Namespace),
 		"homes", f.homes, "region_blocks", f.regionBlocks,
 		"recovered", f.recovered, "unverified", f.unverified)
 	return f, nil
+}
+
+// BoundSize caps a configured byte budget by the LUN it will cache. A cache
+// larger than the device can only ever hold data that does not exist, and
+// sizing one for it is how a handful of libraries come to reserve hundreds of
+// gigabytes. A non-positive budget or LUN leaves the size untouched, so a
+// caller that has not learnt the geometry yet keeps what it configured.
+//
+// The result is still subject to layout's own minimum: a LUN too small for a
+// superblock and one slot makes Open report the size as too small rather than
+// silently opening a cache that cannot hold a block.
+func BoundSize(sizeBytes, lunBytes int64) int64 {
+	if sizeBytes <= 0 || lunBytes <= 0 || sizeBytes <= lunBytes {
+		return sizeBytes
+	}
+	return lunBytes
 }
 
 // layout sizes the file from the byte budget: whole slots from a fixed start,
@@ -494,11 +599,25 @@ func layout(sizeBytes int64, slotSize int) (slots, indexPages int, fileSize int6
 // pagesFor is the number of index pages a slot count needs.
 func pagesFor(slots int) int { return (slots + recsPerPage - 1) / recsPerPage }
 
-// indexOffset is where the index region of a file holding that many slots
-// begins, plus the pages ahead of the one asked for. Slots come first, so this
-// is the only place the slot count takes part in addressing.
+// indexOffset is where page n of the index of a snapshot with that many slots
+// lives. A file of its own starts at zero no matter how many slots the budget
+// holds, which is why the data file no longer has to reach the end of the
+// budget before its first page can be written. One store holding both regions
+// keeps the pages after the data of the count they belong to, so a caller that
+// injected it must load with the snapshot's count and write with the current
+// one.
 func (f *File) indexOffset(slots, page int) int64 {
-	return SuperBlockSize + int64(slots)*int64(f.slotSize+stampSize) + int64(page)*indexPageSize
+	base := int64(0)
+	if f.sharedIndex {
+		base = SuperBlockSize + int64(slots)*int64(f.slotSize+stampSize)
+	}
+	return base + int64(page)*indexPageSize
+}
+
+// indexPath is where the index pages of a data file live: the extension replaced
+// by .idx, so l2-<id>.bin keeps its pages in l2-<id>.idx.
+func indexPath(dataPath string) string {
+	return strings.TrimSuffix(dataPath, filepath.Ext(dataPath)) + ".idx"
 }
 
 // Namespace returns the identity the file is bound to.
@@ -600,48 +719,58 @@ func (f *File) IOStats() IOStats {
 // initSuperBlock validates the header, restores a cleanly closed index, and
 // finally marks the file open so that a crash from here on cannot bring back
 // the mapping this session is about to change.
-func (f *File) initSuperBlock() error {
+func (f *File) initSuperBlock() (bool, error) {
 	buf := make([]byte, SuperBlockSize)
 	if err := f.store.ReadAt(buf, 0); err != nil {
-		return fmt.Errorf("l2: read superblock: %w", err)
+		return false, fmt.Errorf("l2: read superblock: %w", err)
 	}
 	ns := sha256.Sum256([]byte(f.namespace))
+	// wiped reports that the previous contents were discarded, which lets Open
+	// give the space they held back to the volume.
+	wiped := false
 	switch {
 	case string(buf[:8]) != superBlockMag:
 		// No header yet: a new file.
 		f.reset()
+		wiped = true
 	case buf[8] != superBlockVer:
 		f.log.Warn("l2: cache file version changed, discarding previous contents")
 		f.reset()
+		wiped = true
 	case le32(buf[sbOffCRC:]) != checksum(buf, sbOffCRC):
 		// A torn header would otherwise be read as a valid one.
 		f.log.Warn("l2: superblock checksum mismatch, discarding previous contents")
 		f.reset()
+		wiped = true
 	case int(le32(buf[sbOffSlotSize:])) != f.slotSize ||
 		int(le32(buf[sbOffSectorSize:])) != f.sectorSize:
 		f.log.Warn("l2: geometry changed, starting with an empty index")
 		f.reset()
+		wiped = true
 	case int(le32(buf[sbOffRegion:])) != f.regionBlocks:
 		// The region size decides which slot a block belongs in, so records
 		// written under another one are not places this session can serve from.
 		f.log.Warn("l2: region size changed, discarding previous contents",
 			"old", le32(buf[sbOffRegion:]), "new", f.regionBlocks)
 		f.reset()
+		wiped = true
 	case string(buf[sbOffNamespace:sbOffNamespace+32]) != string(ns[:]):
 		f.log.Warn("l2: cache namespace changed, discarding previous contents",
 			"old", hex.EncodeToString(buf[sbOffNamespace:sbOffNamespace+32]),
 			"new", hex.EncodeToString(ns[:]))
 		f.reset()
+		wiped = true
 	case int(le32(buf[sbOffSlotCount:])) < 1:
 		f.log.Warn("l2: superblock holds no slots, starting with an empty index")
 		f.reset()
+		wiped = true
 	default:
 		// The generation has to come back even when the snapshot is discarded:
 		// it is what tells this session's pages apart from the ones on disk.
 		f.generation = le64(buf[sbOffGeneration:])
-		// The index region sits after the slots, so the count the snapshot was
-		// written with is what finds it — even when this session was given a
-		// different budget than the session that wrote it.
+		// The index file is addressed by page number, so the count the snapshot
+		// was written with is what says how many pages belong to it — even when
+		// this session was given a different budget than the one that wrote it.
 		f.snapshotSlots = int(le32(buf[sbOffSlotCount:]))
 		// A clean close wrote both the index and the marker after every slot was
 		// final, so its records can be trusted as they are. Any other state means
@@ -650,7 +779,7 @@ func (f *File) initSuperBlock() error {
 		// before it may serve data.
 		clean := le32(buf[sbOffState:]) == stateClean
 		if err := f.loadIndex(); err != nil {
-			return err
+			return wiped, err
 		}
 		// The directory is derived from the slots rather than persisted, so it
 		// is rebuilt here — after the records, because an entry the mapping
@@ -669,7 +798,7 @@ func (f *File) initSuperBlock() error {
 			"restored entries will be checked against their slot stamps",
 			"slots", f.recovered)
 	}
-	return f.writeSuperBlock(stateOpen)
+	return wiped, f.writeSuperBlock(stateOpen)
 }
 
 // reset starts from an empty index under a fresh generation, which hides every
@@ -708,18 +837,18 @@ func (f *File) writeSuperBlock(state uint32) error {
 	return f.store.Sync()
 }
 
-// loadIndex rebuilds the slot index from the index region. Pages that were
-// never written, belong to another generation or are torn (checksum mismatch)
-// are skipped, so a partially written region costs entries instead of serving
-// records that were never meant to be there.
+// loadIndex rebuilds the slot index from the index file. Pages that were never
+// written, belong to another generation or are torn (checksum mismatch) are
+// skipped, so a partially written file costs entries instead of serving records
+// that were never meant to be there.
 func (f *File) loadIndex() error {
 	buf := make([]byte, indexPageSize)
 	for page := 0; page < pagesFor(f.snapshotSlots); page++ {
-		err := f.store.ReadAt(buf, f.indexOffset(f.snapshotSlots, page))
+		err := f.idx.ReadAt(buf, f.indexOffset(f.snapshotSlots, page))
 		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			// A smaller budget truncates the file, and with it the tail of the
-			// region the previous snapshot lived in. Losing that part of the
-			// snapshot is the expected cost of the shrink, not a failure.
+			// A page the previous session never had to write: the file is only
+			// as long as the highest page that held an entry. Losing the rest of
+			// the snapshot is the expected cost of not having written it.
 			f.log.Debug("l2: index page beyond the end of the file", "page", page)
 			continue
 		}
@@ -792,7 +921,7 @@ func (f *File) writeIndexPage(page int) error {
 		put64(rec[12:20], sl.version)
 	}
 	put32(buf[12:], checksum(buf, 12))
-	if err := f.store.WriteAt(buf, f.indexOffset(f.slotCount, page)); err != nil {
+	if err := f.idx.WriteAt(buf, f.indexOffset(f.slotCount, page)); err != nil {
 		return fmt.Errorf("l2: write index page %d: %w", page, err)
 	}
 	return nil
@@ -1141,8 +1270,20 @@ func (f *File) Close() error {
 	f.mu.Lock()
 	err := f.flushLocked(true)
 	f.mu.Unlock()
-	if cerr := f.store.Close(); err == nil {
+	if cerr := f.closeStores(); err == nil {
 		err = cerr
+	}
+	return err
+}
+
+// closeStores releases the data and index stores, tolerating the case where a
+// caller injected one store for both.
+func (f *File) closeStores() error {
+	err := f.store.Close()
+	if f.idx != nil && f.idx != f.store {
+		if cerr := f.idx.Close(); err == nil {
+			err = cerr
+		}
 	}
 	return err
 }
@@ -1152,11 +1293,11 @@ func (f *File) Close() error {
 // are durable, so a crash in the middle of a flush costs the whole snapshot
 // instead of leaving half of it marked as good.
 func (f *File) flushLocked(clean bool) error {
-	// The index region follows the slots, so a different budget moves it. When
-	// it moved, every page has to be written where it now belongs rather than
-	// only the ones that changed; losing that to a crash is safe either way,
-	// because until the header names the new region the old one still holds the
-	// snapshot this session loaded.
+	// A different budget changes how many pages the index has, and the pages
+	// past that count describe a snapshot this session no longer owns. Rewriting
+	// them all keeps the file in step with the header; a crash while doing so is
+	// safe either way, because until the header names the new count a later
+	// session still reads the snapshot this one loaded.
 	moved := f.snapshotSlots != f.slotCount
 	written := 0
 	if f.dirtyAll || moved {
@@ -1178,7 +1319,7 @@ func (f *File) flushLocked(clean bool) error {
 		}
 	}
 	if written > 0 {
-		if err := f.store.Sync(); err != nil {
+		if err := f.idx.Sync(); err != nil {
 			return err
 		}
 		f.dirty = make(map[int]struct{})
@@ -1551,15 +1692,30 @@ func (m *MemoryStore) ReadAt(p []byte, off int64) error {
 	return nil
 }
 
-// WriteAt implements Store.
+// WriteAt implements Store. A write past the end grows the store the way a
+// real file grows: the part between the old end and the write starts out as
+// zeroes.
 func (m *MemoryStore) WriteAt(p []byte, off int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if off < 0 || off+int64(len(p)) > int64(len(m.data)) {
+	if off < 0 {
 		return io.ErrShortWrite
+	}
+	end := off + int64(len(p))
+	if end > int64(len(m.data)) {
+		grown := make([]byte, end)
+		copy(grown, m.data)
+		m.data = grown
 	}
 	copy(m.data[off:], p)
 	return nil
+}
+
+// Size implements Store.
+func (m *MemoryStore) Size() (int64, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return int64(len(m.data)), nil
 }
 
 // Truncate implements Store.

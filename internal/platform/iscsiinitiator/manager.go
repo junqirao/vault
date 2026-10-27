@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"vault/internal/apperr"
@@ -42,6 +43,14 @@ const (
 type Manager struct {
 	ps     *winps.Runner
 	logger *slog.Logger
+	// portalMu 串行化门户的新增/移除。
+	//
+	// 依据：MSiSCSI 的 WMI 提供程序**不抗并发** —— 同时发多个 New-IscsiTargetPortal 会直接
+	// 返回 "The target does not have enough resources to process the given request."
+	// 真实现场：分组并发挂载 4 个库，3 个在同一毫秒内全部失败在 stage=portal，
+	// 之后单独重试就都成功了。门户操作是毫秒级 WMI 调用，串行化不会拖慢整体挂载，
+	// 挂载链路的其它阶段（磁盘上线、分区枚举、卷挂载）仍然并行。
+	portalMu sync.Mutex
 }
 
 // NewManager 构造 Manager。runner 为 nil 时使用默认配置的执行器。
@@ -158,6 +167,9 @@ func (m *Manager) EnsureService(ctx context.Context) error {
 }
 
 // EnsurePortal 幂等添加目标门户（已存在同一「地址 + 端口」时跳过）。
+//
+// 并发安全：门户的新增/移除由 portalMu 串行化（见 Manager.portalMu —— 并发调
+// New-IscsiTargetPortal 会被 WMI 提供程序直接拒绝）。
 func (m *Manager) EnsurePortal(ctx context.Context, address string, port int) error {
 	if strings.TrimSpace(address) == "" {
 		return apperr.InvalidParam("portal_address")
@@ -165,6 +177,8 @@ func (m *Manager) EnsurePortal(ctx context.Context, address string, port int) er
 	if port <= 0 {
 		port = DefaultPortalPort
 	}
+	m.portalMu.Lock()
+	defer m.portalMu.Unlock()
 	params := []winps.Param{
 		winps.String("Address", address),
 		winps.String("Port", strconv.Itoa(port)),
@@ -373,6 +387,8 @@ func (m *Manager) RemovePortal(ctx context.Context, address string, port int) er
 	if port <= 0 {
 		port = DefaultPortalPort
 	}
+	m.portalMu.Lock()
+	defer m.portalMu.Unlock()
 	params := []winps.Param{
 		winps.String("PortalAddress", address),
 		winps.String("PortalPort", strconv.Itoa(port)),

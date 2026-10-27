@@ -1345,6 +1345,8 @@
   "settings.update.title": "클라이언트 업데이트",
   "settings.update.check": "업데이트 확인",
   "settings.update.checking": "확인 중…",
+  "settings.update.auto": "자동 업데이트",
+  "settings.update.autoHint": "로그인 후 업데이트를 자동으로 확인하고 설치합니다. 끄면 위의 업데이트 확인으로만 실행할 수 있습니다.",
   "settings.update.available": "새 버전 {version} 사용 가능",
   "settings.update.upToDate": "현재 최신 버전입니다",
   "settings.update.apply": "지금 업데이트",

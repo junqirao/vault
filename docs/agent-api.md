@@ -1038,7 +1038,9 @@ Electron 主进程应读取 `%ProgramData%\Vault\webapp\current.json`，以其�
   **边下边算**并与清单比对（不符 → 失败且**不激活**）→ 版本单调性：**仅允许更新到比当前
   `active_version` 更"新"的版本**（不允许降级；当前无 active 时允许任意版本）。
 - 解压：只接受 zip 内的**相对路径**，拒绝 `..` / 绝对路径 / 驱动器号（防 zip slip），
-  且限制解压后总大小（清单声明 size 的 1.5 倍 + 1MiB，防 zip bomb）。
+  且限制解压后总大小（清单声明 size 的 12 倍 + 1MiB，绝对上限 1GiB，防 zip bomb）。
+  zip 是 deflate 压缩包，解压后通常是压缩包的数倍（实测 Vite 产物约 3.2 倍），
+  上限过紧会让所有真实产物都判 `extract_too_large`。
 - 原子激活：先解压到 `<webapp>/<version>.tmp-<random>/`，确认 `index.html` 存在后再
   `os.Rename` 成 `<webapp>/<version>/`，最后以"临时文件 + `MoveFileEx(REPLACE_EXISTING|
   WRITE_THROUGH)`"原子替换 `current.json`（**不用 `os.Rename`**：Windows 上它不覆盖已存在目标）。

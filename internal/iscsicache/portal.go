@@ -192,6 +192,14 @@ func (rt *targetRuntime) build(_ context.Context, log *slog.Logger, tc TargetCon
 
 	var l2Store cache.L2
 	if cc.L2.Enabled {
+		// A cache larger than the LUN can only hold data that does not exist.
+		if lunBytes := int64(info.BlockCount) * int64(info.BlockSize); lunBytes > 0 {
+			if bounded := l2.BoundSize(cc.L2.SizeBytes, lunBytes); bounded != cc.L2.SizeBytes {
+				log.Info("iscsicache: L2 budget capped by the backing LUN",
+					"configured", cc.L2.SizeBytes, "lun_bytes", lunBytes, "using", bounded)
+				cc.L2.SizeBytes = bounded
+			}
+		}
 		f, err := l2.Open(l2.Config{
 			Path:       cc.L2.Path,
 			SizeBytes:  cc.L2.SizeBytes,

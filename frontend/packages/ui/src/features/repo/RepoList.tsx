@@ -33,7 +33,7 @@ import { useAuth } from '../../hooks/useAuth'
 import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { formatBytes, formatTime, repoUsage } from '../../utils/format'
+import { formatBytes, formatTime, repoUsage, userDiffUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
 import { GroupMountSettingsModal, RepoMountSettingsModal } from './RepoMountSettings'
@@ -527,6 +527,42 @@ interface GroupOpState {
 }
 
 const GROUP_OP_IDLE: GroupOpState = { busy: false, kind: null, progress: { done: 0, total: 0 } }
+
+/**
+ * 分组批量挂载 / 卸载的并发上限。
+ *
+ * 为什么不"一次全部并发"：代理侧每次挂载/卸载都要起 PowerShell 做 iSCSI 登录、磁盘上线、
+ * 盘符或目录分配，几十个库同时开跑会把发起端与磁盘管理接口压满，反而更慢、更容易超时
+ * （启动时的自动挂载同样是小并发，见 internal/agent/automount.go 的 autoMountConcurrency）。
+ * 取 4：墙钟时间从"逐个串行"压到约 N/4，又能让前几个库的进度立刻反馈到界面上。
+ */
+const GROUP_OP_CONCURRENCY = 4
+
+/**
+ * 以固定并发跑完一批任务。
+ *
+ * 与逐条串行保持同一套语义：单个任务失败**不中断**整批（成败由 task 自己记账），
+ * 全部结束后才 resolve。
+ */
+async function forEachConcurrent<T>(
+  items: T[],
+  limit: number,
+  task: (item: T) => Promise<void>
+): Promise<void> {
+  if (items.length === 0) return
+  // 游标由所有 worker 共享：取下标与自增之间没有 await，不会被并发打断。
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    for (;;) {
+      const index = cursor
+      cursor += 1
+      if (index >= items.length) return
+      await task(items[index])
+    }
+  })
+  await Promise.all(workers)
+}
+
 const groupOps = new Map<string, GroupOpState>()
 const groupOpListeners = new Set<() => void>()
 
@@ -551,11 +587,11 @@ function useGroupOpState(key: string): GroupOpState {
 }
 
 /**
- * 分组整体挂载 / 卸载：按组内每个库的分配逐个调本机代理。
+ * 分组整体挂载 / 卸载：按组内每个库的分配调本机代理（**并发**执行，见 GROUP_OP_CONCURRENCY）。
  *
  * 为什么在客户端做而不是服务端：挂载是"这台机器"的行为（盘符、本地会话、缓存代理都在
- * 本机），服务端只下发目标；分组只是一个标签。因此这里按组遍历，逐个复用单库挂载那一套
- * 语义（没有分配先建、再交给代理）。
+ * 本机），服务端只下发目标；分组只是一个标签。因此这里按组遍历，每个库都复用单库挂载那一套
+ * 语义（没有分配先建、再交给代理），只是把"逐个等待"换成"最多 N 个同时在跑"。
  */
 function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string) {
   const api = useApi()
@@ -572,7 +608,9 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
     setGroupOp(groupKey, { busy: true, kind: 'mount', progress: { done: 0, total: targets.length } })
     let ok = 0
     let fail = 0
-    for (const repo of targets) {
+    // 进度用本地计数：并发下不能再"读全局进度再 +1"，否则几次完成会读到同一个旧值而丢格。
+    let done = 0
+    await forEachConcurrent(targets, GROUP_OP_CONCURRENCY, async (repo) => {
       try {
         const allocations = await api.listAllocations(repo.id)
         let allocation = allocations.items.find(
@@ -596,12 +634,12 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
       } catch {
         fail += 1
       }
-      setGroupOp(groupKey, {
-        busy: true,
-        kind: 'mount',
-        progress: { done: (groupOps.get(groupKey)?.progress.done ?? 0) + 1, total: targets.length }
-      })
-    }
+      done += 1
+      setGroupOp(groupKey, { busy: true, kind: 'mount', progress: { done, total: targets.length } })
+    })
+    // 并发下每个 mount 各自 probe 一次，快照可能被先发起、后返回的那次覆盖成旧值：
+    // 收尾再取一次，保证挂载列表与 N 个库的最终状态一致。
+    await agent.refresh()
     await queryClient.invalidateQueries({ queryKey: ['repo-allocations'] })
     await queryClient.invalidateQueries({ queryKey: ['leases'] })
     setGroupOp(groupKey, GROUP_OP_IDLE)
@@ -619,19 +657,19 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
     setGroupOp(groupKey, { busy: true, kind: 'unmount', progress: { done: 0, total: targets.length } })
     let ok = 0
     let fail = 0
-    for (const item of targets) {
+    let done = 0
+    await forEachConcurrent(targets, GROUP_OP_CONCURRENCY, async (item) => {
       try {
         await agent.unmount({ allocation_id: item.allocation_id })
         ok += 1
       } catch {
         fail += 1
       }
-      setGroupOp(groupKey, {
-        busy: true,
-        kind: 'unmount',
-        progress: { done: (groupOps.get(groupKey)?.progress.done ?? 0) + 1, total: targets.length }
-      })
-    }
+      done += 1
+      setGroupOp(groupKey, { busy: true, kind: 'unmount', progress: { done, total: targets.length } })
+    })
+    // 同 mountAll：并发 probe 可能互相覆盖，收尾再取一次最终快照。
+    await agent.refresh()
     await queryClient.invalidateQueries({ queryKey: ['repo-allocations'] })
     await queryClient.invalidateQueries({ queryKey: ['leases'] })
     setGroupOp(groupKey, GROUP_OP_IDLE)
@@ -710,26 +748,48 @@ function RepoGroupCard({
 
   // 差异盘占用按盘聚合：repo.used_bytes 是"已分配容量"的计费口径，
   // 只有 listRepoDisks 的 diff 盘 physical_bytes 才是真正吃掉的空间。
+  // 只有共享库有差异盘（独享库自己就是母盘），独享库与占位库不查。
+  const diffQueryEnabled = (repo: RepoDTO): boolean =>
+    repo.mode === 'shared' && !isPlaceholderRepoId(repo.id)
   const diskQueries = useQueries({
     queries: repos.map((repo) => ({
       queryKey: ['repo-disks', repo.id],
       queryFn: () => api.listRepoDisks(repo.id),
-      enabled: !isPlaceholderRepoId(repo.id)
+      enabled: diffQueryEnabled(repo)
+    }))
+  })
+  // **只算"我当前被分配到的那块盘"**（真实反馈："分组已使用空间的上限应当只算用户当前被
+  // 分配到的盘的大小"）：同一共享库的每块差异盘属于**一个用户**，把整组 diff 盘无差别加总，
+  // 分母会变成「组内差异盘数 × 容量」—— 别人也有一份盘时，上限凭空翻倍，用户对着自己
+  // 那块 24.9 GB 的盘看到 49.9 GB 的上限根本对不上。口径与单库卡片 / 详情页完全一致
+  // （见 RepoUsageTip 的 useRepoDiffUsage + utils/format 的 userDiffUsage），
+  // 所以这里同样要先取分配记录、用它定位我的 disk_id。
+  const allocationQueries = useQueries({
+    queries: repos.map((repo) => ({
+      queryKey: ['repo-allocations', repo.id],
+      queryFn: () => api.listAllocations(repo.id),
+      enabled: diffQueryEnabled(repo)
     }))
   })
   const diffUsage = useMemo(() => {
     let used = 0
     let total = 0
-    for (const query of diskQueries) {
-      for (const disk of query.data?.items ?? []) {
-        if (disk.kind !== 'diff') continue
-        used += disk.physical_bytes || 0
-        total += disk.size_bytes || 0
-      }
-    }
+    repos.forEach((_, index) => {
+      const mine = userDiffUsage(
+        diskQueries[index]?.data?.items,
+        allocationQueries[index]?.data?.items,
+        currentUserId
+      )
+      if (!mine) return
+      used += mine.used
+      total += mine.total
+    })
     return { used, total }
-  }, [diskQueries])
-  const diffLoading = diskQueries.some((query) => query.isPending)
+  }, [allocationQueries, currentUserId, diskQueries, repos])
+  // 只统计**真正发出去的**查询：被 enabled 关掉的查询在 TanStack v5 里也是 pending，
+  // 用 isPending 会让"组里有独享库/上传占位"的分组永远转圈（isLoading = pending && fetching）。
+  const diffLoading =
+    diskQueries.some((query) => query.isLoading) || allocationQueries.some((query) => query.isLoading)
 
   // 操作开始后按固定的 kind 出文案：挂载过程中 mountedCount 会增长，
   // 不能再用它判断"这一次到底是在挂载还是卸载"。
@@ -737,6 +797,12 @@ function RepoGroupCard({
   // 条的比例同样按容量算（分母 = 分组内全部库的容量）：全组都挂上就是 100%。
   const mountedPercent = totalCapacity > 0 ? Math.min(100, Math.round((mountedCapacity / totalCapacity) * 100)) : 0
   const diffPercent = diffUsage.total > 0 ? Math.min(100, Math.round((diffUsage.used / diffUsage.total) * 100)) : 0
+  // 组内没有一块"我的盘"（全独享库 / 我在这些共享库上还没分配）时不写 `0 B / 0 B`：
+  // 那是"上限未知"，不是"上限为 0"，与用量格写 `-` 的既有口径一致。
+  const diffValue =
+    diffLoading || diffUsage.total <= 0
+      ? '-'
+      : `${formatBytes(diffUsage.used)} / ${formatBytes(diffUsage.total)}`
 
   return (
     <Card
@@ -795,7 +861,7 @@ function RepoGroupCard({
       />
       <GroupMetric
         label={t('repo.group.usedSpace')}
-        value={diffLoading ? '-' : `${formatBytes(diffUsage.used)} / ${formatBytes(diffUsage.total)}`}
+        value={diffValue}
         percent={diffPercent}
         loading={diffLoading}
       />

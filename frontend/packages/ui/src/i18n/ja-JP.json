@@ -1345,6 +1345,8 @@
   "settings.update.title": "クライアントの更新",
   "settings.update.check": "更新を確認",
   "settings.update.checking": "確認中…",
+  "settings.update.auto": "自動更新",
+  "settings.update.autoHint": "サインイン後に更新を自動で確認・インストールします。オフにすると上の「更新を確認」からのみ実行できます。",
   "settings.update.available": "新しいバージョン {version} があります",
   "settings.update.upToDate": "現在が最新バージョンです",
   "settings.update.apply": "今すぐ更新",

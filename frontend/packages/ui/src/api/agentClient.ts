@@ -129,6 +129,8 @@ export interface VaultBridge {
    * **不需要重启客户端**。applied=false 表示当前已是最新层或没有可用热更层。
    */
   applyWebLayer?: () => Promise<{ applied: boolean; version?: string; reason?: string }>
+  /** 上报"当前渲染层已成功启动"（Electron 下才存在；用于热更层白屏自愈）。 */
+  rendererReady?: () => Promise<boolean>
 }
 
 /**
@@ -482,6 +484,18 @@ export async function applyWebLayer(): Promise<{ applied: boolean; version?: str
     // 切换失败不影响使用：当前界面继续可用，下次启动会走正常加载路径。
     return { applied: false }
   }
+}
+
+/**
+ * 上报"当前渲染层已成功启动"。
+ *
+ * 主进程用它判定热更层是否白屏：切层后超过看门狗时限仍未收到上报，就回退内置资源并把
+ * 这个版本记为坏层（见 electron/main.ts）。浏览器 dev 下无声返回。
+ */
+export function signalRendererReady(): void {
+  const ready = hostBridge()?.rendererReady
+  if (!ready) return
+  void Promise.resolve(ready()).catch(() => undefined)
 }
 
 /** 当前环境是否提供系统目录选择（Electron preload 才提供）。 */
