@@ -701,10 +701,11 @@ func (c *Cache) fillRun(ctx context.Context, start, end int64, dst []byte, src S
 // caller can use it as a fast path and fall back to a backend read when it
 // reports false.
 //
-// The range is verified before anything is copied, so a partial hit is reported
-// as a plain miss without inflating the L1 counters for the blocks that were
-// valid; a race that invalidates a block between the two passes likewise just
-// reports a miss, and the caller re-reads the range from the backing store.
+// A partial hit is reported as a plain miss and leaves no counter behind: the
+// hits are accumulated locally and committed only once the whole range has been
+// copied. dst is therefore unspecified when this returns false, the same
+// contract L2.ReadSectors has — every caller either re-reads the range from the
+// backing store into it or recycles the buffer.
 func (c *Cache) ReadCached(off int64, dst []byte) bool {
 	if len(dst) == 0 {
 		return true
@@ -721,6 +722,7 @@ func (c *Cache) ReadCached(off int64, dst []byte) bool {
 func (c *Cache) readCachedL1(off int64, dst []byte) bool {
 	bs := int64(c.blockSize)
 	end := off + int64(len(dst))
+	var hits int64
 	for cur := off; cur < end; {
 		blk := uint64(cur / bs)
 		blkStart := int64(blk) * bs
@@ -728,29 +730,21 @@ func (c *Cache) readCachedL1(off int64, dst []byte) bool {
 		if segEnd > end {
 			segEnd = end
 		}
-		s0, s1 := c.sectorRange(blkStart, cur, segEnd-cur)
-		e := c.shard(blk).lookup(blk)
-		if e == nil || !e.rangeValid(s0, s1) {
-			return false
-		}
-		cur = segEnd
-	}
-	for cur := off; cur < end; {
-		blk := uint64(cur / bs)
-		blkStart := int64(blk) * bs
-		segEnd := blkStart + bs
-		if segEnd > end {
-			segEnd = end
-		}
+		// One pass: copyIfValid tests the bitmap and copies under the same hold
+		// of the entry, so a block costs one shard lock instead of the two a
+		// verify-then-copy pair took. A miss part way through leaves dst partly
+		// written, which the contract allows, and the counters have not seen the
+		// blocks that did hit.
 		sh := c.shard(blk)
 		e := sh.lookup(blk)
 		if e == nil || !e.copyIfValid(blkStart, cur, dst[cur-off:segEnd-off], c.sectorSize) {
 			return false
 		}
 		sh.touch(e)
-		c.stats.L1Hits.Add(1)
+		hits++
 		cur = segEnd
 	}
+	c.stats.L1Hits.Add(hits)
 	c.stats.RequestHits.Add(1)
 	return true
 }
@@ -904,8 +898,19 @@ func (c *Cache) readCachedL1L2(off int64, dst []byte) bool {
 	return true
 }
 
+// l2RunMaxBlocks bounds one L2 range request. Probing costs one shard lookup
+// per block, while the transfers a run saves are bounded by the L2's own I/O
+// size — a longer run would be split there anyway. Past this point the extra
+// lookups only delay the first byte, so a longer read is asked for as
+// consecutive runs, and each one pays one more L1 lookup and nothing else.
+//
+// Under the shipped geometry (64 KiB blocks, 1 MiB of L2 I/O) this is four
+// transfers per run: well past the sizes a host actually reads, and short
+// enough that the probe stays off the measurement floor.
+const l2RunMaxBlocks = 64
+
 // l2Run is how many whole blocks one L2 range request may cover, or 1 when the
-// range is not worth asking for.
+// range is not worth asking for. The result never exceeds l2RunMaxBlocks.
 //
 // The range has to start on the block boundary and the block has to be covered
 // whole, because a run is answered with whole blocks and a block the request
@@ -924,6 +929,9 @@ func (c *Cache) l2Run(blk uint64, cur, blkStart, segEnd, end int64) int {
 	}
 	run := 1
 	for {
+		if run == l2RunMaxBlocks {
+			return run
+		}
 		b := blk + uint64(run)
 		if start := int64(b) * bs; start+bs > end {
 			// The request stops inside b, so b is not ours to read whole.

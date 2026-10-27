@@ -895,9 +895,17 @@ func (f *File) ReadBlocks(blk0 uint64, nblk int, dst []byte) (int, error) {
 		// Serving the run is what keeps the region it came from resident. A run
 		// can straddle two homes — the last slot of one followed by the first
 		// slot of the next — so every home it covers is marked, not just the
-		// one it started in.
+		// one it started in. The slots of one home are neighbours by
+		// construction, so the bit is set once per home rather than once per
+		// block: under the region layout that is one store for the whole run.
+		last := -1
 		for n := 0; n < run; n++ {
-			f.homeRef[(first.num+n)/f.regionBlocks].Store(true)
+			home := (first.num + n) / f.regionBlocks
+			if home == last {
+				continue
+			}
+			f.homeRef[home].Store(true)
+			last = home
 		}
 		i += run
 	}

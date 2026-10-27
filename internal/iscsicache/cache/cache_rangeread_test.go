@@ -1,6 +1,9 @@
 package cache
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 // The range read is what makes the physical layout of L2 matter: a request that
 // covers several whole blocks L1 does not hold is handed to L2 as one run, so the
@@ -122,5 +125,68 @@ func TestReadCachedBothRunStopsAtL1(t *testing.T) {
 	}
 	if n := after.RequestHits - before.RequestHits; n != 1 {
 		t.Fatalf("request hits = %d, want 1", n)
+	}
+}
+
+// TestReadCachedL1PartialMissLeavesNoCounters pins the accounting of the single
+// pass read: a block that did hit is copied out before the range is known to be
+// a miss, so the counters may only move once every block has been served.
+func TestReadCachedL1PartialMissLeavesNoCounters(t *testing.T) {
+	src := newFakeSource(rangeSecSize, 4*rangeBlkSize)
+	c := newTestCache(t, testOpts{})
+	if err := c.Read(context.Background(), 0, make([]byte, rangeBlkSize), src); err != nil {
+		t.Fatalf("warm block 0: %v", err)
+	}
+	c.Wait()
+
+	// Block 0 is in L1 in full and block 1 is not, so the first block is copied
+	// before the second one ends the range.
+	if c.ReadCached(0, make([]byte, 2*rangeBlkSize)) {
+		t.Fatal("a range with a block L1 does not hold must miss")
+	}
+	if st := c.Stats(); st.L1Hits != 0 || st.RequestHits != 0 {
+		t.Fatalf("a partial hit must not count: %+v", st)
+	}
+}
+
+// runTrackingL2 records the length of every range read, so a test can check
+// that a long request is split into bounded runs instead of probing the whole
+// range for blocks L1 might already hold.
+type runTrackingL2 struct {
+	*fakeL2
+	runs []int
+}
+
+func (r *runTrackingL2) ReadBlocks(blk0 uint64, nblk int, dst []byte) (int, error) {
+	r.runs = append(r.runs, nblk)
+	return r.fakeL2.ReadBlocks(blk0, nblk, dst)
+}
+
+// TestL2RunStaysBounded pins the cap on one range request: probing costs a
+// shard lookup per block, so a request past the cap is asked for as consecutive
+// runs rather than walked end to end.
+func TestL2RunStaysBounded(t *testing.T) {
+	const n = l2RunMaxBlocks + 4
+	tracked := &runTrackingL2{fakeL2: newFakeL2(rangeSecSize, testBlkSecs)}
+	for b := 0; b < n; b++ {
+		seedWholeBlocks(t, tracked.fakeL2, uint64(b))
+	}
+	c := newTestCache(t, testOpts{l2: tracked})
+
+	buf := make([]byte, n*rangeBlkSize)
+	if !c.ReadCachedBoth(0, buf) {
+		t.Fatal("a range L2 holds whole must be served")
+	}
+	expectPattern(t, rangeSecSize, 0, buf)
+	c.Wait()
+
+	want := []int{l2RunMaxBlocks, n - l2RunMaxBlocks}
+	if len(tracked.runs) != len(want) {
+		t.Fatalf("range reads = %v, want %v", tracked.runs, want)
+	}
+	for i := range want {
+		if tracked.runs[i] != want[i] {
+			t.Fatalf("range reads = %v, want %v", tracked.runs, want)
+		}
 	}
 }

@@ -1,6 +1,6 @@
 {
   "name": "vault-frontend",
-  "version": "0.1.205",
+  "version": "0.1.206",
   "private": true,
   "license": "PolyForm-Noncommercial-1.0.0",
   "description": "Vault 桌面客户端（内含用户功能与管理功能）前端工程",
