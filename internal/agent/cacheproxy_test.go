@@ -21,10 +21,11 @@ func newCacheTestStore(t *testing.T) *ConfigStore {
 	return store
 }
 
-// TestCacheQuotaSplitsClientBudget 锁定配额口径：**客户端总量在开缓存的库之间按库容量分摊**。
+// TestCacheQuotaSplitsClientBudget 锁定配额口径：**L1 全局共享按库容量分摊，L2 是每库上限**。
 //
-// 用户只在客户端层面设置 L1/L2 最大空间（"一个客户端一个代理"），每个库分到的是它按容量
-// 占比应得的一份；算错会让每个库都按满额占用，多个库一起开就把内存/磁盘吃穿。
+// 用户只在客户端层面设置 L1/L2 上限（"一个客户端一个代理"）：L1 是所有库共享的内存总量，
+// 每个库分到的是它按容量占比应得的一份；L2 不做分摊，每个库各自最多用这么多。算错会让
+// 每个库都按满额占用内存，多个库一起开就把内存吃穿。
 func TestCacheQuotaSplitsClientBudget(t *testing.T) {
 	store := newCacheTestStore(t)
 	l1, l2 := int64(4)<<30, int64(16)<<30
@@ -43,10 +44,10 @@ func TestCacheQuotaSplitsClientBudget(t *testing.T) {
 		return cacheTargetRequest{AllocationID: "alloc-" + repoID, RepoID: repoID, RepoSizeBytes: size}
 	}
 
-	// 只有自己一个库开缓存时，配额就是总量（库容量比预算大，不触发封顶）。
+	// 只有自己一个库开缓存时：L1 拿到全局总量，L2 拿满每库上限（库容量比预算大，不触发封顶）。
 	enable("repo-a")
 	if got1, got2 := m.quotaFor(req("repo-a", 1000<<30)); got1 != l1 || got2 != l2 {
-		t.Fatalf("1 个库时配额应等于总量：%d/%d", got1, got2)
+		t.Fatalf("1 个库时 L1 应等于全局总量、L2 应等于每库上限：%d/%d", got1, got2)
 	}
 
 	// 容量 10:1 的两个库：份额也该是 10:1，而不是各占一半。
@@ -55,13 +56,17 @@ func TestCacheQuotaSplitsClientBudget(t *testing.T) {
 	enable("repo-b")
 	m.rememberRepoSize("repo-a", 1000<<30)
 	m.rememberRepoSize("repo-b", 100<<30)
-	gotA, _ := m.quotaFor(req("repo-a", 1000<<30))
-	gotB, _ := m.quotaFor(req("repo-b", 100<<30))
+	gotA, l2A := m.quotaFor(req("repo-a", 1000<<30))
+	gotB, l2B := m.quotaFor(req("repo-b", 100<<30))
 	if gotA <= gotB*8 || gotA >= gotB*12 {
-		t.Fatalf("1000 GiB 与 100 GiB 的库应分到约 10:1：%d/%d", gotA, gotB)
+		t.Fatalf("1000 GiB 与 100 GiB 的库应分到约 10:1 的 L1：%d/%d", gotA, gotB)
 	}
 	if gotA+gotB > l1 {
-		t.Fatalf("两个库合计 %d 超过 L1 总量 %d", gotA+gotB, l1)
+		t.Fatalf("L1 两个库合计 %d 超过全局总量 %d", gotA+gotB, l1)
+	}
+	// L2 是每库上限：两个库各自都拿满 16 GiB（都不超过自身容量），不随库数缩水。
+	if l2A != l2 || l2B != l2 {
+		t.Fatalf("L2 是每库上限，两个库都应拿 %d：a=%d b=%d", l2, l2A, l2B)
 	}
 
 	// 关掉缓存开关的库既不参与分摊，也不该挤占别人的份额。

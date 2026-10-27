@@ -491,7 +491,7 @@ func (a *Agent) handleListMounts(w http.ResponseWriter, _ *http.Request) {
 
 // handleCacheStatus 返回本机 iSCSI 读缓存代理的状态（见 cacheproxy.go）。
 //
-// 内容：门户是否在跑、客户端 L1/L2 总量预算与"每个启用缓存的库"分到的配额，以及按库汇总的
+// 内容：门户是否在跑、客户端 L1 全局上限 / L2 每库上限与"每个启用缓存的库"实际分到的配额，以及按库汇总的
 // 用量（L1/L2 占用）与命中情况（读命令数、整命令命中数、命中率）。存储库页面据此展示
 // "缓存用量/命中情况"；门户没开（没有任何库启用缓存）时 running=false、targets 为空。
 func (a *Agent) handleCacheStatus(w http.ResponseWriter, _ *http.Request) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -52,15 +53,16 @@ const (
 	// 界面上不会出现 1048577 字节这种读数。
 	cacheQuotaGranularity = 1 << 20
 
-	// cacheRecommendL2Share 是"库容量 → L2 推荐值"的比例：取库容量的 5%。
+	// cacheRecommendL2Share 是"库容量 → L2 推荐值"的比例：取**平均库容量**的 5%（每库上限）。
 	//
 	// 冷数据不进缓存，收益只在**热**的那部分数据上，而负载的有效工作集经验上只有库容量的
 	// 百分之几；给到 5% 已经能覆盖绝大多数热点，再往上加基本不再涨命中率，只是白占磁盘。
 	cacheRecommendL2Share = 0.05
-	// cacheRecommendL1Divisor 是两级推荐值的比例：L1 = L2 / 8。
+	// cacheRecommendL1Divisor 是两级推荐值的比例：L1 = 总容量 × 5% / 8。
 	//
-	// 两层各司其职：L1 是内存，只放最热的那一层（S3-FIFO 的"频繁"队列）；L2 是磁盘，
-	// 放"温"的一层。内存比磁盘贵得多，所以 L1 远小于 L2，热点超出内存的部分自然落到 SSD。
+	// 两层各司其职：L1 是内存（全局共享），只放最热的那一层（S3-FIFO 的"频繁"队列）；
+	// L2 是磁盘（每库上限），放"温"的一层。内存比磁盘贵得多，所以 L1 远小于 L2，
+	// 热点超出内存的部分自然落到 SSD。
 	cacheRecommendL1Divisor = 8
 	// cacheRecommendL1MaxBytes 是 L1 推荐值的上限（2 GiB）：库容量继续变大时不该线性抬高
 	// 内存占用，客户机上还有别的程序要跑，2 GiB 是"明显加速"与"不影响机器"之间的平衡点。
@@ -74,7 +76,8 @@ type cacheTargetRequest struct {
 	// RepoID 是该分配所属的存储库 ID：配额按**库**分摊，它同时是分摊表里的键。
 	// 空串（老记录、手工调用）时退化为按分配 ID 单独分摊，等价于这个库独占一份。
 	RepoID string
-	// RepoSizeBytes 是该库的容量。分摊比例由它决定：1TB 的库分到的份额是 100GB 库的 10 倍。
+	// RepoSizeBytes 是该库的容量。L1 的分摊比例由它决定（1TB 的库份额是 100GB 库的 10 倍），
+	// L2 也用它封顶（每库上限不会超过库自身容量）。
 	//
 	// 挂载参数里就带着它（服务端下发的 disk_size_bytes），因此每个库在挂载那一刻即已知；
 	// 0 表示未知，此时按"已知库的平均容量"参与分摊（见 splitCacheBudget）。
@@ -137,10 +140,36 @@ type cacheManager struct {
 	// activeMu 保护 activeTargets：本进程内**已经建立了缓存目标**的分配。
 	//
 	// 缓存默认开启后，没有单独保存过偏好的库也会开缓存；配额分摊必须把这些库算进去，
-	// 否则后挂的库会把同一份总预算再分一遍，多个库一起用就把内存/磁盘吃穿。
+	// 否则后挂的库会把同一份 L1 预算再分一遍，多个库一起用就把内存吃穿。
 	// 映射是 分配 ID → 分摊键（库 ID，缺省为分配 ID）。
 	activeMu      sync.Mutex
 	activeTargets map[string]string
+
+	// quotaMu 保护 allocated：**分摊键（库 ID）→ 已生效的配额**，即 L1 的账本。
+	//
+	// L1 是全局共享的：只按当期分摊集合算一份是不够的，集合会变（新库加入、配置增删），
+	// 而已经建好的目标不会缩水，于是每次挂载都在旧占用之上再加一份，多挂几次就叠到
+	// 总预算的数倍。这里记下每个库**实际拿到**多少，新库申请时先扣掉，因此所有活跃库
+	// 的 L1 之和永远不超过 cache_l1_bytes。
+	//
+	// L2 是每库上限，不参与这本账。
+	quotaMu   sync.Mutex
+	allocated map[string]cacheQuota
+
+	// gcMu 串行化无主文件回收，避免两次挂载并发删同一批文件。
+	gcMu sync.Mutex
+
+	// liveAllocations 返回状态里仍然存在的挂载分配 ID（门户之外的"有主"来源）。
+	//
+	// 缓存文件按分配 ID 命名，卸载后挂载记录随之删除、文件再也不会被打开；而应用重启
+	// 后到自动挂载完成之前，记录仍在。以它为准既尊重"重启预热"，又能回收真正无主的文件。
+	liveAllocations func() map[string]struct{}
+}
+
+// cacheQuota 是一个库当前生效的 L1/L2 配额。
+type cacheQuota struct {
+	L1 int64
+	L2 int64
 }
 
 // 缓存指标历史：近 5 分钟的滑动窗口（60 点 × 5s），供客户端"缓存指标曲线"弹窗展示。
@@ -224,6 +253,7 @@ func newCacheManager(cfg *ConfigStore, logger *slog.Logger) *cacheManager {
 		perfHub:       NewEventHub(),
 		repoSize:      map[string]int64{},
 		activeTargets: map[string]string{},
+		allocated:     map[string]cacheQuota{},
 	}
 }
 
@@ -334,8 +364,14 @@ func (m *cacheManager) clearCacheTargets() {
 		return
 	}
 	m.activeMu.Lock()
-	defer m.activeMu.Unlock()
 	m.activeTargets = map[string]string{}
+	m.activeMu.Unlock()
+
+	// 门户关闭后所有目标都已不存在，账本随之作废：否则下次打开门户时，
+	// 上一轮进程内的配额还占着预算，新目标会分到 0。
+	m.quotaMu.Lock()
+	m.allocated = map[string]cacheQuota{}
+	m.quotaMu.Unlock()
 }
 
 // Start 记录缓存代理的生命周期 context（门户在首次使用时才真正打开），
@@ -696,7 +732,10 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 	// 配额分摊要看见"已经存在的缓存目标"：默认开启后，没有单独配置过的库也算一份。
 	if req.CacheEnabled {
 		m.markCacheTarget(allocationID, req.key())
+		// 记进账本：后续任何库申请配额都要先扣掉这一份，总量才不会随挂载次数叠加。
+		m.commitQuota(req.key(), l1, l2)
 	} else {
+		m.releaseQuota(allocationID)
 		m.unmarkCacheTarget(allocationID)
 	}
 	fields := []any{
@@ -708,6 +747,12 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 		fields = append(fields, "l1_bytes", l1, "l2_bytes", l2)
 	}
 	m.logger.Info("本地 iSCSI 代理目标已启用", fields...)
+	// 目标已经进门户、文件也已经打开，这时回收才安全：p.Keys() 看得到本次分配，
+	// 不会把它当成"没人用的旧文件"。放这里而不是启动时，是因为启动时门户还没开，
+	// 所有文件都会被误判成非活跃 —— 那等于每次开机都把预热好的缓存清掉。
+	if req.CacheEnabled {
+		m.collectCacheFiles()
+	}
 	return nil
 }
 
@@ -732,20 +777,29 @@ func (m *cacheManager) ReleaseTarget(allocationID string) error {
 		m.unmarkCacheTarget(allocationID)
 		return nil
 	}
-	if err := p.Remove(allocationID); err != nil {
-		return err
-	}
+	err := p.Remove(allocationID)
+	// Portal.Remove 先从表里摘掉目标再 close，所以无论 close 是否报错，这条目标
+	// 都已经不在用了：账本必须归还，否则一次关闭失败就能把预算永久占住。
+	m.releaseQuota(allocationID)
 	m.unmarkCacheTarget(allocationID)
-	return nil
+	// 该分配的文件句柄已关闭，可以按预算回收；没超预算时不动它（保留热数据，
+	// 重挂时还能接着用）。
+	m.collectCacheFiles()
+	return err
 }
 
 // quotaFor 计算本次要开缓存的库分到的 L1/L2 配额。
 //
-// 分摊集合是**所有已启用缓存的库**，再加本次请求的库（配置可能刚改、还没落盘时以请求为准）：
-// 每个开了缓存的库都要占一份，否则先挂载的库会把整份预算吃光，后挂的库一个字节都分不到。
+// 两个上限的口径**不同**：
 //
-// 分摊结果在库挂载那一刻定死，运行中不重算（见文件头）：已经有缓存数据的库不该因为新挂
-// 了一个库就被判定超额。代价是"运行中新开的库只能分到剩余的部分"，这份取舍是刻意的。
+//   - L1 是**全局共享**的：cache_l1_bytes 是本机所有开缓存的库共用的内存总量，
+//     按库容量分摊（分摊集合 = 所有已启用缓存的库 + 本次请求的库），再用账本夹紧，
+//     保证 L1 总量不超。
+//   - L2 是**每库上限**：cache_l2_bytes 是单个库最多能用的磁盘，不和其他库分。
+//     挂 N 个库时目录最多 N × 上限，但仍不超过库自身容量（缓存比数据大没有意义）。
+//
+// 分摊/封顶结果在库挂载那一刻定死，运行中不重算（见文件头）：已经有缓存数据的库
+// 不该因为配置或集合变化被判定超额；要缩到新配额，得等该库下次重新挂载。
 func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 	cfg := m.cfg.Get()
 	key := req.key()
@@ -755,6 +809,7 @@ func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 
 	ids := cachePoolRepos(cfg, key, m.activeRepoKeys())
 	repos := make([]cacheRepoSize, 0, len(ids))
+	var keySize int64
 	for _, id := range ids {
 		size := m.knownRepoSize(id)
 		if id == key && req.RepoSizeBytes > 0 {
@@ -762,14 +817,209 @@ func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 			size = req.RepoSizeBytes
 			m.rememberRepoSize(id, size)
 		}
+		if id == key {
+			keySize = size
+		}
 		repos = append(repos, cacheRepoSize{ID: id, SizeBytes: size})
 	}
 
+	// L1：全局预算按容量分摊，再按账本剩余夹紧。
 	l1 = splitCacheBudget(cfg.CacheL1Bytes, cacheMinL1Bytes, repos)[key]
+	usedL1, _ := m.quotaInUse(key)
+	l1 = clampQuota(l1, cfg.CacheL1Bytes-usedL1)
+
+	// L2：每库一个固定上限，不参与分摊、也不受其他库影响。
 	if cfg.CacheL2Bytes > 0 {
-		l2 = splitCacheBudget(cfg.CacheL2Bytes, cacheMinL2Bytes, repos)[key]
+		l2 = cfg.CacheL2Bytes
+		if keySize > 0 && keySize < l2 {
+			l2 = keySize
+		}
+		l2 = l2 / cacheQuotaGranularity * cacheQuotaGranularity
 	}
 	return l1, l2
+}
+
+// clampQuota 把理论份额压到剩余预算之内（并保持 MiB 对齐）。
+// remaining <= 0 表示预算已经被其他库占满，本次只能拿 0：调用方据此降级
+// （L1 低于下限就回退直连、L2 低于下限就不开 L2），而不是继续超发。
+func clampQuota(want, remaining int64) int64 {
+	if want <= 0 || remaining <= 0 {
+		return 0
+	}
+	if want > remaining {
+		want = remaining / cacheQuotaGranularity * cacheQuotaGranularity
+	}
+	return want
+}
+
+// quotaInUse 返回除 key 之外所有活跃库已占用的配额之和。
+//
+// 排除 key 自身：同一个库重新挂载时，旧目标一旦注销账本就已经删掉；若它还在
+// 收尾（并发卸载），把旧份额算进去只会让这次重挂分到 0，所以按"自己不吃自己"处理。
+func (m *cacheManager) quotaInUse(key string) (l1, l2 int64) {
+	if m == nil {
+		return 0, 0
+	}
+	m.quotaMu.Lock()
+	defer m.quotaMu.Unlock()
+	for id, q := range m.allocated {
+		if id == key {
+			continue
+		}
+		l1 += q.L1
+		l2 += q.L2
+	}
+	return l1, l2
+}
+
+// commitQuota 记下某库本次实际生效的配额。
+//
+// 同一分摊键复用一条账本（同一库重复挂载时磁盘上会有两个文件，但预算只算一份），
+// 取较大值：宁可把总量估高一点，也不要在旧目标还没收尾时把新目标放进一个
+// 已经被占用的预算里。
+func (m *cacheManager) commitQuota(key string, l1, l2 int64) {
+	if m == nil || key == "" {
+		return
+	}
+	m.quotaMu.Lock()
+	defer m.quotaMu.Unlock()
+	if m.allocated == nil {
+		m.allocated = map[string]cacheQuota{}
+	}
+	if old, ok := m.allocated[key]; ok {
+		if old.L1 > l1 {
+			l1 = old.L1
+		}
+		if old.L2 > l2 {
+			l2 = old.L2
+		}
+	}
+	m.allocated[key] = cacheQuota{L1: l1, L2: l2}
+}
+
+// releaseQuota 在某个分配注销后归还它占的分摊键。只有该键再没有别的活跃分配时
+// 才真正删除账本，避免"同一库挂了两次、先注销的那个把另一个的份额也还掉"。
+func (m *cacheManager) releaseQuota(allocationID string) {
+	if m == nil {
+		return
+	}
+	allocationID = strings.TrimSpace(allocationID)
+	if allocationID == "" {
+		return
+	}
+	m.activeMu.Lock()
+	key := m.activeTargets[allocationID]
+	stillUsed := false
+	for id, k := range m.activeTargets {
+		if id != allocationID && k == key {
+			stillUsed = true
+			break
+		}
+	}
+	m.activeMu.Unlock()
+	if key == "" || stillUsed {
+		return
+	}
+	m.quotaMu.Lock()
+	delete(m.allocated, key)
+	m.quotaMu.Unlock()
+}
+
+// cacheDirUsage 统计缓存目录里 L2/L1 文件的实际合计（目录不存在时为 0）。
+func (m *cacheManager) cacheDirUsage() (l2, l1 int64) {
+	if m == nil {
+		return 0, 0
+	}
+	entries, err := os.ReadDir(cacheStorageDir(m.cfg.Get().CacheL2Dir))
+	if err != nil {
+		return 0, 0
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".bin"):
+			l2 += info.Size()
+		case strings.HasPrefix(name, "l1-") && strings.HasSuffix(name, ".bin"):
+			l1 += info.Size()
+		}
+	}
+	return l2, l1
+}
+
+// collectCacheFiles 回收缓存目录里**已经没有主人**的文件。
+//
+// 为什么需要它：L2 文件是按配额定长预分配的，只在目标创建时写一次。库被删掉、
+// 分配换新之后，旧文件不会自己消失 —— 它们不会再被任何目标打开，却永远实占磁盘
+// （"库早就删了，目录还挂着一百多 GiB"就是这么来的）。
+//
+// "有主"的判定有两条，任一满足即保留：
+//   - 门户里还有这个分配的目标（正在读写，删也删不掉）；
+//   - 状态里还有这个分配的挂载记录（应用重启后、自动挂载前，记录仍在 —— 这正是
+//     跨重启预热成立的前提）。
+//
+// 卸载会删掉挂载记录，所以卸载后的文件在这里被回收：L2 是每库上限、不预留空间，
+// 没有"留着给下次挂载"的必要。
+func (m *cacheManager) collectCacheFiles() {
+	if m == nil {
+		return
+	}
+	m.gcMu.Lock()
+	defer m.gcMu.Unlock()
+
+	dir := cacheStorageDir(m.cfg.Get().CacheL2Dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // 目录还不存在（从没开过缓存），没有可回收的
+	}
+
+	// 文件名里的 id 后缀要和 cacheL2Path/cacheL1Path 的命名口径一致。
+	live := map[string]struct{}{}
+	if p := m.runningPortal(); p != nil {
+		for _, key := range p.Keys() {
+			live[sanitizeIQNSuffix(key)] = struct{}{}
+		}
+	}
+	if m.liveAllocations != nil {
+		for id := range m.liveAllocations() {
+			live[sanitizeIQNSuffix(id)] = struct{}{}
+		}
+	}
+
+	var removed int
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		var id string
+		switch {
+		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".bin"):
+			id = strings.TrimSuffix(strings.TrimPrefix(name, "l2-"), ".bin")
+		case strings.HasPrefix(name, "l1-") && strings.HasSuffix(name, ".bin"):
+			id = strings.TrimSuffix(strings.TrimPrefix(name, "l1-"), ".bin")
+		default:
+			continue
+		}
+		if _, ok := live[id]; ok {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, name)); err != nil {
+			// 正被别的进程/会话占用时删不掉：跳过即可，下次挂载再试。
+			m.logger.Warn("回收无主缓存文件失败", "path", name, "error", err)
+			continue
+		}
+		removed++
+	}
+	if removed > 0 {
+		m.logger.Info("已回收无主缓存文件", "count", removed, "dir", dir)
+	}
 }
 
 // cacheRepoSize 是一个参与配额分摊的库。
@@ -780,9 +1030,9 @@ type cacheRepoSize struct {
 	SizeBytes int64
 }
 
-// splitCacheBudget 把**总预算**按各库容量分摊给每个库，返回库 ID → 配额。
+// splitCacheBudget 把**全局内存预算**按各库容量分摊给每个库，返回库 ID → 配额。
 //
-// 客户端设置里配的是总上限（所有开缓存的库在这一个数里分），分摊规则：
+// 只服务 L1：L2 是每库上限，不参与分摊（见 quotaFor）。分摊规则：
 //
 //   - 按**库容量占比**分：1TB 的库分到的份额是 100GB 库的 10 倍。缓存的价值在热点数据，
 //     热点规模与库的大小正相关，按容量分比按库数均分更贴近实际；均分会让 20GB 的小库
@@ -908,9 +1158,11 @@ func cacheRecommend(totalBytes int64, repos int) CacheRecommend {
 		return rec
 	}
 
-	l2 := int64(float64(totalBytes) * cacheRecommendL2Share)
-	if l2 > totalBytes {
-		l2 = totalBytes
+	// L2 是每库上限 → 按**平均库容量**估算，不随库数增长。
+	avg := totalBytes / int64(repos)
+	l2 := int64(float64(avg) * cacheRecommendL2Share)
+	if l2 > avg {
+		l2 = avg
 	}
 	if l2 > cacheMaxL2Bytes {
 		l2 = cacheMaxL2Bytes
@@ -921,7 +1173,8 @@ func cacheRecommend(totalBytes int64, repos int) CacheRecommend {
 		l2 = cacheMinL2Bytes
 	}
 
-	l1 := l2 / cacheRecommendL1Divisor
+	// L1 是全局共享 → 按**所有库容量之和**估算，库越多总量越大（封顶 cacheRecommendL1MaxBytes）。
+	l1 := int64(float64(totalBytes) * cacheRecommendL2Share / cacheRecommendL1Divisor)
 	if l1 > cacheRecommendL1MaxBytes {
 		l1 = cacheRecommendL1MaxBytes
 	}
@@ -941,7 +1194,7 @@ func cacheRecommend(totalBytes int64, repos int) CacheRecommend {
 // 外加 extra（本次要挂的那个库，配置可能刚改、还没落盘时以请求为准）。
 //
 // active 不能省：缓存**默认开启**后，没有单独保存过偏好（不在 cfg.RepoMounts 里）的库也会
-// 建立缓存目标；只看配置会让后挂的库把同一份总预算再分一遍。
+// 建立缓存目标；只看配置会让后挂的库把同一份 L1 预算再分一遍。
 //
 // 去空白、去重、稳定排序 —— 分摊结果不该随 map 迭代顺序变化。
 func cachePoolRepos(cfg Config, extra string, active []string) []string {
@@ -977,10 +1230,17 @@ type CacheStatus struct {
 	Running bool `json:"running"`
 	// Addr 门户监听地址。
 	Addr string `json:"addr,omitempty"`
-	// L1LimitBytes/L2LimitBytes 是客户端总量预算（所有开缓存的库在这一个数里按库容量分摊；
-	// L2 为 0 表示关闭 L2）。逐库分到多少见 Targets 里的 l1_limit_bytes/l2_limit_bytes。
+	// L1LimitBytes 是**全局**内存预算（所有开缓存的库按容量分摊这一个数）；
+	// L2LimitBytes 是**单个库**的磁盘上限（不与其他库分摊，0 表示关闭 L2）。
+	// 逐库实际分到多少见 Targets 里的 l1_limit_bytes/l2_limit_bytes。
 	L1LimitBytes int64 `json:"l1_limit_bytes"`
 	L2LimitBytes int64 `json:"l2_limit_bytes"`
+	// DiskL2Bytes/DiskL1Bytes 是缓存目录里 L2/L1 文件的**实际**合计（含尚未回收的旧文件）。
+	//
+	// 它是解释"设置 40 GiB、目录却有一百多 GiB"的读数：回收只在挂载/注销时按预算
+	// 执行，没人挂载时旧文件会一直躺在盘上。正常情况下应收敛到 limit 之内。
+	DiskL2Bytes int64 `json:"disk_l2_bytes"`
+	DiskL1Bytes int64 `json:"disk_l1_bytes"`
 	// EnabledRepos 是已启用缓存的库数（分摊集合的规模）。
 	EnabledRepos int `json:"enabled_repos"`
 	// KnownRepoBytes/KnownRepos 是本机**已知容量**的库合计与个数。
@@ -1070,6 +1330,7 @@ func (m *cacheManager) Status() CacheStatus {
 		Recommend:      cacheRecommend(knownBytes, len(known)),
 		Targets:        []CacheTargetStatus{},
 	}
+	st.DiskL2Bytes, st.DiskL1Bytes = m.cacheDirUsage()
 
 	m.mu.Lock()
 	p, lastErr := m.portal, m.lastErr

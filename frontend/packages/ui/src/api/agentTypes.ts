@@ -418,17 +418,18 @@ export interface AgentConfig {
   /** 是否用本地客户端证书免密登录（identity.json 存在时生效）。 */
   auto_login: boolean
   /**
-   * 本地读缓存代理的 **L1（内存）总上限**（字节）：所有开了缓存的库都在这一个数里，
+   * 本地读缓存代理的 **L1（内存）全局上限**（字节）：所有开了缓存的库共享这一个数，
    * 按各自**库容量占比**分摊（见 GET /agent/cache 的 recommend 与 targets[].l1_limit_bytes）。
    *
    * 它不是"每个库各拿这么多"，也不必须用满：没有库开缓存时一个字节都不占。
    */
   cache_l1_bytes: number
   /**
-   * 本地读缓存代理的 **L2（本地磁盘文件）总上限**（字节）：同样是总量、按库容量占比分摊。
+   * 本地读缓存代理的 **L2（本地磁盘文件）每库上限**（字节）：不做分摊，每个库各自最多
+   * 用这么多（开 N 个库最多占 N 倍；各库仍不会超过自身容量）。
    * **0 表示关闭 L2**（只做内存缓存），是合法取值。
    *
-   * 该配多大可以看 GET /agent/cache 的 `recommend.l2_bytes`（按库容量估算）。
+   * 该配多大可以看 GET /agent/cache 的 `recommend.l2_bytes`（按平均库容量估算）。
    */
   cache_l2_bytes: number
   /**
@@ -523,10 +524,11 @@ export interface AgentCacheStatus {
   /** 门户监听地址（未运行时为空）。 */
   addr?: string
   /**
-   * 客户端总量预算。逐库分到多少见 targets[].l1_limit_bytes（按库容量占比分摊，
+   * L1 全局上限。逐库分到多少见 targets[].l1_limit_bytes（按库容量占比分摊，
    * 不再有"每个库都一样"的单一配额数字）。
    */
   l1_limit_bytes: number
+  /** L2 每库上限（不做分摊；0 表示关闭 L2）。 */
   l2_limit_bytes: number
   /** 已启用缓存的库数（分摊集合的规模）。 */
   enabled_repos: number

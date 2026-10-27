@@ -446,7 +446,7 @@ GET /agent/cache
 CacheStatus = {
   running:bool,                 # 门户是否已打开（**懒启动**：首个库启用缓存时创建）
   addr,                         # 门户监听地址（running 时有值），如 "127.0.0.1:3261"
-  l1_limit_bytes, l2_limit_bytes,   # 客户端总量**上限**（L2 为 0 表示关闭 L2）
+  l1_limit_bytes, l2_limit_bytes,   # L1 全局上限 / L2 每库上限（L2 为 0 表示关闭 L2）
   enabled_repos:int,            # 已启用缓存的库数（配额分摊集合的规模）
   known_repo_bytes, known_repos,    # 本机**已知容量**的库合计与个数（分摊与推荐值的依据）
   recommend:CacheRecommend,     # 按已知库容量估算的推荐预算（设置页显示在配置项后面）
@@ -483,12 +483,13 @@ CacheTargetStatus = {
 
 要点：
 
-- **设面只按客户端**：L1/L2 总量在「客户端设置」里配（`PATCH /agent/config` 的
+- **设面只按客户端**：L1/L2 上限在「客户端设置」里配（`PATCH /agent/config` 的
   `cache_l1_bytes` / `cache_l2_bytes`，见「本地配置」），**是否启用按库配**
-  （`POST /agent/repo-mounts/{repo_id}` 的 `cache_enabled`，**默认开启**）。总量是**上限**，在所有已启用
-  缓存的库之间按**库容量占比**分摊（1 TB 的库分到的份额是 100 GB 的 10 倍），单库不超过
-  自身容量；容量未知的库按"已知库的平均容量"看待（一个都不知时退化为按库数均分）。
-  分摊结果在挂载时定下，逐库配额见 `targets[].l1_limit_bytes` / `l2_limit_bytes`。
+  （`POST /agent/repo-mounts/{repo_id}` 的 `cache_enabled`，**默认开启**）。
+  **两者口径不同**：L1 是**全局共享**的内存总量，在所有已启用缓存的库之间按**库容量占比**
+  分摊（1 TB 的库分到的份额是 100 GB 的 10 倍），单库不超过自身容量，容量未知的库按
+  "已知库的平均容量"看待；L2 是**每库上限**，不做分摊，开 N 个库最多占 N 倍（各库仍不超过
+  自身容量）。配额在挂载时定下，逐库实际值见 `targets[].l1_limit_bytes` / `l2_limit_bytes`。
 - **库容量从哪来**：不做额外查询 —— 挂载参数里的 `disk_size_bytes`（服务端下发）与
   `GET /v1/repos` 的 `capacity_bytes`（代理在会话建立后、开始挂载前为分摊取一次）都会记进
   本机索引，`known_repo_bytes` / `known_repos` 与 `recommend` 都由它算。
@@ -877,12 +878,12 @@ POST  /agent/group-mounts
 取值超出范围时 PATCH 返回 `system.invalid_param`（args.field=download_connections）；
 从配置文件读取到越界值时按「<=0 取默认 4、>8 取 8」归一化。
 
-`cache_l1_bytes` / `cache_l2_bytes` 是本机 iSCSI 读缓存代理的 **L1（内存）/ L2（本地磁盘
-文件）总量上限**（字节），前者默认 512MiB、后者默认 4GiB。语义是**客户端总量上限**：设面只
-按客户端设置，一个客户端只起一个代理，所有已启用缓存的库在这一个数里按**库容量占比**分摊
-（1 TB 的库分到的份额是 100 GB 的 10 倍；单库不超过自身容量；容量未知按已知库的平均容量）。
-逐库分到多少见 `GET /agent/cache` 的 `targets[].l1_limit_bytes` / `l2_limit_bytes`，该配多大
-见同接口的 `recommend`（按库容量估算：L2 取库容量的 5%，L1 取 L2 的 1/8）。配额在
+`cache_l1_bytes` 是 **L1（内存）的全局上限**，默认 512MiB：所有已启用缓存的库共享这一个数，
+按**库容量占比**分摊（1 TB 的库分到的份额是 100 GB 的 10 倍；单库不超过自身容量；容量未知
+按已知库的平均容量）。`cache_l2_bytes` 是 **L2（本地磁盘文件）的每库上限**，默认 4GiB：
+不做分摊，每个库各自最多用这么多（开 N 个库目录最多 N × 上限，各库仍不超过自身容量）。
+逐库实际值见 `GET /agent/cache` 的 `targets[].l1_limit_bytes` / `l2_limit_bytes`，该配多大见
+同接口的 `recommend`（L2 取单个库容量的 5%；L1 取所有库容量之和的 5% 再除以 8）。配额在
 **挂载建立时定下，运行中不重算**，因此：
 
 - **取值范围**：L1 必须落在 `[64MiB, 64GiB]`；L2 允许 **0（= 关闭 L2，只做内存缓存）**，

@@ -1,6 +1,10 @@
 package agent
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // 配额分摊与推荐值都是纯计算，但直接决定"每块盘能缓存多少"，边界（未知容量、封顶、
 // 下限、预算不够）任一处理错都会让某个库静默拿到 0 或超发，所以逐个锁住。
@@ -113,9 +117,10 @@ func TestCacheRecommend(t *testing.T) {
 	}{
 		{"没有任何库", 0, 0, 0, 0},
 		{"一个库都没有容量", 0, 3, 0, 0},
-		{"100 GiB：L2 取 5%，L1 取 L2 的 1/8", 100 * gib, 1, 640 * mib, 5 * gib},
-		// 1 TiB 的 5% = 51200 MiB，再按 MiB 对齐；L1 本该 6.4 GiB，被 2 GiB 上限截住。
-		{"1 TiB：L1 被 2 GiB 上限截住", 1 << 40, 2, 2 * gib, 52428 * mib},
+		{"100 GiB：L2 取 5%，L1 取总量的 5%/8", 100 * gib, 1, 640 * mib, 5 * gib},
+		// L2 是每库上限 → 按平均库容量（512 GiB）的 5% = 26214 MiB；
+		// L1 是全局共享 → 1 TiB 的 5%/8 = 6.4 GiB，被 2 GiB 上限截住。
+		{"1 TiB / 2 库：L2 按平均容量、L1 被 2 GiB 截住", 1 << 40, 2, 2 * gib, 26214 * mib},
 		{"1 GiB：两级都被下限抬起来", gib, 1, cacheMinL1Bytes, cacheMinL2Bytes},
 	}
 	for _, tc := range cases {
@@ -169,8 +174,9 @@ func TestQuotaForSplitsAcrossEnabledCacheRepos(t *testing.T) {
 	if l1Big <= l1Small*8 {
 		t.Fatalf("1 TiB 的库应比 100 GiB 的库分到多得多的 L1：big=%d small=%d", l1Big, l1Small)
 	}
-	if l2Big <= l1Big {
-		t.Fatalf("L2 总额是 L1 的 10 倍，配额不该反过来：L1=%d L2=%d", l1Big, l2Big)
+	// L2 是每库上限：与库数、库容量占比都无关，单库最多就是配置值（80 GiB）。
+	if l2Big != 80*gib {
+		t.Fatalf("L2 每库上限应为 80 GiB，实际 %d", l2Big)
 	}
 	if got := l1Big + l1Small; got > cfg.cfg.CacheL1Bytes {
 		t.Fatalf("L1 两个库合计 %d 超过总预算 %d", got, cfg.cfg.CacheL1Bytes)
@@ -243,5 +249,96 @@ func TestStatusReportsRecommendation(t *testing.T) {
 	}
 	if st.EnabledRepos != 1 {
 		t.Fatalf("已启用缓存的库数 %d，期望 1", st.EnabledRepos)
+	}
+}
+
+// TestQuotaLedgerKeepsTotalWithinBudget 锁定 L1 的"全局共享"口径：集合变化（新库加入）
+// 之后，新库只能分到账本上**还剩**的 L1，不能在老库已占的份额之上再叠一份。
+func TestQuotaLedgerKeepsTotalWithinBudget(t *testing.T) {
+	const gib = int64(1) << 30
+	store := newCacheTestStore(t)
+	l1, l2 := 4*gib, 40*gib
+	if _, err := store.Patch(ConfigPatch{CacheL1Bytes: &l1, CacheL2Bytes: &l2}); err != nil {
+		t.Fatalf("Patch 缓存上限失败：%v", err)
+	}
+	m := newCacheManager(store, testLogger())
+	enable := func(id string) {
+		t.Helper()
+		if _, err := store.SetRepoMountPref(id, RepoMountPref{CacheEnabled: true}); err != nil {
+			t.Fatalf("启用 %s 的缓存失败：%v", id, err)
+		}
+	}
+
+	// 集合里只有 A：L1 拿走全部全局预算，L2 拿满每库上限。
+	enable("a")
+	aL1, aL2 := m.quotaFor(cacheTargetRequest{AllocationID: "alloc-a", RepoID: "a", RepoSizeBytes: 1000 * gib})
+	if aL1 != l1 || aL2 != l2 {
+		t.Fatalf("只有 A 时 L1 应为全局预算 %d、L2 为每库上限 %d，实际 %d/%d", l1, l2, aL1, aL2)
+	}
+	m.markCacheTarget("alloc-a", "a")
+	m.commitQuota("a", aL1, aL2)
+
+	// B 加入后集合是 {a,b}：B 的 L1 理论份额是 2 GiB，但账本已被 A 占满 → 0（降级为直连）。
+	// L2 是每库上限，不受账本影响，B 依然拿满 40 GiB。
+	enable("b")
+	bL1, bL2 := m.quotaFor(cacheTargetRequest{AllocationID: "alloc-b", RepoID: "b", RepoSizeBytes: 1000 * gib})
+	if bL1 != 0 {
+		t.Fatalf("L1 预算已被 A 占满时 B 不该再分到 %d", bL1)
+	}
+	if bL2 != l2 {
+		t.Fatalf("L2 是每库上限，B 应分到 %d，实际 %d", l2, bL2)
+	}
+
+	// A 注销后账本归还，B 才能拿到自己按容量占比应得的 L1 份额。
+	m.releaseQuota("alloc-a")
+	m.unmarkCacheTarget("alloc-a")
+	bL1, _ = m.quotaFor(cacheTargetRequest{AllocationID: "alloc-b", RepoID: "b", RepoSizeBytes: 1000 * gib})
+	if bL1 != l1/2 {
+		t.Fatalf("A 注销后 B 应分到 %d，实际 %d", l1/2, bL1)
+	}
+}
+
+// TestCollectCacheFilesRemovesOrphans 锁定无主文件回收：卸载/删除库之后，既不在门户里、
+// 也没有挂载记录的 l2-/l1- 文件应被删除；有主文件与无关文件不动。
+func TestCollectCacheFilesRemovesOrphans(t *testing.T) {
+	const mib = int64(1) << 20
+	dir := t.TempDir()
+	store := newCacheTestStore(t)
+	budget := int64(cacheMinL2Bytes)
+	if _, err := store.Patch(ConfigPatch{CacheL2Bytes: &budget, CacheL2Dir: &dir}); err != nil {
+		t.Fatalf("Patch 缓存目录失败：%v", err)
+	}
+	m := newCacheManager(store, testLogger())
+	// 状态里还有挂载记录的分配（应用重启后、自动挂载完成之前就是这种状态）。
+	m.liveAllocations = func() map[string]struct{} {
+		return map[string]struct{}{"alloc-live": {}}
+	}
+
+	write := func(name string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, mib), 0o600); err != nil {
+			t.Fatalf("造缓存文件失败：%v", err)
+		}
+	}
+	write("l2-alloc-live.bin")
+	write("l1-alloc-live.bin")
+	write("l2-alloc-gone.bin")
+	write("l1-alloc-gone.bin")
+	write("notes.txt")
+
+	m.collectCacheFiles()
+
+	for _, name := range []string{"l2-alloc-live.bin", "l1-alloc-live.bin"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s 还有挂载记录，不该被删：%v", name, err)
+		}
+	}
+	for _, name := range []string{"l2-alloc-gone.bin", "l1-alloc-gone.bin"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s 已无主，应被回收", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "notes.txt")); err != nil {
+		t.Fatalf("非缓存文件不该被删：%v", err)
 	}
 }

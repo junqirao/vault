@@ -48,7 +48,8 @@ type RepoMountPref struct {
 	// **默认开启**：没有保存过偏好的库、以及旧配置里缺少 cache_enabled 的条目都按开启处理
 	// （见 UnmarshalJSON 与 normalizeConfig）。用户可以在「存储库 → 挂载设置」里关闭它。
 	// 开启后本机到服务端目标的链路变成 本机 → 本地缓存代理 → 服务端目标，
-	// 多占用一份本地内存（L1）与磁盘（L2）；缓存是**总量上限**，多个库按容量分摊。
+	// 多占用一份本地内存（L1）与磁盘（L2）；L1 是全局共享的总量、多个库按容量分摊，
+	// L2 是每个库各自的上限。
 	//
 	// ⚠️ 关闭缓存后仍会**经过本机代理**（纯透传），从而读写 IOPS 可被监控；
 	// 只有 DirectMode 才真正绕过代理。
@@ -187,13 +188,13 @@ type Config struct {
 	UpdateChannel string `json:"update_channel"`
 	// ServerAlias 服务端别名（目录模式命名空间，见 3.4.5）。
 	ServerAlias string `json:"server_alias"`
-	// CacheL1Bytes 是本机 iSCSI 读缓存代理的 L1（内存）**总上限**：所有开了缓存的库都在这一个
-	// 数里，按各自库容量占比分摊（见 cacheproxy.go 的 splitCacheBudget）。
+	// CacheL1Bytes 是本机 iSCSI 读缓存代理的 L1（内存）**全局上限**：所有开了缓存的库共用这一个
+	// 数，按各自库容量占比分摊（见 cacheproxy.go 的 splitCacheBudget）。
 	//
 	// 它不是"每个库各拿这么多"，也不是必须用满：没有库开缓存时一个字节都不占。
 	CacheL1Bytes int64 `json:"cache_l1_bytes"`
-	// CacheL2Bytes 是本机 iSCSI 读缓存代理的 L2（本地磁盘文件）总上限，分摊规则同上；
-	// **0 表示关闭 L2**（只做内存缓存）。
+	// CacheL2Bytes 是**单个库**的 L2（本地磁盘文件）上限，不与其他库分摊：
+	// 开 N 个库时缓存目录最多 N × 这个值（各库仍不超过自身容量）。**0 表示关闭 L2**。
 	//
 	// 该配多大可以看 GET /agent/cache 的 recommend（按本机已知的库容量估算），
 	// 口径是"库容量的 5%"，客户端设置页会把推荐值显示在输入框后面。
@@ -264,7 +265,7 @@ type ConfigPatch struct {
 	StartAtLogin        *bool   `json:"start_at_login"`
 	UpdateChannel       *string `json:"update_channel"`
 	ServerAlias         *string `json:"server_alias"`
-	// CacheL1Bytes / CacheL2Bytes 是缓存代理的 L1/L2 总预算（字节）；L2 允许 0（关闭）。
+	// CacheL1Bytes 是 L1 的全局预算；CacheL2Bytes 是**每库** L2 上限（字节）；L2 允许 0（关闭）。
 	CacheL1Bytes *int64 `json:"cache_l1_bytes"`
 	CacheL2Bytes *int64 `json:"cache_l2_bytes"`
 	// CacheL2Dir 是 L2 缓存文件目录；空串表示恢复默认位置（见 Config.CacheL2Dir）。
@@ -287,7 +288,8 @@ func defaultConfig() Config {
 		Language:            "zh-CN",
 		StartAtLogin:        false,
 		UpdateChannel:       "stable",
-		// 缓存代理的总预算（默认值只是"上限"，实际只在库挂载且启用缓存后才被占用）。
+		// 缓存代理的上限（默认值只是"上限"，实际只在库挂载且启用缓存后才被占用）：
+		// L1 为全局总量，L2 为每库上限。
 		CacheL1Bytes: cacheDefaultL1Bytes,
 		CacheL2Bytes: cacheDefaultL2Bytes,
 	}

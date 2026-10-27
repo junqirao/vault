@@ -19,7 +19,7 @@ import { bytesToMegabytes, formatBytes, formatTime, megabytesToBytes } from '../
 import { ServerManagementCard } from './ServerManagementCard'
 
 /**
- * 本地读缓存代理的 L1/L2 上限（客户端总量，单位 MiB）。
+ * 本地读缓存代理的 L1（全局共享）/ L2（每库上限）配置，单位 MiB。
  *
  * 上下界必须与代理侧（internal/agent/cacheproxy.go 的 cacheMin/Max）一致 —— 否则界面放行、
  * 保存却被 PATCH 以 cache_l1_bytes/cache_l2_bytes invalid_param 拒掉，用户只看到一个对不上的报错。
