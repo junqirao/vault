@@ -86,6 +86,8 @@ CLIENT_PKG_JSON = CLIENT_APP_DIR / "package.json"
 GO_TARGETS = [
     ("Vault-Server.exe", "./cmd/vault-server", False),
     ("Vault-Agent.exe", "./cmd/vault-agent", True),
+    # 客户端本体更新的独立切换器（随客户端程序目录分发，见 electron-builder.yml 的 extraFiles）。
+    ("Vault-Updator.exe", "./cmd/vault-updator", False),
 ]
 
 # Linux 服务端的交叉编译产物名（无 .exe 后缀）。
@@ -104,6 +106,7 @@ CLIENT_SOURCE_PATHS = [
     "internal/platform",
     "internal/updatepkg",
     "cmd/vault-agent",
+    "cmd/vault-updator",
 ]
 
 # 服务端专属路径：仅用于提示"服务端有改动但版本未变"，不参与版本递增决策。
@@ -1017,16 +1020,23 @@ def build_client_app(args) -> Path | None:
         warn("找不到 pnpm，跳过客户端打包")
         return None
 
-    # 先把 agent 放到 electron-builder 约定的位置（对应 electron-builder.yml 的 extraFiles），
-    # 这样打出来的程序目录里就有 Vault-Agent.exe，客户端启动时才能找到它。
-    agent = DIST_DIR / "Vault-Agent.exe"
-    if agent.is_file():
-        staged = CLIENT_APP_DIR / "build" / "Vault-Agent.exe"
-        staged.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(agent, staged)
-        info(f"已暂存 {agent.name} → {staged.relative_to(ROOT)}")
-    else:
-        warn("未找到 dist/Vault-Agent.exe，客户端会因找不到本地代理而进入降级模式")
+    # 先把 agent 与独立 updator 放到 electron-builder 约定的位置（对应 electron-builder.yml
+    # 的 extraFiles），这样打出来的程序目录里就有 Vault-Agent.exe 与 Vault-Updator.exe。
+    #
+    # updator 缺失不阻断打包：客户端会退回"请求代理拉起切换器副本"的兜底路径（功能等价），
+    # 只是排障时在客户端目录里看不到独立进程，所以这里明确告警。
+    for name, hint in (
+        ("Vault-Agent.exe", "客户端会因找不到本地代理而进入降级模式"),
+        ("Vault-Updator.exe", "本体更新将退回代理侧切换器（可用，但客户端里没有独立 updator）"),
+    ):
+        src = DIST_DIR / name
+        if src.is_file():
+            staged = CLIENT_APP_DIR / "build" / name
+            staged.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, staged)
+            info(f"已暂存 {name} → {staged.relative_to(ROOT)}")
+        else:
+            warn(f"未找到 dist/{name}：{hint}")
 
     proc = run([pnpm, "--filter", "@vault/client", "run", "package"],
                cwd=FRONTEND_DIR, capture=False, check=False,

@@ -5,7 +5,7 @@ export interface MyReposProps {
   onOpen: (repoId: string) => void
   /** 打开「上传任务」页：本机正在上传的库混在列表里（状态标签为「上传中」），点它进这个页面。 */
   onOpenUpload?: (uploadId: string) => void
-  /** 首页「存储」卡片：整卡进入只读存储页。 */
+  /** 首页「存储」卡片标题后的箭头：进入只读存储页。 */
   onOpenStorages?: () => void
 }
 

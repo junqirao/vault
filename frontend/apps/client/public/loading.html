@@ -39,18 +39,8 @@
         -webkit-user-select: none;
         cursor: default;
       }
-      .mark {
-        width: 56px;
-        height: 56px;
-      }
-      .brand {
-        margin-top: 18px;
-        font-size: 17px;
-        font-weight: 600;
-        letter-spacing: 0.02em;
-      }
       .message {
-        margin: 26px 0 0;
+        margin: 0;
         font-size: 14px;
         line-height: 1.6;
       }
@@ -68,9 +58,45 @@
         font-size: 12px;
         color: rgba(0, 0, 0, 0.45);
       }
+      /*
+        下载进度条：下载新版本期间替代转圈，给出"还剩多少"的确定感。
+        没有总大小时用不确定条纹（见 .is-indeterminate），不显示假的 0%。
+      */
+      .progress {
+        display: none;
+        width: 220px;
+        height: 4px;
+        margin-top: 18px;
+        border-radius: 999px;
+        background: rgba(10, 108, 255, 0.14);
+        overflow: hidden;
+      }
+      .progress.is-on {
+        display: block;
+      }
+      .progress-bar {
+        height: 100%;
+        width: 0%;
+        border-radius: 999px;
+        background: #0a6cff;
+        transition: width 240ms ease-out;
+      }
+      .progress.is-indeterminate .progress-bar {
+        width: 40%;
+        transition: none;
+        animation: vault-slide 1100ms ease-in-out infinite;
+      }
       @keyframes vault-spin {
         to {
           transform: rotate(360deg);
+        }
+      }
+      @keyframes vault-slide {
+        0% {
+          transform: translateX(-120%);
+        }
+        100% {
+          transform: translateX(320%);
         }
       }
       @media (prefers-color-scheme: dark) {
@@ -85,23 +111,20 @@
         .hint {
           color: rgba(255, 255, 255, 0.45);
         }
+        .progress {
+          background: rgba(77, 148, 255, 0.24);
+        }
+        .progress-bar {
+          background: #4d94ff;
+        }
       }
     </style>
   </head>
   <body>
-    <svg class="mark" viewBox="0 0 56 56" aria-hidden="true">
-      <rect width="56" height="56" rx="14" fill="#0a6cff" />
-      <path
-        d="M16 18.5 L28 38 L40 18.5"
-        fill="none"
-        stroke="#ffffff"
-        stroke-width="5"
-        stroke-linecap="round"
-        stroke-linejoin="round"
-      />
-    </svg>
-    <div class="brand">Vault</div>
     <p class="message" id="message">正在切换到新版本界面…</p>
+    <div class="progress" id="progress" aria-hidden="true">
+      <div class="progress-bar" id="progress-bar"></div>
+    </div>
     <div class="spinner" aria-hidden="true"></div>
     <p class="hint" id="hint">完成后会自动继续，无需操作</p>
     <script>
@@ -129,6 +152,84 @@
       document.documentElement.lang = TEXT[lang] ? lang : 'zh-CN';
       document.getElementById('message').textContent = text.message;
       document.getElementById('hint').textContent = text.hint;
+
+      /*
+        启动期更新门的文案（见 electron/main.ts 的 setBootStatus）。
+        主进程只传状态 key（checking / downloading / preparing / restarting）和可选的百分比，
+        文案全部留在这里，四种语言一处维护。
+      */
+      var BOOT = {
+        'zh-CN': {
+          checking: '正在检查更新…',
+          downloading: '正在下载新版本… {percent}%',
+          preparing: '正在准备新版本…',
+          restarting: '正在启动新版本…'
+        },
+        'en-US': {
+          checking: 'Checking for updates…',
+          downloading: 'Downloading the new version… {percent}%',
+          preparing: 'Preparing the new version…',
+          restarting: 'Starting the new version…'
+        },
+        'ja-JP': {
+          checking: '更新を確認しています…',
+          downloading: '新しいバージョンをダウンロードしています… {percent}%',
+          preparing: '新しいバージョンを準備しています…',
+          restarting: '新しいバージョンを起動しています…'
+        },
+        'ko-KR': {
+          checking: '업데이트를 확인하는 중…',
+          downloading: '새 버전을 내려받는 중… {percent}%',
+          preparing: '새 버전을 준비하는 중…',
+          restarting: '새 버전을 시작하는 중…'
+        }
+      };
+      var progressEl = document.getElementById('progress');
+      var progressBarEl = document.getElementById('progress-bar');
+      var spinnerEl = document.querySelector('.spinner');
+      /** 上一次画到的百分比：executeJavaScript 可能乱序到达，进度条绝不能往回缩。 */
+      var lastBootPercent = 0;
+
+      /** 有真实百分比就画实心条；拿不到总大小就画不确定条纹，不显示假的 0%。 */
+      function setBootProgress(percent) {
+        progressEl.classList.add('is-on');
+        spinnerEl.style.display = 'none';
+        if (typeof percent === 'number' && percent > 0) {
+          lastBootPercent = Math.max(lastBootPercent, Math.min(100, percent));
+          progressEl.classList.remove('is-indeterminate');
+          progressBarEl.style.width = lastBootPercent + '%';
+        } else {
+          progressEl.classList.add('is-indeterminate');
+          progressBarEl.style.width = '';
+        }
+      }
+
+      function hideBootProgress() {
+        progressEl.classList.remove('is-on', 'is-indeterminate');
+        progressBarEl.style.width = '0%';
+        spinnerEl.style.display = '';
+      }
+
+      window.__vaultBootStatus = function (status, percent) {
+        var table = BOOT[lang] || BOOT['zh-CN'];
+        var message = table[status];
+        if (!message) return;
+        if (typeof percent === 'number' && percent > 0) {
+          message = message.replace('{percent}', String(percent));
+        } else {
+          // 还不知道总大小（或没有进度）：去掉占位符，别显示 “0%” 让人以为卡住了。
+          message = message.replace(/\s*\{percent\}%/, '');
+        }
+        document.getElementById('message').textContent = message;
+        /*
+          下载：确定进度条（received/total，见 clientUpdate.ts 的 awaitStartupClientUpdate）。
+          校验/解压：耗时但对用户不可量化，用不确定条纹顶上，避免"停在 100% 不动"。
+          检查/启动：回到转圈。
+        */
+        if (status === 'downloading') setBootProgress(percent);
+        else if (status === 'preparing') setBootProgress(null);
+        else hideBootProgress();
+      };
     </script>
   </body>
 </html>

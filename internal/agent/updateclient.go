@@ -48,8 +48,12 @@ const (
 	// 阈值与 build.py 的 MIN_APP_FILES 保持一致（精简后约 22 个文件）：只用来识破
 	// "解压不完整/空壳"，不需要贴近真实数量。
 	clientMinFiles = 15
-	// clientVersionsKept 保留的历史版本目录数（当前 + 上一个，便于出问题时手工回退）。
-	clientVersionsKept = 2
+	// clientVersionsKept 保留的历史版本目录数（当前 + 上两个，便于出问题时手工回退）。
+	//
+	// 为什么不是 2：切换器接手时**旧客户端还在运行**，而 apply 在它退出前就把新版本
+	// 写进 current.json 并清理目录。跨版本升级（现场用离线包直接跳版）时，正在运行的
+	// 那个目录会正好排在"第 3 个"上，删它就是删用户正在用的程序（窗口闪退 / 白屏）。
+	clientVersionsKept = 3
 )
 
 // 客户端本体更新状态取值（ClientUpdateState.state）。
@@ -64,6 +68,8 @@ const (
 	ClientStateExtracting = "extracting"
 	// ClientStateReady 新版本已就绪（current.json 已指向它），等客户端重启切换。
 	ClientStateReady = "ready"
+	// ClientStateSwitching 切换器已启动：客户端即将退出，由切换器拉起新版本。
+	ClientStateSwitching = "switching"
 	// ClientStateFailed 失败（error 为稳定错误码）。
 	ClientStateFailed = "failed"
 )

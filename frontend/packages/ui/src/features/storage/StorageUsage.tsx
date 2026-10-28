@@ -1,4 +1,4 @@
-import { ArrowLeftOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, ArrowRightOutlined } from '@ant-design/icons'
 import { Button, Card, Progress, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
 import { useQuery } from '@tanstack/react-query'
 
@@ -114,8 +114,9 @@ function StorageUsageRow({
  * 存储库首页的「存储」总览卡片。
  *
  * 与「我的配额」模块同款排版：一行总量 + 一条进度条 + 底部"剩余 / 存储数量"。
- * 不在首页罗列每个存储，明细只在只读存储页看。整卡点击进入只读存储页；
- * 管理入口挪到只读存储页右上角（见 StorageUsagePage）。
+ * 不在首页罗列每个存储，明细只在只读存储页看；入口是**标题后的箭头按钮**，
+ * 卡片本身不再整块可点（避免与卡片内其他区域的可点语义混淆、也不再给整张卡片
+ * 加上悬停变色）。管理入口在只读存储页右上角（见 StorageUsagePage）。
  */
 export function StorageUsageCard({
   onOpen,
@@ -145,6 +146,16 @@ export function StorageUsageCard({
     <>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
         <Typography.Text strong>{t('storage.title')}</Typography.Text>
+        <Tooltip title={t('storage.usage.detail')}>
+          <Button
+            type="text"
+            size="small"
+            aria-label={t('storage.usage.detail')}
+            icon={<ArrowRightOutlined />}
+            onClick={onOpen}
+            style={{ alignSelf: 'center' }}
+          />
+        </Tooltip>
         <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
           {`${t('storage.usage.used')} ${formatBytes(aggregate.used)} / ${formatBytes(aggregate.total)}`}
         </Typography.Text>
@@ -174,8 +185,7 @@ export function StorageUsageCard({
   if (embedded) {
     return (
       <div
-        onClick={onOpen}
-        style={{ cursor: 'pointer', height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}
+        style={{ height: '100%', display: 'flex', flexDirection: 'column', justifyContent: 'center' }}
       >
         {content}
       </div>
@@ -183,12 +193,7 @@ export function StorageUsageCard({
   }
 
   return (
-    <Card
-      hoverable
-      onClick={onOpen}
-      styles={{ body: { padding: spacing.md } }}
-      style={{ cursor: 'pointer', height: '100%' }}
-    >
+    <Card styles={{ body: { padding: spacing.md } }} style={{ height: '100%' }}>
       {content}
     </Card>
   )
@@ -198,7 +203,7 @@ export function StorageUsageCard({
  * 客户端只读存储页：每个存储的用量进度条。
  *
  * 没有任何管理动作（启停/挂载/扩容/删除都不在这里）：普通用户只需要知道"空间用了多少"。
- * 管理入口在首页卡片的右上角箭头，且仅超级管理员可点。
+ * 管理入口在本页右上角的「管理」按钮，且仅超级管理员可点。
  */
 export function StorageUsagePage({
   onBack,

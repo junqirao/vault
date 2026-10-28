@@ -4,11 +4,13 @@ package linuxlvm
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"vault/internal/apperr"
@@ -309,10 +311,7 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 		name, fsType = e.source, e.fsType
 	}
 
-	mediaType := ""
-	if strings.HasPrefix(name, "/dev/") {
-		mediaType = mediaTypeOfDevice(name)
-	}
+	mediaType := mediaTypeOfPath(p, name)
 
 	free := size.freeBytes
 	// 该路径落在某个 thin 卷上时，还要看它所属**池**还剩多少（多存储池下各算各的）：
@@ -329,6 +328,24 @@ func (m *Manager) SpaceUsageOf(ctx context.Context, path string) (*domain.Volume
 	}, nil
 }
 
+// mediaTypeOfPath 判定承载该路径的物理盘是 HDD 还是 SSD。
+//
+// 目录模式的存储（storages.path 是宿主目录，不是存储卷的挂载点）必须靠第 2 条路：
+// 它的挂载源可能是 overlay / tmpfs / nfs，甚至根本匹配不到 mountinfo，只看 source
+// 会一律判成 unknown —— 界面上就是"目录存储不显示 HDD/SSD"。
+func mediaTypeOfPath(path, source string) string {
+	// ① 挂载源本身就是块设备（thin LV 的 /dev/mapper/...、分区 /dev/sda1）。
+	//    非块设备（overlay/tmpfs/nfs）在这里自然拿不到 rotational，会落到第 ② 条。
+	if t := mediaTypeOfDevice(source); t != "" {
+		return t
+	}
+	// ② 用 stat(2) 的设备号找回承载该目录的真实块设备（含 dm / 分区）。
+	if name, ok := blockDeviceOfPath(path); ok {
+		return mediaTypeOfName(name)
+	}
+	return ""
+}
+
 // mediaTypeOfDevice 判断 /dev 下的设备（含 dm / 分区）所在物理盘的介质类型。
 //
 // 返回 hdd / ssd / 空串（识别不出来）。
@@ -337,10 +354,16 @@ func mediaTypeOfDevice(dev string) string {
 	if resolved, err := filepath.EvalSymlinks(dev); err == nil {
 		base = filepath.Base(resolved)
 	}
-	if base == "" || base == "." || base == "/" {
+	return mediaTypeOfName(base)
+}
+
+// mediaTypeOfName 按 /sys/class/block/<name> 的 rotational 判定介质类型。
+func mediaTypeOfName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == "/" {
 		return ""
 	}
-	switch blockRotational(base, 0) {
+	switch blockRotational(name, 0) {
 	case 1:
 		return domain.MediaTypeHDD
 	case 0:
@@ -348,6 +371,40 @@ func mediaTypeOfDevice(dev string) string {
 	default:
 		return ""
 	}
+}
+
+// blockDeviceOfPath 返回承载 path 的块设备名（如 sda2 / dm-0）。
+//
+// 原理：stat(2) 的 st_dev 是"该路径所在文件系统"的设备号，/sys/dev/block/<maj>:<min>
+// 是指向真实块设备的符号链接。这样目录模式（宿主目录、bind mount、overlay 下层）
+// 也能追到物理盘，不必依赖 mountinfo 的 source 是不是 /dev/...。
+func blockDeviceOfPath(path string) (string, bool) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return "", false
+	}
+	dev := uint64(st.Dev)
+	link := fmt.Sprintf("/sys/dev/block/%d:%d", devMajor(dev), devMinor(dev))
+	resolved, err := filepath.EvalSymlinks(link)
+	if err != nil {
+		return "", false
+	}
+	base := filepath.Base(resolved)
+	if base == "" || base == "." || base == "/" {
+		return "", false
+	}
+	return base, true
+}
+
+// devMajor / devMinor 解码 Linux 的 dev_t（glibc 的 gnu_dev_major/minor 布局）。
+//
+// 不用 syscall.Major/Minor：标准库在 linux 上并没有导出这两个函数。
+func devMajor(dev uint64) uint64 {
+	return uint64((dev>>8)&0xfff) | uint64(uint32(dev>>32)&^uint32(0xfff))
+}
+
+func devMinor(dev uint64) uint64 {
+	return uint64(dev&0xff) | uint64(uint32(dev>>12)&^uint32(0xff))
 }
 
 // blockRotational 读取 /sys/class/block/<name>/queue/rotational：

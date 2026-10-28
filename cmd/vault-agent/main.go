@@ -52,6 +52,8 @@ const (
 	unmountTimeout = 2 * time.Minute
 	// applyUpdateSubcommand 是"替换器"子命令名（与 update.go 中的常量保持一致）。
 	applyUpdateSubcommand = "apply-update"
+	// clientSwitchSubcommand 是"客户端切换器"子命令名（与 clientswitch.go 的常量保持一致）。
+	clientSwitchSubcommand = "client-switch"
 )
 
 func main() {
@@ -69,8 +71,13 @@ func run() (code int) {
 	// apply-update 是**替换器**路径：它由自更新流程以"当前 exe 的临时副本"身份启动，
 	// 因此**绝不能**触碰单实例锁、日志初始化或本地 HTTP —— 否则副本会因锁冲突无法运行，
 	// 而这正是"运行中的 exe 无法覆盖自身"所要绕开的问题。
-	if len(os.Args) > 1 && os.Args[1] == applyUpdateSubcommand {
-		return runApplyUpdate(os.Args[2:])
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case applyUpdateSubcommand:
+			return runApplyUpdate(os.Args[2:])
+		case clientSwitchSubcommand:
+			return runClientSwitch(os.Args[2:])
+		}
 	}
 
 	fs := flag.NewFlagSet("Vault-Agent", flag.ContinueOnError)
@@ -287,6 +294,33 @@ func runApplyUpdate(args []string) int {
 	return 0
 }
 
+// runClientSwitch 执行"客户端切换器"路径：等旧客户端退出 → 启动新版本 → 退出。
+//
+// 与 apply-update 一样，这条路径**不初始化日志、不获取单实例锁、不启动本地 HTTP**：
+// 切换器必须能在代理与客户端都已退出之后独立完成工作。
+func runClientSwitch(args []string) int {
+	fs := flag.NewFlagSet(clientSwitchSubcommand, flag.ContinueOnError)
+	pid := fs.Int("pid", 0, "需要等待退出的旧客户端 PID")
+	target := fs.String("target", "", "新版本客户端主程序（必填，绝对路径）")
+	version := fs.String("version", "", "新版本号（仅用于日志与传递给新进程）")
+	fallback := fs.String("fallback", "", "新版本启动失败时回退的旧客户端主程序（可选）")
+	timeout := fs.Duration("timeout", agent.DefaultUpdateTimeout, "等待旧客户端退出的超时")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	opt := agent.ClientSwitchOptions{
+		ClientPID:     *pid,
+		TargetExe:     *target,
+		TargetVersion: *version,
+		FallbackExe:   *fallback,
+		Timeout:       *timeout,
+	}
+	if err := agent.RunClientSwitch(context.Background(), opt, nil); err != nil {
+		return 1
+	}
+	return 0
+}
+
 // printUsage 打印 Vault-Agent 的完整用法（同时列出 serve 与 apply-update 两种模式）。
 func printUsage(w io.Writer, fs *flag.FlagSet) {
 	fs.SetOutput(w)
@@ -295,6 +329,7 @@ func printUsage(w io.Writer, fs *flag.FlagSet) {
 用法:
   Vault-Agent [选项]                 启动本地代理（默认 serve）
   Vault-Agent apply-update [选项]    以替换器身份运行（由自更新流程的临时副本调用）
+  Vault-Agent client-switch [选项]   以客户端切换器身份运行（等旧客户端退出后启动新版本）
 
 serve 选项:
 `)
@@ -307,6 +342,13 @@ apply-update 选项:
   -backup <path>  备份路径（可选）
   -restart        替换成功后启动 target
   -timeout <dur>  等待父进程退出的超时（默认 120s）
+
+client-switch 选项:
+  -pid <n>        需要等待退出的旧客户端 PID
+  -target <path>  新版本客户端主程序（必填，绝对路径）
+  -version <v>    新版本号（仅用于日志 / 传递给新进程）
+  -fallback <path> 新版本启动失败时回退的旧客户端主程序（可选）
+  -timeout <dur>  等待旧客户端退出的超时（默认 120s）
 
 说明:
   - 运行中的 exe 无法覆盖自身：自更新时本程序把**自身**复制为临时副本

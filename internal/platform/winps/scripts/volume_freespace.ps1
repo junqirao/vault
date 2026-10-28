@@ -19,24 +19,44 @@ try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 #
 # Get-Disk.MediaType 在新版 Windows 上直接给出 "SSD" / "HDD"，旧版可能只有 BusType，
 # 因此再做一次 NVMe 兜底。识别不出来返回 unknown —— 调用方按"未知"展示，不猜测。
+#
+# 目录模式（路径是一个普通目录、或卷没有盘符而是挂在文件夹上）同样要判定：
+# 先按盘符找分区，找不到就用 Get-Volume 的 Volume 对象找（-Volume 直接吃对象，
+# 不要求盘符），最后才退回按根目录反推盘符。之前只按盘符找，目录/无盘符卷一律 unknown。
 function Get-MediaType {
     param(
         [string]$DriveLetter,
-        [string]$Root
+        [string]$Root,
+        $Volume
     )
     try {
+        $partition = $null
         $letter = $DriveLetter
         if (-not $letter -and $Root) {
             $letter = $Root.TrimEnd('\').TrimEnd(':')
         }
-        if (-not $letter) { return 'unknown' }
-        $partition = Get-Partition -DriveLetter $letter -ErrorAction Stop | Select-Object -First 1
+        if ($letter) {
+            $partition = Get-Partition -DriveLetter $letter -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        }
+        if (-not $partition -and $Volume) {
+            $partition = Get-Partition -Volume $Volume -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+        }
         if (-not $partition) { return 'unknown' }
-        $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction Stop
+        $disk = Get-Disk -Number $partition.DiskNumber -ErrorAction SilentlyContinue
+        if (-not $disk) { return 'unknown' }
         $media = [string]$disk.MediaType
         if ($media -match 'SSD') { return 'ssd' }
         if ($media -match 'HDD') { return 'hdd' }
         if ([string]$disk.BusType -match 'NVMe') { return 'ssd' }
+        # 兜底：旧版系统上 Get-Disk.MediaType 可能是 Unspecified，改问物理盘。
+        $pd = Get-PhysicalDisk -DeviceNumber $partition.DiskNumber -ErrorAction SilentlyContinue
+        if ($pd) {
+            if (([string]$pd.MediaType) -match 'SSD') { return 'ssd' }
+            if (([string]$pd.MediaType) -match 'HDD') { return 'hdd' }
+            if (([string]$pd.BusType) -match 'NVMe') { return 'ssd' }
+        }
     } catch { }
     return 'unknown'
 }
@@ -48,7 +68,7 @@ try {
     try { $volume = Get-Volume -FilePath $Path -ErrorAction Stop } catch { $volume = $null }
 
     if ($volume -and $volume.Size) {
-        $mediaType = Get-MediaType -DriveLetter ([string]$volume.DriveLetter) -Root ''
+        $mediaType = Get-MediaType -DriveLetter ([string]$volume.DriveLetter) -Root '' -Volume $volume
         [pscustomobject]@{
             ok            = $true
             free          = [long]$volume.SizeRemaining

@@ -53,7 +53,7 @@ export interface RepoListProps {
    */
   onOpenUpload?: (uploadId: string) => void
   /**
-   * 打开客户端只读存储页（首页「存储」卡片的整卡点击）。
+   * 打开客户端只读存储页（首页「存储」卡片标题后的箭头按钮）。
    * 不传时（管理端列表）不渲染该卡片。
    */
   onOpenStorages?: () => void

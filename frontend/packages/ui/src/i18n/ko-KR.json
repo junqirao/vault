@@ -679,6 +679,7 @@
   "storage.usage.used": "사용",
   "storage.usage.remaining": "남음",
   "storage.usage.disabled": "중지됨",
+  "storage.usage.detail": "스토리지 상세 보기",
   "storage.create": "스토리지 생성",
   "storage.createFailed": "스토리지 생성 실패",
   "storage.edit": "스토리지 편집",

@@ -621,6 +621,7 @@
   "storage.usage.used": "Used",
   "storage.usage.remaining": "Remaining",
   "storage.usage.disabled": "Disabled",
+  "storage.usage.detail": "View storage details",
   "storage.create": "New storage",
   "storage.createFailed": "Could not create the storage",
   "storage.edit": "Edit storage",

@@ -159,8 +159,15 @@ func CleanupStaleUpdaterCopies(logger *slog.Logger) {
 		logger = slog.Default()
 	}
 	dir := filepath.Join(DataDir(), updateDirName)
-	matches, err := filepath.Glob(filepath.Join(dir, updaterCopyPrefix+"*.exe"))
-	if err != nil || len(matches) == 0 {
+	matches := make([]string, 0, 8)
+	for _, prefix := range []string{updaterCopyPrefix, clientSwitchPrefix} {
+		found, err := filepath.Glob(filepath.Join(dir, prefix+"*.exe"))
+		if err != nil {
+			continue
+		}
+		matches = append(matches, found...)
+	}
+	if len(matches) == 0 {
 		return
 	}
 	removed := 0

@@ -679,6 +679,7 @@
   "storage.usage.used": "使用済み",
   "storage.usage.remaining": "残り",
   "storage.usage.disabled": "停止中",
+  "storage.usage.detail": "ストレージの詳細を表示",
   "storage.create": "ストレージを作成",
   "storage.createFailed": "ストレージの作成に失敗しました",
   "storage.edit": "ストレージを編集",

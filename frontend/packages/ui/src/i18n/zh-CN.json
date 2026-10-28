@@ -679,6 +679,7 @@
   "storage.usage.used": "已用",
   "storage.usage.remaining": "剩余",
   "storage.usage.disabled": "已停用",
+  "storage.usage.detail": "查看存储详情",
   "storage.create": "新建存储",
   "storage.createFailed": "创建存储失败",
   "storage.edit": "编辑存储",

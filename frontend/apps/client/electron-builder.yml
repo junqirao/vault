@@ -52,6 +52,13 @@ afterPack: ./scripts/after-pack.cjs
 extraFiles:
   - from: build/Vault-Agent.exe
     to: Vault-Agent.exe
+  # 客户端本体更新的独立切换器（与 Vault.exe 同级）。
+  #
+  # 为什么必须是一个独立进程：Windows 不允许替换正在运行的 exe，而 Vault.exe 退出后
+  # 没有任何代码能再启动新版本。切换器负责"等旧客户端退出 → 启动新版本（失败回退旧版本）"。
+  # 源文件由 build.py 在调用 electron-builder 之前从 dist/ 复制到 build/ 下。
+  - from: build/Vault-Updator.exe
+    to: Vault-Updator.exe
 
 electronVersion: 32.2.0
 

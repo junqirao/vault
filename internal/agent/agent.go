@@ -143,6 +143,10 @@ type Agent struct {
 	web *webUpdateManager
 	// client 管理客户端本体更新（client，见 updateclient.go）。
 	client *clientUpdateManager
+	// clientSwitchStarted 标记"本次运行已经启动过客户端切换器"：切换器一旦启动，
+	// 客户端会在几秒内退出，重复请求只返回当前状态，不再拉起第二个切换器
+	// （否则两个切换器会各启动一个新客户端，抢单实例锁）。
+	clientSwitchStarted atomic.Bool
 	// updateStarted 标记"本次退出由自更新触发"：为 true 时退出流程不得卸载挂载
 	// （挂载由 updater 重启后的自动挂载恢复，见 update.go 的说明）。
 	updateStarted atomic.Bool

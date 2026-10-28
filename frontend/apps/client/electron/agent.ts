@@ -6,6 +6,8 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { app } from 'electron'
 
+import { agentDataDir } from './webapp'
+
 /**
  * 本地代理（Vault-Agent.exe）生命周期管理。
  *
@@ -77,6 +79,21 @@ const MAX_RESPONSE_BYTES = 8 << 20
 const AGENT_EXE_NAME = 'Vault-Agent.exe'
 /** 结束陈旧代理后等待其释放单实例锁的最长时间。 */
 const STALE_KILL_WAIT_MS = 3000
+/**
+ * 代理退出后延迟多久再拉起。
+ *
+ * 代理自更新时会先退出再由更新器拉起新进程；若客户端同时 spawn，两者抢
+ * `Global\VaultAgent` 互斥体，必有一方报错。留出这段时间让更新器先落位。
+ */
+const AGENT_RESTART_DELAY_MS = 2500
+/**
+ * 快速重启次数用尽后的慢速重试间隔。
+ *
+ * 不能永久停在 agent_crashed：代理起不来的原因（旧进程还没释放 `Global\VaultAgent`、
+ * 更新器正在替换 exe、文件被短暂占用）几乎都在几十秒内自愈。现场反馈的"更新完一片
+ * network.error、还要手动点重启服务"就是永久放弃造成的。
+ */
+const AGENT_SLOW_RESTART_MS = 30000
 /** 每次轮询"陈旧进程是否已退出"的间隔。 */
 const STALE_KILL_POLL_MS = 150
 
@@ -244,6 +261,8 @@ export class AgentManager {
   private restartTimes: number[] = []
   private stopping = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
+  /** 代理退出后的延迟重启定时器（见 AGENT_RESTART_DELAY_MS）。 */
+  private restartTimer: ReturnType<typeof setTimeout> | null = null
   /**
    * 额外的"可清理目录"。
    *
@@ -490,6 +509,10 @@ export class AgentManager {
   stop(): void {
     this.stopping = true
     this.clearReadyTimer()
+    if (this.restartTimer) {
+      clearTimeout(this.restartTimer)
+      this.restartTimer = null
+    }
     this.child?.kill()
     this.child = null
     this.publish({ available: false, baseUrl: null, token: null, error: 'stopped' })
@@ -542,6 +565,14 @@ export class AgentManager {
       // getAppPath 在极早期不可用时可忽略。
     }
     if (locatedExe) roots.add(path.dirname(locatedExe))
+    /*
+     * 本体更新会把客户端换到 `%ProgramData%\Vault\client\<版本>\` 这套目录里
+     * （见 clientUpdate.ts）。旧版本目录下的 Vault-Agent.exe 如果不清理，会一直占着
+     * `Global\VaultAgent`，导致新客户端拉不起代理 —— 界面一片 network.error，
+     * 只能手动点"重启服务"。把整个 client 根目录都纳入可清理范围：
+     * 这里清理的是"即将被本进程 spawn 的代理之外"的同名进程，当前版本的代理此时还没起。
+     */
+    roots.add(path.join(agentDataDir(), 'client'))
     for (const extra of this.extraRoots) roots.add(extra)
     return [...roots]
   }
@@ -711,11 +742,26 @@ export class AgentManager {
     this.clearReadyTimer()
     if (this.stopping) return
     if (!this.canRestart()) {
-      this.publish({ available: false, baseUrl: null, token: null, error: 'agent_crashed' })
+      // 快速重启配额用尽 → 退到慢速重试，而不是永久放弃（见 AGENT_SLOW_RESTART_MS）。
+      this.publish({ available: false, baseUrl: null, token: null, error: 'agent_restarting' })
+      this.restartTimer = setTimeout(() => {
+        this.restartTimer = null
+        if (this.stopping) return
+        this.restartTimes = []
+        void this.spawnOnce()
+      }, AGENT_SLOW_RESTART_MS)
       return
     }
     this.restartTimes.push(Date.now())
     this.publish({ available: false, baseUrl: null, token: null, error: 'agent_restarting' })
-    void this.spawnOnce()
+    // 代理"因自更新而退出"时，更新器会立刻拉起新进程。若这里同秒 spawn，两个进程
+    // 会抢 Global\VaultAgent，其中一个必然以 "Cannot create a file when that file
+    // already exists" 失败并把错误推到界面上 —— 用户看到的就是"更新完之后报错"。
+    // 稍等一会儿让更新器先落位，spawnOnce 里的 reapStaleAgent 再统一回收/接管。
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null
+      if (this.stopping) return
+      void this.spawnOnce()
+    }, AGENT_RESTART_DELAY_MS)
   }
 }

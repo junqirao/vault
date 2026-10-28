@@ -120,6 +120,9 @@ func (a *Agent) localMux() http.Handler {
 	// 客户端本体更新（client）：下载并准备新程序目录，由客户端主进程重启切换。
 	mux.HandleFunc("GET /agent/update/client", a.handleClientUpdateState)
 	mux.HandleFunc("POST /agent/update/client/apply", a.handleClientUpdateApply)
+	// 真正执行切换：代理拉起一个独立的切换器进程（等客户端退出 → 启动新版本），
+	// 客户端收到 202 后隐藏窗口、停掉代理、退出自己。见 clientswitch.go。
+	mux.HandleFunc("POST /agent/update/client/switch", a.handleClientUpdateSwitch)
 
 	mux.HandleFunc("POST /agent/shutdown", a.handleShutdown)
 
@@ -926,6 +929,24 @@ func (a *Agent) handleClientUpdateApply(w http.ResponseWriter, r *http.Request) 
 		_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req)
 	}
 	state := a.startClientUpdate(req.CurrentVersion)
+	a.writeJSON(w, http.StatusAccepted, map[string]any{"client_update": state})
+}
+
+// handleClientUpdateSwitch 启动独立的切换器进程（POST /agent/update/client/switch）。
+//
+// 与 apply 的分界：apply 只负责把新程序目录准备好（不改动正在运行的客户端）；
+// switch 才真正执行"关旧 → 启新"，而且**由切换器进程完成**，代理与客户端都不做替换动作。
+func (a *Agent) handleClientUpdateSwitch(w http.ResponseWriter, r *http.Request) {
+	var req ClientSwitchRequest
+	if err := decodeJSON(r, &req); err != nil {
+		a.writeError(w, err)
+		return
+	}
+	state, err := a.switchClient(req)
+	if err != nil {
+		a.writeError(w, err)
+		return
+	}
 	a.writeJSON(w, http.StatusAccepted, map[string]any{"client_update": state})
 }
 
