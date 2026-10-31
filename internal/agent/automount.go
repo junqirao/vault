@@ -161,9 +161,9 @@ func (a *Agent) restoreMounts(ctx context.Context, key string) {
 	// 永远停在"卸载中"（真实反馈："重启之后客户端一直提示在卸载中，这种名存实亡的"）。
 	a.finishInterruptedUnmounts(ctx)
 	if cfg.AutoMount {
-		a.restoreRecordedMounts(ctx, key, cfg.RepoMounts)
+		a.restoreRecordedMounts(ctx, key, cfg.RepoMounts, cfg.GroupMounts)
 	}
-	a.mountConfiguredRepos(ctx, key, cfg.RepoMounts)
+	a.mountConfiguredRepos(ctx, key, cfg.RepoMounts, cfg.GroupMounts)
 }
 
 // finishInterruptedUnmounts 补完"上次没收尾的卸载"：state=unmounting 的记录是进程死在卸载
@@ -235,7 +235,12 @@ func (a *Agent) pruneOrphanInitiatorSessions(ctx context.Context) {
 // 注意语义：服务端没有「本机应挂载哪些分配」的清单接口，因此这里只能恢复本代理上次运行
 // 留下的记录（这也是服务端重连后恢复挂载的可行路径）；"从来没挂过的库"由 per-repo 配置
 // 负责（见 mountConfiguredRepos）。
-func (a *Agent) restoreRecordedMounts(ctx context.Context, key string, prefs map[string]RepoMountPref) {
+func (a *Agent) restoreRecordedMounts(
+	ctx context.Context,
+	key string,
+	repoPrefs map[string]RepoMountPref,
+	groupPrefs map[string]RepoMountPref,
+) {
 	// 只恢复**归属这台服务端**的记录：多服务端下每台各自恢复自己的，互不代劳
 	// （拿 A 的分配 ID 去 B 上恢复必然失败）。
 	pending := a.store.MountsForServer(key)
@@ -261,9 +266,9 @@ func (a *Agent) restoreRecordedMounts(ctx context.Context, key string, prefs map
 		if item.State == MountStateError || item.State == MountStateRevoked {
 			continue
 		}
-		// 用户在库级配置里明确关掉了"启动后自动挂载"：不恢复这条记录（记录留着，
+		// 用户在库级/分组配置里明确关掉了"启动后自动挂载"：不恢复这条记录（记录留着，
 		// 界面仍能看到这个库的状态，等用户手动挂载或卸载）。
-		req, ok := recordedMountRequest(item, prefs)
+		req, ok := recordedMountRequest(item, repoPrefs, groupPrefs)
 		if !ok {
 			continue
 		}
@@ -291,10 +296,14 @@ func (a *Agent) restoreRecordedMounts(ctx context.Context, key string, prefs map
 }
 
 // recordedMountRequest 决定一条本地挂载记录在本次启动时的处置：
-//   - ok=false：用户在库级配置里明确关掉了该库的自动挂载，这条记录不恢复；
-//   - ok=true：返回可直接交给 mountEngine.restore 的请求，其中库级配置优先于记录里的旧值
+//   - ok=false：用户在库级（或作用于该库的分组）配置里明确关掉了该库的自动挂载，这条记录不恢复；
+//   - ok=true：返回可直接交给 mountEngine.restore 的请求，其中生效配置优先于记录里的旧值
 //     （记录里的形态/目录是上次用的，用户在配置里改过就该以配置为准）。
-func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (MountRequest, bool) {
+func recordedMountRequest(
+	item MountState,
+	repoPrefs map[string]RepoMountPref,
+	groupPrefs map[string]RepoMountPref,
+) (MountRequest, bool) {
 	req := MountRequest{
 		AllocationID: item.AllocationID,
 		MountMode:    item.MountMode,
@@ -307,7 +316,7 @@ func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (Moun
 		ServerURL:  item.ServerURL,
 		ServerName: item.ServerName,
 	}
-	pref, hasPref := prefs[item.RepoID]
+	pref, hasPref := autoMountPrefFor(item.RepoID, item.RepoGroup, repoPrefs, groupPrefs)
 	if !hasPref {
 		return req, true
 	}
@@ -324,6 +333,39 @@ func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (Moun
 	return req, true
 }
 
+// autoMountPrefFor 返回某个库在"启动后自动挂载"决策里实际生效的配置。
+//
+// 解析顺序必须与 mountEngine.mountPrefFor 完全一致：分组配置（该分组勾了「使用分组配置」
+// 且本库被勾选）优先覆盖单库配置，否则用单库配置。早先这里只读 cfg.RepoMounts，于是
+// 界面按分组显示"启动后自动挂载已开启"、启动时却一个都不挂（真实反馈："没有按照我的组
+// 配置进行启动后自动挂载"）。
+func autoMountPrefFor(
+	repoID string,
+	group string,
+	repoPrefs map[string]RepoMountPref,
+	groupPrefs map[string]RepoMountPref,
+) (RepoMountPref, bool) {
+	if gp, ok := groupMountPrefFor(group, repoID, groupPrefs); ok {
+		return gp, true
+	}
+	pref, ok := repoPrefs[repoID]
+	return pref, ok
+}
+
+// groupMountPrefFor 判断该库是否由分组配置接管，返回那份配置。
+// 判据与 mountEngine.groupOverride 相同：分组存在、勾了「使用分组配置」、且本库被勾选。
+func groupMountPrefFor(group, repoID string, groupPrefs map[string]RepoMountPref) (RepoMountPref, bool) {
+	group = strings.TrimSpace(group)
+	if group == "" {
+		return RepoMountPref{}, false
+	}
+	gp, ok := groupPrefs[group]
+	if !ok || !gp.UseForRepos || !gp.AppliesToRepo(repoID) {
+		return RepoMountPref{}, false
+	}
+	return gp, true
+}
+
 // mountConfiguredRepos 挂载配置里显式打开"启动后自动挂载"的库（每库独立）。
 //
 // 与恢复记录不同，这些库在本机可能从来没挂过（没有本地记录、甚至没有分配），
@@ -332,12 +374,35 @@ func recordedMountRequest(item MountState, prefs map[string]RepoMountPref) (Moun
 // ⚠️ 这里正是"手动卸载后马上又被挂回来"的入口：卸载删了记录，于是这个库看起来就是
 // "从来没挂过、但配置要求自动挂载"，任何一次会话建立（含令牌续期）都会重新挂上。
 // 因此必须先让开"用户本次运行手动卸载过"的库（见 manualUnmountGuard）。
-func (a *Agent) mountConfiguredRepos(ctx context.Context, key string, prefs map[string]RepoMountPref) {
-	if len(prefs) == 0 {
+func (a *Agent) mountConfiguredRepos(
+	ctx context.Context,
+	key string,
+	repoPrefs map[string]RepoMountPref,
+	groupPrefs map[string]RepoMountPref,
+) {
+	// 没人为任何库（含分组）打开过"启动后自动挂载"时直接返回：下面的库列表查询是网络请求，
+	// 不该在每次会话建立时都白跑一趟。
+	if !hasAutoMountIntent(repoPrefs, groupPrefs) {
 		return
 	}
 	userID := strings.TrimSpace(a.store.User(key).ID)
 	if userID == "" {
+		return
+	}
+
+	client, err := a.serverClientFor(key)
+	if err != nil {
+		a.logger.Warn("自动挂载配置指定的存储库失败：本地没有该服务端的会话", "server", key, "error", err)
+		return
+	}
+	// 库列表同时给出三样东西：库名（挂载点命名）、分组归属（分组配置据此生效）、
+	// 以及"这个库是不是这台的"的判据（见下）。
+	repos, err := a.repoInfos(ctx, client)
+	if err != nil {
+		// 多服务端的关键一步：库级配置是按**库 ID** 存的，而库 ID 只对"它所属的那台服务端"
+		// 有意义。拿 A 的库 ID 去 B 上建分配只会得到一串失败记录，所以查不到列表就不再往下走
+		// （连不上/无权限时也一样：宁可这一轮不挂，也不要在错的台子上瞎试）。
+		a.logger.Warn("自动挂载：查询存储库列表失败，本台跳过自动挂载", "server", key, "error", err)
 		return
 	}
 
@@ -349,26 +414,7 @@ func (a *Agent) mountConfiguredRepos(ctx context.Context, key string, prefs map[
 			recorded[m.RepoID] = struct{}{}
 		}
 	}
-	todo := configuredAutoMountTargets(prefs, recorded, a.manualUnmounts.blocked)
-	if len(todo) == 0 {
-		return
-	}
-
-	client, err := a.serverClientFor(key)
-	if err != nil {
-		a.logger.Warn("自动挂载配置指定的存储库失败：本地没有该服务端的会话", "server", key, "error", err)
-		return
-	}
-	// 库名用于卷标与目录命名；同时它还是"这个库是不是这台的"的判据（见下）。
-	names, err := a.repoNames(ctx, client)
-	if err != nil {
-		// 多服务端的关键一步：库级配置是按**库 ID** 存的，而库 ID 只对"它所属的那台服务端"
-		// 有意义。拿 A 的库 ID 去 B 上建分配只会得到一串失败记录，所以查不到列表就不再往下走
-		// （连不上/无权限时也一样：宁可这一轮不挂，也不要在错的台子上瞎试）。
-		a.logger.Warn("自动挂载：查询存储库列表失败，本台跳过自动挂载", "server", key, "error", err)
-		return
-	}
-	todo = filterReposOnServer(todo, names)
+	todo := configuredAutoMountTargets(repoPrefs, groupPrefs, repos, recorded, a.manualUnmounts.blocked)
 	if len(todo) == 0 {
 		return
 	}
@@ -389,7 +435,10 @@ func (a *Agent) mountConfiguredRepos(ctx context.Context, key string, prefs map[
 				a.logger.Warn("自动挂载：准备分配失败", "server", key, "repo_id", item.repoID, "error", err)
 				return
 			}
-			req.RepoName = names[item.repoID]
+			req.RepoName = repos[item.repoID].Name
+			// 分组名必须随请求带上：挂载参数解析（缓存/直连/形态）与挂载记录都按它找回
+			// 分组配置，否则自动挂出来的库会用库自己的（可能被分组覆盖掉的）配置。
+			req.RepoGroup = repos[item.repoID].Group
 			if _, err := a.engine.restore(ctx, req); err != nil {
 				a.logger.Warn("自动挂载失败", "repo_id", item.repoID, "allocation_id", req.AllocationID, "error", err)
 				a.markMountError(req.AllocationID, "automount", err)
@@ -399,29 +448,68 @@ func (a *Agent) mountConfiguredRepos(ctx context.Context, key string, prefs map[
 	wg.Wait()
 }
 
+// hasAutoMountIntent 判断配置里是否存在"启动后自动挂载"的明确表态（单库或分组）。
+//
+// 只用来省掉一次库列表查询：真正该挂谁仍由 configuredAutoMountTargets 决定。
+func hasAutoMountIntent(repoPrefs, groupPrefs map[string]RepoMountPref) bool {
+	for _, pref := range repoPrefs {
+		if pref.AutoMount {
+			return true
+		}
+	}
+	for _, pref := range groupPrefs {
+		// 分组配置只有开了「使用分组配置」才会作用到组内的库上。
+		if pref.UseForRepos && pref.AutoMount {
+			return true
+		}
+	}
+	return false
+}
+
 // autoMountTarget 是一个"本次运行该自动挂载的库"及其配置。
 type autoMountTarget struct {
 	repoID string
 	pref   RepoMountPref
 }
 
-// configuredAutoMountTargets 从每库配置里挑出**本次运行该自动挂载**的库（顺序无关，按库 ID 排序稳定输出）。
+// configuredAutoMountTargets 挑出**本次运行该自动挂载**的库（按库 ID 排序稳定输出）。
+//
+// 候选集是"单库配置的库 ∪ 服务端库列表里的库"：后者不可省 —— 分组配置可能作用于一个
+// 从来没单独配过的库，而分组归属只有库列表知道。
 //
 // 三条排除规则：
-//   - 配置里 auto_mount=false：用户明确关掉了这个库的自动挂载；
+//   - 生效配置（分组优先，见 autoMountPrefFor）里 auto_mount=false：用户明确关掉了这个库；
 //   - 本机已有记录（recorded）：交给 restoreRecordedMounts，这里只补"从来没挂过"的；
 //   - blocked 判定为真（用户本次运行手动卸载过）：配置压不过用户的那一次点击
 //     （见 manualUnmountGuard，这就是"卸载后马上又被挂回来"的修复点）。
 //
+// 另外它顺带完成"这个库在不在这台服务端上"的过滤：库 ID 由服务端生成，只有它认得自己的库，
+// 多服务端下必须过滤，否则会拿 A 的库 ID 去 B 上建分配（必然失败）。
+//
 // 抽成纯函数是因为它是"该不该自动挂"的唯一判据：策略被单独测试，调用方只负责执行。
 func configuredAutoMountTargets(
-	prefs map[string]RepoMountPref,
+	repoPrefs map[string]RepoMountPref,
+	groupPrefs map[string]RepoMountPref,
+	repos map[string]repoMountInfo,
 	recorded map[string]struct{},
 	blocked func(repoID string) bool,
 ) []autoMountTarget {
-	out := make([]autoMountTarget, 0, len(prefs))
-	for repoID, pref := range prefs {
-		if !pref.AutoMount {
+	candidates := make(map[string]struct{}, len(repoPrefs)+len(repos))
+	for repoID := range repoPrefs {
+		candidates[repoID] = struct{}{}
+	}
+	for repoID := range repos {
+		candidates[repoID] = struct{}{}
+	}
+
+	out := make([]autoMountTarget, 0, len(candidates))
+	for repoID := range candidates {
+		pref, ok := autoMountPrefFor(repoID, repos[repoID].Group, repoPrefs, groupPrefs)
+		if !ok || !pref.AutoMount {
+			continue
+		}
+		// 不在库列表里（本机留着的旧配置）或记录里已有 → 跳过。
+		if _, ok := repos[repoID]; !ok {
 			continue
 		}
 		if _, ok := recorded[repoID]; ok {
@@ -434,20 +522,6 @@ func configuredAutoMountTargets(
 	}
 	// 稳定的遍历顺序：日志与测试输出不会因 map 迭代顺序而变。
 	sort.Slice(out, func(i, j int) bool { return out[i].repoID < out[j].repoID })
-	return out
-}
-
-// filterReposOnServer 只保留"确实存在于该服务端"的自动挂载目标。
-//
-// 依据是服务端返回的库列表：库 ID 由服务端生成，只有它认得自己的库。库级自动挂载配置是本地
-// 按库 ID 存的，多服务端下必须这一步过滤，否则会拿 A 的库 ID 去 B 上建分配（必然失败）。
-func filterReposOnServer(targets []autoMountTarget, names map[string]string) []autoMountTarget {
-	out := make([]autoMountTarget, 0, len(targets))
-	for _, item := range targets {
-		if _, ok := names[item.repoID]; ok {
-			out = append(out, item)
-		}
-	}
 	return out
 }
 
@@ -490,25 +564,31 @@ func (a *Agent) primeRepoSizeIndex(ctx context.Context, key string, prefs map[st
 	}
 	queryCtx, cancel := context.WithTimeout(ctx, serverRequestTimeout)
 	defer cancel()
-	if _, err := a.repoNames(queryCtx, client); err != nil {
+	if _, err := a.repoInfos(queryCtx, client); err != nil {
 		a.logger.Warn("读取存储库容量失败，本次缓存配额按已知容量分摊",
 			"server", key, "error", err)
 	}
 }
 
-// repoNames 返回"存储库 ID -> 名称"（仅该服务端可见的库）。
+// repoMountInfo 是自动挂载决策需要的库元信息：名字用于挂载点命名，分组决定哪份配置生效。
+type repoMountInfo struct {
+	Name  string
+	Group string
+}
+
+// repoInfos 返回"存储库 ID -> 元信息"（仅该服务端可见的库）。
 //
 // 顺带把库容量喂给缓存管理器：缓存预算按库容量分摊，而挂载参数里只带**本库**的容量，
 // 这里是唯一一次能拿到全部库容量的地方（见 cacheproxy.go 的 splitCacheBudget）。
-func (a *Agent) repoNames(ctx context.Context, client *serverClient) (map[string]string, error) {
+func (a *Agent) repoInfos(ctx context.Context, client *serverClient) (map[string]repoMountInfo, error) {
 	repos, err := client.ListRepos(ctx)
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]string, len(repos))
+	out := make(map[string]repoMountInfo, len(repos))
 	sizes := make(map[string]int64, len(repos))
 	for _, repo := range repos {
-		out[repo.ID] = repo.Name
+		out[repo.ID] = repoMountInfo{Name: repo.Name, Group: strings.TrimSpace(repo.Group)}
 		if repo.CapacityBytes > 0 {
 			sizes[repo.ID] = repo.CapacityBytes
 		}

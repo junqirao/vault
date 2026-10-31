@@ -48,6 +48,21 @@ const DEV_SERVER_URL = process.env.VITE_DEV_SERVER_URL
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let quitting = false
+/**
+ * 启动后是否"只留在托盘里"（不把窗口摆到桌面上）。
+ *
+ * 需求（真实反馈）：客户端启动后应当在后台完成自动挂载，不要留一个窗口在外面；
+ * 右下角托盘图标就够用了，要看界面再点托盘。
+ *
+ * 打开窗口的入口因此收敛到托盘（单击 / 菜单「显示窗口」）与重复启动
+ * （second-instance，再点一次快捷方式就会把窗口叫出来）。
+ *
+ * 例外（这三种情况照常显示窗口）：
+ *   - 开发态（VITE_DEV_SERVER_URL）：调试时不希望每次都被藏起来；
+ *   - 显式带 `--window` / `--show` 参数：排障时的逃生口；
+ *   - 托盘创建失败（见 createTray）：没有托盘图标就没有任何入口，必须显示窗口。
+ */
+let startHidden = !DEV_SERVER_URL && !process.argv.some((arg) => arg === '--window' || arg === '--show')
 /** 客户端本体更新的运行期守护（见 clientUpdate.ts）；退出时停掉，避免往回连。 */
 let clientUpdateWatch: ClientUpdateWatch | null = null
 /**
@@ -669,11 +684,18 @@ async function createWindow(): Promise<void> {
       preload: path.join(__dirname, 'preload.js'),
       nodeIntegration: false,
       contextIsolation: true,
-      sandbox: true
+      sandbox: true,
+      // 窗口可能长时间藏在托盘里：不能让 Chromium 把隐藏窗口的定时器节流掉，
+      // 否则渲染层的会话保活 / 挂载状态刷新会变成"一分钟才动一次"。
+      backgroundThrottling: false
     }
   })
 
-  mainWindow.once('ready-to-show', () => mainWindow?.show())
+  // 启动即隐藏（见 startHidden）：窗口照样加载界面，只是不显示 —— 自动登录、
+  // 会话推送、自动挂载都发生在渲染层与本地代理里，不需要窗口可见。
+  mainWindow.once('ready-to-show', () => {
+    if (!startHidden) mainWindow?.show()
+  })
 
   const persistState = async (): Promise<void> => {
     if (!mainWindow || mainWindow.isDestroyed()) return
@@ -918,10 +940,17 @@ function createTray(): void {
   } catch {
     // 无图形环境（如 CI）时静默跳过托盘，不影响窗口本身。
     tray = null
+    // 没有托盘 = 用户没有任何入口把隐藏的窗口叫出来：必须显示窗口。
+    // 窗口可能还没建好（createTray 先于 createWindow）：只撤销"隐藏启动"，
+    // 由 ready-to-show 正常把窗口显示出来。
+    startHidden = false
+    if (mainWindow) showWindow()
   }
 }
 
 function showWindow(): void {
+  // 用户主动要窗口：此后的重建（关闭 → 托盘 → 再打开）都照常显示。
+  startHidden = false
   if (!mainWindow) {
     void createWindow()
     return
@@ -1133,8 +1162,10 @@ function startPrimaryInstance(): void {
     // 代理必须先于窗口起来：启动期更新门要向它确认"有没有新版本、能不能装"，
     // 而那道门在 createWindow 里、加载界面之前。找不到可执行文件时进入降级模式，不影响窗口。
     agent.start()
-    await createWindow()
+    // 托盘先于窗口创建：窗口默认是**隐藏**启动的（见 startHidden），而启动期更新门可能
+    // 让 createWindow 停留数秒 —— 托盘图标这时是用户唯一能看到的"客户端已经起来了"。
     createTray()
+    await createWindow()
     // 客户端本体更新：请求代理准备新版本（下载/校验/解压），就绪且无活跃挂载时切换。
     // 有挂载时绝不重启——重启会掐断 iSCSI 会话（见 docs/implementation.md §7.4.4）。
     clientUpdateWatch = startClientUpdateWatch(agent, bundledVersion, {
@@ -1143,10 +1174,7 @@ function startPrimaryInstance(): void {
     // 开机自启：等代理就绪后把系统自启项对齐到配置里的开关。这一步同时负责修复
     // "本体更新换了程序目录，自启项还指着已清理的旧 exe"（见 autostart.ts 的文件头）。
     void syncAutoStartFromAgent()
-    app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) void createWindow()
-      else showWindow()
-    })
+    app.on('activate', () => showWindow())
   })
 
   // 关闭窗口时保留托盘（真正退出走托盘菜单或系统退出）。

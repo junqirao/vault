@@ -110,7 +110,9 @@ func TestRecordedMountRequestPrefPolicy(t *testing.T) {
 	}
 	cases := []struct {
 		name      string
+		group     string
 		prefs     map[string]RepoMountPref
+		groups    map[string]RepoMountPref
 		wantMount bool
 		wantMode  string
 		wantPath  string
@@ -145,11 +147,51 @@ func TestRecordedMountRequestPrefPolicy(t *testing.T) {
 			wantMode:  mountModeLetter,
 			wantPath:  `E:\`,
 		},
+		{
+			// 真实反馈："没有按照我的组配置进行启动后自动挂载"：分组配置接管了本库时，
+			// 单库配置里那个（界面上已置灰的）auto_mount=false 不能压过分组的 auto_mount=true。
+			name:  "分组配置接管并开了自动挂载 → 按分组恢复",
+			group: "财务",
+			prefs: map[string]RepoMountPref{"repo-a": {AutoMount: false}},
+			groups: map[string]RepoMountPref{"财务": {
+				UseForRepos: true,
+				AutoMount:   true,
+				MountMode:   mountModeDirectory,
+				MountDir:    `F:\vault\共享`,
+			}},
+			wantMount: true,
+			wantMode:  mountModeDirectory,
+			wantPath:  `F:\vault\共享`,
+		},
+		{
+			name:      "分组配置接管但关掉了自动挂载 → 不恢复",
+			group:     "财务",
+			prefs:     map[string]RepoMountPref{"repo-a": {AutoMount: true}},
+			groups:    map[string]RepoMountPref{"财务": {UseForRepos: true, AutoMount: false}},
+			wantMount: false,
+		},
+		{
+			name:      "分组没勾选本库 → 退回单库配置",
+			group:     "财务",
+			prefs:     map[string]RepoMountPref{"repo-a": {AutoMount: false}},
+			groups:    map[string]RepoMountPref{"财务": {UseForRepos: true, AutoMount: true, UseRepos: []string{"repo-b"}}},
+			wantMount: false,
+		},
+		{
+			name:      "分组没开「使用分组配置」 → 退回单库配置并恢复",
+			group:     "财务",
+			groups:    map[string]RepoMountPref{"财务": {UseForRepos: false, AutoMount: false}},
+			wantMount: true,
+			wantMode:  mountModeLetter,
+			wantPath:  `E:\`,
+		},
 	}
 
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			req, ok := recordedMountRequest(record, c.prefs)
+			rec := record
+			rec.RepoGroup = c.group
+			req, ok := recordedMountRequest(rec, c.prefs, c.groups)
 			if ok != c.wantMount {
 				t.Fatalf("是否恢复 = %v，期望 %v", ok, c.wantMount)
 			}
@@ -184,24 +226,72 @@ func TestConfiguredAutoMountTargetsSkipsManuallyUnmounted(t *testing.T) {
 	}
 	// repo-recorded 已有本地记录 → 由 restoreRecordedMounts 负责，这里不重复处理。
 	recorded := map[string]struct{}{"repo-recorded": {}}
+	repos := map[string]repoMountInfo{
+		"repo-auto":     {Name: "自动"},
+		"repo-off":      {Name: "关掉"},
+		"repo-recorded": {Name: "已挂"},
+		"repo-manual":   {Name: "手动卸载"},
+	}
 
-	if got := joinAutoMountTargetIDs(configuredAutoMountTargets(prefs, recorded, guard.blocked)); got != "repo-auto" {
+	if got := joinAutoMountTargetIDs(configuredAutoMountTargets(prefs, nil, repos, recorded, guard.blocked)); got != "repo-auto" {
 		t.Fatalf("手动卸载 repo-manual 后该自动挂载的库 = %q，期望 %q", got, "repo-auto")
 	}
 
 	// 没手动卸载过的库必须照旧自动挂载：修复不能演变成"自动挂载整体失效"。
 	want := "repo-auto,repo-manual,repo-recorded"
-	if got := joinAutoMountTargetIDs(configuredAutoMountTargets(prefs, map[string]struct{}{}, func(string) bool { return false })); got != want {
+	if got := joinAutoMountTargetIDs(configuredAutoMountTargets(prefs, nil, repos, map[string]struct{}{}, func(string) bool { return false })); got != want {
 		t.Fatalf("未手动卸载时该自动挂载的库 = %q，期望 %q", got, want)
 	}
 
 	// 只挡被点过卸载的那一个库，别的库不受牵连。
 	if got := joinAutoMountTargetIDs(configuredAutoMountTargets(
 		map[string]RepoMountPref{"repo-manual": {AutoMount: true}, "repo-other": {AutoMount: true}},
+		nil,
+		map[string]repoMountInfo{"repo-manual": {}, "repo-other": {}},
 		map[string]struct{}{},
 		guard.blocked,
 	)); got != "repo-other" {
 		t.Fatalf("黑名单只应挡 repo-manual，实际自动挂载 = %q，期望 %q", got, "repo-other")
+	}
+}
+
+// TestConfiguredAutoMountTargetsHonoursGroupPref 锁定"分组配置能带动组内库自动挂载"。
+//
+// 真实反馈："没有按照我的组配置进行启动后自动挂载"。分组配置（勾了「使用分组配置」）
+// 就是组内库的生效配置，界面也按它显示；启动自动挂载必须同一套口径：
+//   - 组内库即使**没有单独配置**也要被挂上（这是旧实现最大的漏点：只遍历 cfg.RepoMounts）；
+//   - 分组优先于单库配置（组内 auto_mount=true 时，单库里那个已置灰的 false 不算数）；
+//   - 未勾选的库、其它分组的库、以及没开「使用分组配置」的分组都不受影响。
+func TestConfiguredAutoMountTargetsHonoursGroupPref(t *testing.T) {
+	repoPrefs := map[string]RepoMountPref{
+		"repo-unconfigured": {AutoMount: false}, // 界面上已被分组配置置灰
+		"repo-other-group":  {AutoMount: true},  // 不在本组：仍按自己的配置
+	}
+	groupPrefs := map[string]RepoMountPref{
+		"财务": {
+			UseForRepos: true,
+			AutoMount:   true,
+			UseRepos:    []string{"repo-unconfigured", "repo-picked"},
+		},
+		"研发": {UseForRepos: false, AutoMount: false},
+	}
+	repos := map[string]repoMountInfo{
+		"repo-unconfigured": {Name: "未单独配置", Group: "财务"},
+		"repo-picked":       {Name: "勾选", Group: "财务"},
+		"repo-unpicked":     {Name: "未勾选", Group: "财务"},
+		"repo-other-group":  {Name: "别的组", Group: "研发"},
+	}
+
+	got := joinAutoMountTargetIDs(configuredAutoMountTargets(repoPrefs, groupPrefs, repos, nil, func(string) bool { return false }))
+	want := "repo-other-group,repo-picked,repo-unconfigured"
+	if got != want {
+		t.Fatalf("分组配置驱动的自动挂载 = %q，期望 %q", got, want)
+	}
+
+	// 分组没开「使用分组配置」时，组内库仍各用各的配置（repo-unpicked 没有任何配置 → 不挂）。
+	passive := map[string]RepoMountPref{"财务": {UseForRepos: false, AutoMount: true}}
+	if got := joinAutoMountTargetIDs(configuredAutoMountTargets(repoPrefs, passive, repos, nil, func(string) bool { return false })); got != "repo-other-group" {
+		t.Fatalf("未启用分组配置时自动挂载 = %q，期望 %q", got, "repo-other-group")
 	}
 }
 

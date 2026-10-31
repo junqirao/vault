@@ -440,8 +440,13 @@ type repoListItem struct {
 	// CapacityBytes 是库容量（建库时设定的那块盘的大小，服务端读时派生）。
 	//
 	// 本机缓存预算按库容量分摊，而挂载参数里只有"这个库"的容量：这里是一次能拿到
-	// **全部**库容量的地方，因此顺带喂给缓存管理器（见 automount.go 的 repoNames）。
+	// **全部**库容量的地方，因此顺带喂给缓存管理器（见 automount.go 的 repoInfos）。
 	CapacityBytes int64 `json:"capacity_bytes"`
+	// Group 是库所属分组（服务端 repoDTO.group）。
+	//
+	// 自动挂载要按"分组配置优先于单库配置"解析（与挂载时的 mountPrefFor 同口径，见
+	// automount.go 的 autoMountPrefFor），而库 ID 本身看不出分组归属 —— 只能从这里取。
+	Group string `json:"group"`
 }
 
 // CreateUpload 调用 POST /v1/uploads 创建分块上传会话。
