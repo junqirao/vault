@@ -9,6 +9,7 @@ import {
   awaitStartupClientUpdate,
   logClientUpdate,
   maybeHandoffOnStartup,
+  setHiddenStartProbe,
   startClientUpdateWatch,
   type ClientUpdateWatch,
   type StartupUpdateStatus
@@ -49,20 +50,46 @@ let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let quitting = false
 /**
- * 启动后是否"只留在托盘里"（不把窗口摆到桌面上）。
+ * "启动即隐藏"的环境变量。
  *
- * 需求（真实反馈）：客户端启动后应当在后台完成自动挂载，不要留一个窗口在外面；
- * 右下角托盘图标就够用了，要看界面再点托盘。
- *
- * 打开窗口的入口因此收敛到托盘（单击 / 菜单「显示窗口」）与重复启动
- * （second-instance，再点一次快捷方式就会把窗口叫出来）。
- *
- * 例外（这三种情况照常显示窗口）：
- *   - 开发态（VITE_DEV_SERVER_URL）：调试时不希望每次都被藏起来；
- *   - 显式带 `--window` / `--show` 参数：排障时的逃生口；
- *   - 托盘创建失败（见 createTray）：没有托盘图标就没有任何入口，必须显示窗口。
+ * 只在**本体更新**这条路上用：切换器（Vault-Updator.exe / 代理侧切换器）拉起新版本时
+ * 命令行参数到不了新进程，由本进程通过环境变量把"这次是后台启动"传下去
+ * （见 clientUpdate.ts 的 launchUpdator），否则自动更新一换版本，登录后又弹出窗口。
  */
-let startHidden = !DEV_SERVER_URL && !process.argv.some((arg) => arg === '--window' || arg === '--show')
+const CLIENT_HIDDEN_ENV = 'VAULT_CLIENT_HIDDEN'
+
+/** 自启项在命令行上传入的参数（与 autostart.ts 的 AUTOSTART_HIDDEN_ARG 一致）。 */
+const CLIENT_HIDDEN_ARG = '--hidden'
+
+/**
+ * 这一次启动要不要只留托盘（不把窗口摆到桌面上）。
+ *
+ * **只有开机自启那一次**该藏起来：登录后客户端在后台完成自动登录与自动挂载，右下角
+ * 托盘图标就够用。用户自己双击启动**必须出窗口** —— 区别只在命令行参数上，
+ * 不看配置、不留持久状态。
+ *
+ * ⚠️ 这里曾经写成"默认隐藏，只有带 `--window` 才显示"，结果正常双击启动也不出窗口，
+ * 用户看到的就是"点了图标什么都不发生"（真实反馈："正常打开的还是要出来窗口啊"）。
+ * 判定方向必须是**白名单**：只有明确标记了"我是自启拉起来的"才隐藏。
+ *
+ * 例外/兜底：
+ *   - 开发态（VITE_DEV_SERVER_URL）：调试时不希望每次都被藏起来；
+ *   - 显式带 `--window` / `--show`：优先于 `--hidden`，排障时的逃生口；
+ *   - 托盘创建失败（见 createTray）：没有托盘图标就没有任何入口，必须显示窗口；
+ *   - 本体更新换版本后的新实例：靠 CLIENT_HIDDEN_ENV 继承（更新期间窗口本来就被藏了）。
+ */
+function wantsHiddenStart(argv: readonly string[], env: NodeJS.ProcessEnv): boolean {
+  if (argv.some((arg) => arg === '--window' || arg === '--show')) return false
+  if (argv.some((arg) => arg === CLIENT_HIDDEN_ARG)) return true
+  return env[CLIENT_HIDDEN_ENV] === '1'
+}
+
+let startHidden = !DEV_SERVER_URL && wantsHiddenStart(process.argv, process.env)
+
+// 把"这次是后台启动"写回环境变量：本机代理（agent.ts 的 spawn 没传 env）等子进程靠继承，
+// 它们再拉起客户端（切换器 / 代理侧切换器）时不至于把这个语义弄丢。只写不删：值为 '1' 才是
+// 隐藏，其余一律显示，残留的 '0' 无害。
+if (startHidden) process.env[CLIENT_HIDDEN_ENV] = '1'
 /** 客户端本体更新的运行期守护（见 clientUpdate.ts）；退出时停掉，避免往回连。 */
 let clientUpdateWatch: ClientUpdateWatch | null = null
 /**
@@ -691,8 +718,8 @@ async function createWindow(): Promise<void> {
     }
   })
 
-  // 启动即隐藏（见 startHidden）：窗口照样加载界面，只是不显示 —— 自动登录、
-  // 会话推送、自动挂载都发生在渲染层与本地代理里，不需要窗口可见。
+  // 自启那一次隐藏（见 startHidden）：界面照样加载，只是不显示 —— 自动登录、会话推送、
+  // 自动挂载都发生在渲染层与本地代理里，不需要窗口可见；用户双击启动则照常显示。
   mainWindow.once('ready-to-show', () => {
     if (!startHidden) mainWindow?.show()
   })
@@ -1110,7 +1137,16 @@ async function takeoverOlderInstance(): Promise<TakeoverOutcome> {
 
 /** 作为主实例运行（唯一实例，正常路径）。 */
 function startPrimaryInstance(): void {
-  app.on('second-instance', () => showWindow())
+  // 用户又点了一次图标（或计划任务的第二条触发）→ 把窗口叫出来。
+  //
+  // 但**自启拉起的那一次**不算"用户要窗口"：登录时若已有实例在跑（例如 Run 项与计划
+  // 任务同时触发、或本体更新刚换完版本），第二条命令同样带 `--hidden`，不能因此弹窗。
+  app.on('second-instance', (_event, argv) => {
+    if (wantsHiddenStart(argv, {})) return
+    showWindow()
+  })
+  // 让本体更新切换器知道"这次是不是后台启动"（见 clientUpdate.ts 的 launchUpdator）。
+  setHiddenStartProbe(() => startHidden)
 
   app.whenReady().then(async () => {
     // 应用自带完整 UI，不需要 Electron 默认的 File/Edit/View/Window/Help 菜单栏。
@@ -1162,7 +1198,7 @@ function startPrimaryInstance(): void {
     // 代理必须先于窗口起来：启动期更新门要向它确认"有没有新版本、能不能装"，
     // 而那道门在 createWindow 里、加载界面之前。找不到可执行文件时进入降级模式，不影响窗口。
     agent.start()
-    // 托盘先于窗口创建：窗口默认是**隐藏**启动的（见 startHidden），而启动期更新门可能
+    // 托盘先于窗口创建：自启那一次是**隐藏**启动的（见 startHidden），而启动期更新门可能
     // 让 createWindow 停留数秒 —— 托盘图标这时是用户唯一能看到的"客户端已经起来了"。
     createTray()
     await createWindow()

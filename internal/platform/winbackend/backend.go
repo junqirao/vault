@@ -300,10 +300,10 @@ func (b *Backend) FileSystemOf(ctx context.Context, path string) (string, error)
 //
 // ⚠️ spec.ReadOnly 在 Windows 侧被忽略：IscsiTarget 模块没有 per-mapping 的只读开关，
 // 只读一直是由客户端挂载方式承担的，见 platform.TargetSpec 注释。
-func (b *Backend) EnsureTarget(ctx context.Context, spec platform.TargetSpec) error {
+func (b *Backend) EnsureTarget(ctx context.Context, spec platform.TargetSpec) (*platform.TargetInfo, error) {
 	if spec.BackingRef != "" {
 		if err := b.Iscsi.ImportVirtualDisk(ctx, spec.BackingRef, "vault:"+spec.Name); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -327,7 +327,11 @@ func (b *Backend) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 		// 无盘可映射（例如"仅停用目标"的最小期望状态）：没有映射约束，直接下发启用状态。
 		enabled := spec.Enabled
 		opt.Enabled = &enabled
-		return b.Iscsi.SetTarget(ctx, spec.Name, opt)
+		info, err := b.Iscsi.SetTargetInfo(ctx, spec.Name, opt)
+		if err != nil {
+			return nil, err
+		}
+		return toTargetInfo(info), nil
 	}
 
 	// ①②③ 先建/更新目标（不改启用状态）→ 建立映射。
@@ -336,19 +340,24 @@ func (b *Backend) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 	// 把"其实没登记/没映射"这类真因掩盖成更难查的隐性故障。
 	if err := b.Iscsi.SetTarget(ctx, spec.Name, opt); err != nil {
 		b.Iscsi.ForgetImported(spec.BackingRef)
-		return err
+		return nil, err
 	}
 	if err := b.Iscsi.AddMapping(ctx, spec.Name, spec.BackingRef); err != nil {
 		b.Iscsi.ForgetImported(spec.BackingRef)
-		return err
+		return nil, err
 	}
 	// ④ 映射就绪后再收敛启用状态（单独一次调用，不带任何其它字段）。
+	//
+	// 用 SetTargetInfo 而不是 SetTarget：脚本在启用后的回读校验里本来就拿到了平台实际状态
+	// （目标名被 Windows 改写后的真实 IQN、授权列表、映射），带上来就不必让上层再花
+	// 5~7 秒单独读一次（见 iscsitarget.Manager.SetTargetInfo 的说明）。
 	enabled := spec.Enabled
-	if err := b.Iscsi.SetTarget(ctx, spec.Name, iscsitarget.SetTargetOptions{Enabled: &enabled}); err != nil {
+	info, err := b.Iscsi.SetTargetInfo(ctx, spec.Name, iscsitarget.SetTargetOptions{Enabled: &enabled})
+	if err != nil {
 		b.Iscsi.ForgetImported(spec.BackingRef)
-		return err
+		return nil, err
 	}
-	return nil
+	return toTargetInfo(info), nil
 }
 
 // RemoveTarget 删除目标（含其名下全部映射与授权）。幂等。
@@ -508,6 +517,11 @@ const hyperVProbeScript = `$cmd = Get-Command -Name Set-VHD -ErrorAction Silentl
 // 两个同名类型（iscsitarget.TargetInfo / platform.TargetInfo）的存在，
 // 正是本适配层需要承担"翻译"职责的原因。
 func toTargetInfo(info *iscsitarget.TargetInfo) *platform.TargetInfo {
+	if info == nil {
+		// 脚本没有顺带读回（例如本次没动启用状态）：返回 nil 表示"未知"，
+		// 调用方需要实际状态就自己再读一次（见 platform.IscsiBackend.EnsureTarget）。
+		return nil
+	}
 	return &platform.TargetInfo{
 		Name:       info.Name,
 		IQN:        info.IQN,

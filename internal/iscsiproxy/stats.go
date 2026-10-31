@@ -30,6 +30,11 @@ type StatsSnapshot struct {
 	Passthrough int64
 	// Degraded counts sessions that fell back to a pure byte splice.
 	Degraded int64
+	// PendingDropped counts read observations a session could not stage: the
+	// in-flight table or its staging-buffer budget was full. Each drop only costs
+	// a future cache miss, but a value that keeps growing means the table is not
+	// draining and the session is no longer warming the cache from its traffic.
+	PendingDropped int64
 }
 
 // Stats aggregates one target's cache and forwarding counters. Its shape mirrors

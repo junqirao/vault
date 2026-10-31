@@ -81,6 +81,11 @@ func (b *invBackend) handle(bc net.Conn) {
 		case iscsi.SCSIRead10:
 			lba := uint32(binary.BigEndian.Uint32(cdb[2:6]))
 			b.record(lba)
+			if lba == invFailLBA {
+				// 失败读：后端用 SCSI Response 收尾，不会有 Data-In。
+				resp = invSCSIResponseStatus(itt, iscsi.StatusCheckCondition)
+				break
+			}
 			resp = invDataIn(itt, make([]byte, int(binary.BigEndian.Uint16(cdb[7:9]))*invBlockSize))
 		default:
 			resp = invSCSIResponse(itt)
@@ -121,11 +126,15 @@ func invDataIn(itt uint32, payload []byte) *iscsi.PDU {
 }
 
 func invSCSIResponse(itt uint32) *iscsi.PDU {
+	return invSCSIResponseStatus(itt, iscsi.StatusGood)
+}
+
+func invSCSIResponseStatus(itt uint32, status uint8) *iscsi.PDU {
 	var h iscsi.BHS
 	h.SetOpcode(iscsi.OpSCSIResponse)
 	h.SetFlags(0x80)
 	h.SetITT(itt)
-	h[3] = iscsi.StatusGood
+	h[3] = status
 	return &iscsi.PDU{Header: h}
 }
 
@@ -469,5 +478,88 @@ func TestUnmapPendingFullDropsOnceAndRecovers(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if st, _ := p.Stats("k"); st.WholeDrops != 1 {
 		t.Fatalf("表满之后仍在持续整盘失效：计数 = %d，期望仍是 1", st.WholeDrops)
+	}
+}
+
+// invFailLBA 是一个"必然失败"的 LBA：后端对它的 READ(10) 回 SCSI Response
+// (CHECK CONDITION)，永远不会有 Data-In —— 真实的失败读就是这么收尾的。
+const invFailLBA = 0xffffff
+
+// TestFailedReadReleasesPending 锁定 pending 表的排空：后端用 SCSI Response
+// 而不是 Data-In 收尾的读，必须把条目还回去。
+//
+// 不还的话条目带着暂存缓冲一直留在表里，攒满 maxPending 之后这个会话再也不回填
+// 缓存，而且没有任何计数能看出来 —— 真机表现就是"读 IOPS 正常、缓存占用不涨"。
+func TestFailedReadReleasesPending(t *testing.T) {
+	be := newInvBackend(t)
+	p := invStartPortal(t, be, "")
+	defer p.Close()
+
+	ic := invDial(t, p)
+	defer ic.Close()
+	// 失败读的响应没人消费：不排空的话 loopback 的发送缓冲一满，TI 泵就卡在写上，
+	// 后面的响应全跟不上，测试会假失败。
+	go func() { _, _ = io.Copy(io.Discard, ic) }()
+	invSniff(t, p, ic)
+
+	read := func(itt, lba uint32) {
+		cdb := make([]byte, 10)
+		cdb[0] = iscsi.SCSIRead10
+		binary.BigEndian.PutUint32(cdb[2:6], lba)
+		binary.BigEndian.PutUint16(cdb[7:9], 1)
+		invSend(t, ic, itt, cdb...)
+	}
+
+	// 足够多必失败的读，把整张表占满（超出的会被丢弃，正是 PendingDropped）。
+	for i := 0; i < maxPending+16; i++ {
+		read(5000+uint32(i), invFailLBA)
+	}
+	invWait(t, "失败读都到了后端", func() bool {
+		return be.readCount(invFailLBA) >= maxPending+16
+	})
+
+	l1Used := func() int64 {
+		st, _ := p.Stats("k")
+		return st.Cache.L1UsedBytes
+	}
+	// 表排空之后，一次正常读必须重新回填；表若被占死，这里永远等不到。
+	deadline := time.Now().Add(5 * time.Second)
+	for i := 0; time.Now().Before(deadline); i++ {
+		read(7000+uint32(i), 0)
+		time.Sleep(50 * time.Millisecond)
+		if l1Used() >= invBlockSize {
+			return
+		}
+	}
+	t.Fatal("失败读之后缓存再也没有回填：pending 条目没有随 SCSI Response 释放")
+}
+
+// TestWholeCacheDropCountsOneWrite 锁定写计数的口径：整盘失效（FORMAT UNIT /
+// SANITIZE、无法解析的写）只该记一次写。
+//
+// dropAll 曾经自己也做 writes.Add(1)，于是这些兜底路径把一次写报成两次，写 IOPS
+// 直接翻倍（"写性能数字对不上"的典型来源）。
+func TestWholeCacheDropCountsOneWrite(t *testing.T) {
+	be := newInvBackend(t)
+	p := invStartPortal(t, be, "")
+	defer p.Close()
+
+	ic := invDial(t, p)
+	defer ic.Close()
+	invSniff(t, p, ic)
+
+	before, ok := p.Stats("k")
+	if !ok {
+		t.Fatal("Stats 未返回目标")
+	}
+	invSend(t, ic, 40, iscsi.SCSIFormatUnit, 0, 0, 0, 0, 0)
+	invWait(t, "整盘失效一次", func() bool {
+		st, _ := p.Stats("k")
+		return st.WholeDrops == before.WholeDrops+1
+	})
+
+	after, _ := p.Stats("k")
+	if got := after.Proxy.Writes - before.Proxy.Writes; got != 1 {
+		t.Fatalf("一次整盘写记了 %d 次写，期望 1", got)
 	}
 }

@@ -404,18 +404,32 @@ type SetTargetOptions struct {
 
 // SetTarget 更新目标配置（目标不存在时由脚本创建，即 upsert）。
 func (m *Manager) SetTarget(ctx context.Context, name string, opt SetTargetOptions) error {
+	_, err := m.SetTargetInfo(ctx, name, opt)
+	return err
+}
+
+// SetTargetInfo 同 SetTarget，并**顺带**返回脚本读回的平台实际状态（可能为 nil）。
+//
+// 为什么要多这个返回值：启用/停用之后脚本本来就要 `Get-IscsiServerTarget` 回读校验
+// （否则"静默没生效"这种事故查不出来），那份数据与 iscsi_get_targets.ps1 查出来的完全一样。
+// 上层（winbackend.EnsureTarget → app.IscsiService.Publish）为了拿"平台实际 IQN"与排障详情，
+// 原先还要再起一次 PowerShell —— Windows 实测 5~7 秒，且**首次挂载必然**要多付这一趟。
+//
+// 返回 nil 表示本次没有读回：opt.Enabled 为 nil（没动启用状态）时脚本不做校验，
+// 调用方需要实际状态就自己读（GetTarget）。
+func (m *Manager) SetTargetInfo(ctx context.Context, name string, opt SetTargetOptions) (*TargetInfo, error) {
 	if err := validateTargetName(name); err != nil {
-		return err
+		return nil, err
 	}
 	if (opt.ChapUser == "") != (opt.ChapSecret == "") {
-		return apperr.InvalidParam("chap")
+		return nil, apperr.InvalidParam("chap")
 	}
 	if opt.EnableReverseChap {
 		if opt.ChapUser == "" || opt.ChapSecret == "" {
-			return apperr.InvalidParam("chap")
+			return nil, apperr.InvalidParam("chap")
 		}
 		if opt.ReverseChapUser == "" || opt.ReverseChapSecret == "" {
-			return apperr.InvalidParam("reverse_chap")
+			return nil, apperr.InvalidParam("reverse_chap")
 		}
 	}
 
@@ -429,7 +443,7 @@ func (m *Manager) SetTarget(ctx context.Context, name string, opt SetTargetOptio
 		}
 		param, err := winps.JSONParam("InitiatorIdsJson", ids)
 		if err != nil {
-			return apperr.InvalidParam("initiator_ids")
+			return nil, apperr.InvalidParam("initiator_ids")
 		}
 		params = append(params, param)
 		logArgs = append(logArgs, "initiator_ids", strings.Join(ids, ","))
@@ -457,13 +471,32 @@ func (m *Manager) SetTarget(ctx context.Context, name string, opt SetTargetOptio
 	m.logger.Info("更新 iSCSI 目标", logArgs...)
 
 	var result struct {
-		Action string `json:"action"`
+		Action    string     `json:"action"`
+		TargetIQN string     `json:"target_iqn"`
+		Verify    *targetDTO `json:"verify"`
 	}
 	if err := m.ps.RunScriptJSON(ctx, winps.ScriptIscsiSetTarget, params, &result); err != nil {
-		return err
+		return nil, err
 	}
 	m.logger.Info("iSCSI 目标已更新", "target", name, "action", result.Action)
-	return nil
+	if result.Verify == nil && strings.TrimSpace(result.TargetIQN) == "" {
+		return nil, nil
+	}
+	info := &TargetInfo{}
+	if result.Verify != nil {
+		info.Name = result.Verify.Name
+		info.IQN = result.Verify.IQN
+		info.Enabled = result.Verify.Enabled
+		info.InitiatorIDs = result.Verify.InitiatorIDs
+		info.MappedDevices = result.Verify.MappedDevices
+	}
+	if strings.TrimSpace(info.IQN) == "" {
+		info.IQN = strings.TrimSpace(result.TargetIQN)
+	}
+	if strings.TrimSpace(info.Name) == "" {
+		info.Name = name
+	}
+	return info, nil
 }
 
 // AddMapping 建立「虚拟盘 ↔ 目标」映射。幂等（已映射则跳过）。

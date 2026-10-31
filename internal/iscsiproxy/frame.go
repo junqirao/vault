@@ -275,6 +275,11 @@ func (b *frameBatch) flush() error {
 	return err
 }
 
+// idle reports whether the batch holds no unflushed bytes. Only then may a
+// caller hand a frame straight to the connection: with nothing pending there is
+// no ordering to preserve.
+func (b *frameBatch) idle() bool { return b.n == 0 }
+
 // write 把一段已经装配好的连续字节（本地代答的一整串 Data-In）并入批，从而与
 // 同方向攒下的透传帧保持先后次序 —— 注入直接写连接就会插到批的前面，StatSN 立刻
 // 倒退。调用方负责在注入后 flush：注入的响应不能等下次攒批才发出去。

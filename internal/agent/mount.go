@@ -47,6 +47,18 @@ const (
 	// 清理与挂载自身的 ctx **解耦**（用户取消挂载时挂载 ctx 已被取消），因此需要自己的上限，
 	// 避免残留现场始终清不动而把请求无限拖住。
 	cleanupTimeout = 2 * time.Minute
+	// unmountTailTimeout 是"卸载收尾"（下线磁盘 / 断会话 / 清发起端缓存 / 回写 release）的时间上限。
+	//
+	// 这一段已经不在用户的等待路径上（见 unmount），但仍然要有个天花板：它握着 allocation 锁，
+	// 卡死会让同一分配永远挂不回来。取 2 分钟与 cleanupTimeout 对齐 —— 回写 release 自身
+	// 超时 30s、断开重试 3×2s，正常几秒内结束。
+	unmountTailTimeout = 2 * time.Minute
+	// teardownWaitLimit 是挂载前"等上一次卸载收尾"的上限。
+	//
+	// 用户"卸载完马上又挂回来"时，上一次的收尾还在断同一条 IQN 的会话；不等它，新会话刚连上
+	// 就可能被后台的 Disconnect/RemoveTarget 拆掉。等不到（超时）也照常继续 —— 挂载自身的
+	// disconnectSameNameSession 还会兜底。
+	teardownWaitLimit = 20 * time.Second
 )
 
 // MountRequest 是本地挂载请求（POST /agent/mount）。
@@ -92,6 +104,20 @@ type mountEngine struct {
 	// `<挂载根>\<库名>`：晚到的那个要么撞 dir_not_empty 报错，要么两块卷抢同一个挂载点。
 	// 见 mountAt 里的占位说明。
 	mountDirMu sync.Mutex
+
+	// teardownMu / teardowns 跟踪"记录已删、但后台还在收尾"的目标 IQN。
+	//
+	// 为什么需要：卸载对用户可见的部分（移除挂载点）先返回，断会话/删目标挪到后台，
+	// 于是"卸了马上又挂回来"会把新会话暴露给还在跑的后台 teardown。挂载前用 waitTeardown
+	// 等一下，避免"刚连上就被拆掉"这种极难复现的故障。
+	teardownMu sync.Mutex
+	teardowns  map[string]*teardownWait
+}
+
+// teardownWait 是一条目标 IQN 上正在进行的收尾（refs 计数，多条收尾可并存）。
+type teardownWait struct {
+	refs int
+	done chan struct{}
 }
 
 // mount 执行完整挂载流程。
@@ -153,9 +179,13 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 				"allocation_id", allocationID,
 				"cache_enabled_record", existing.CacheEnabled, "cache_active_record", existing.CacheActive,
 				"direct_mode_record", existing.DirectMode)
-			if err := e.unmountLocked(ctx, allocationID); err != nil {
+			// 这里必须**同步收尾**：紧接着就要用新的门户/IQN 重新连接，后台残留的断会话 /
+			// 删目标会把刚建好的会话拆掉（见 waitTeardown）。
+			tail, err := e.unmountLocked(ctx, allocationID)
+			if err != nil {
 				return nil, err
 			}
+			e.finishUnmount(ctx, tail)
 		} else {
 			e.a.logger.Info("记录是已挂载但本机已无活动会话，按实际未挂载重新挂载",
 				"allocation_id", allocationID, "target_iqn", existing.TargetIQN)
@@ -408,6 +438,16 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	//   - 上一次直连、这次要代理 → 残留的直连会话会让 Connect 判定"已连接"而绕过代理。
 	// 因此**无论哪种模式**，Connect 前都先显式断开同名残留 —— 这一步幂等，无会话时是空操作。
 	e.disconnectSameNameSession(ctx, effectiveIQN)
+
+	// 上一次卸载的收尾可能还在跑（记录已删、会话还在断）：等它把这条 IQN 收拾干净再连。
+	//
+	// 卸载对用户可见的部分已经先返回了（见 unmount），用户"卸了马上又挂回来"时，
+	// 后台的 Disconnect / RemoveTarget 正对着同一条 IQN —— 不等就会出现"新会话刚连上就被
+	// 后台拆掉"或目标缓存被删的诡异现象。等不到（超时）也照常继续，Connect 前后还有兜底。
+	if waited := e.waitTeardown(ctx, effectiveIQN); waited {
+		e.a.logger.Info("已等待上一次卸载收尾完成", "allocation_id", allocationID, "target_iqn", effectiveIQN)
+	}
+
 	if err := e.a.iscsi.Connect(ctx, iscsiinitiator.ConnectOptions{
 		TargetIQN:     effectiveIQN,
 		PortalAddress: effectivePortalAddr,
@@ -647,11 +687,14 @@ func (e *mountEngine) cleanupFailedMount(ctx context.Context, allocationID, stag
 	if !mountStageLeavesResidue(stage) {
 		return true, nil
 	}
-	if err := e.unmountLocked(ctx, allocationID); err != nil {
+	tail, err := e.unmountLocked(ctx, allocationID)
+	if err != nil {
 		e.a.logger.Warn("失败的挂载尝试清理未完成，保留记录供人工卸载",
 			"allocation_id", allocationID, "stage", stage, "error", err)
 		return false, err
 	}
+	// 失败清理不追求"快"，同步做完收尾：调用方随后要据此判定"是否已清理干净"。
+	e.finishUnmount(ctx, tail)
 	return true, nil
 }
 
@@ -688,6 +731,19 @@ func cleanupFailureDetail(err error) string {
 //
 // 断开会话仍然会以 device_in_use 补一次下线+重试，真失败时按 warn 记录：
 // 服务端 release 后会停用目标把会话踢掉，且④已取消持久化，不会重启后重连。
+//
+// # 为什么只有前半段在请求里同步跑
+//
+// 用户点"卸载"之后**唯一看得见的变化是盘符/目录消失**（①）。这一步之后就"本机已经看不出
+// 还挂着东西"了，剩下的 ②–⑤ 全是清理动作，失败也只记日志、不影响结果。可它们以前全在
+// 请求路径上同步跑：每一步都是一个独立的 powershell.exe（冷启动 ~200ms，导入 Storage /
+// IscsiTarget 模块再各花 300–800ms），断开失败还要重试 3×2s，回写 release 又是一次网络
+// 往返 —— 实测最坏能到一分钟，界面就一直转圈（真实反馈："甚至一分钟才卸得下来"）。
+//
+// 现在：① 同步做（约 1s，失败照旧整次失败并回滚状态），②–⑤ 交给 finishUnmount 在后台跑，
+// 记录与 SSE unmount 事件在 ① 之后立刻落地，界面秒变"未挂载"。
+// 后台那一段继续握着这把 allocation 锁，避免"卸了马上又挂回来"时两边抢同一条 IQN
+// （挂载侧另有 waitTeardown 兜底）。
 func (e *mountEngine) unmount(ctx context.Context, allocationID string) error {
 	allocationID = strings.TrimSpace(allocationID)
 	if allocationID == "" {
@@ -695,19 +751,35 @@ func (e *mountEngine) unmount(ctx context.Context, allocationID string) error {
 	}
 
 	unlock := e.a.locks.Lock("alloc:" + allocationID)
-	defer unlock()
-
-	return e.unmountLocked(ctx, allocationID)
+	tail, err := e.unmountLocked(ctx, allocationID)
+	if tail == nil {
+		unlock()
+		return err
+	}
+	done := e.beginTeardown(tail.ms.TargetIQN)
+	// 收尾与请求 ctx 解耦：前端拿到响应就断开连接是常态，收尾不能因此被取消。
+	// 加进 a.wg 是为了让退出流程（UnmountAll + Stop）等它跑完，不留半拆的会话。
+	e.a.wg.Add(1)
+	safeGo(e.a.logger, "unmount_tail", func() {
+		defer e.a.wg.Done()
+		defer unlock()
+		defer done()
+		e.finishUnmount(ctx, tail)
+	})
+	return nil
 }
 
 // unmountLocked 是 unmount 的**不加锁**版本：调用方必须已经持有该 allocation 的锁。
 //
 // 存在的原因：挂载失败后的清理发生在 mount 的锁内，直接调 unmount 会在同一把 keyed 锁上
 // 自锁死（挂载失败时永远卡住，比错误本身严重得多）。
-func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) error {
+//
+// 返回的 tail 非空表示"挂载点已经移除、记录已经删除，剩下的收尾还没做"，
+// 由调用方决定是同步跑（finishUnmount，用于重挂前的清理与失败清理）还是丢后台（unmount）。
+func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) (*unmountTail, error) {
 	ms, rt, ok := e.a.store.GetMount(allocationID)
 	if !ok {
-		return errNotMounted(allocationID)
+		return nil, errNotMounted(allocationID)
 	}
 
 	// 记住卸载前的状态：卸载失败、且**什么都没拆掉**时要恢复它。
@@ -783,7 +855,7 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 				// 挂载点真的还在（盘符/目录仍属于该卷，Windows 认为卷正被占用）：
 				// 此时磁盘确实还挂着，如实失败并回滚状态才是对的 —— 继续往下做只会让
 				// 下线、断开跟着一起失败，最后留下"盘还挂着但记录已删"的假象。
-				return fail("mount_point", err)
+				return nil, fail("mount_point", err)
 			}
 			reason := "挂载点已不存在"
 			if !pointGone {
@@ -795,6 +867,41 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 	}
 	// 从这一步起，本机已经"看不出还挂着东西"了 —— 后续失败一律不回滚状态。
 	teardown = true
+
+	// 用户要的就是这一步：记录删掉、unmount 事件推出去，客户端立刻变成"未挂载"。
+	// 剩下的 ②–⑤ 是纯清理（见 finishUnmount），不再占用用户的等待时间。
+	e.a.store.DeleteMount(allocationID)
+	e.a.hub.Publish(Event{Type: "unmount", Data: map[string]any{"allocation_id": allocationID}})
+	e.a.logger.Info("已移除挂载点，转入后台收尾",
+		"allocation_id", allocationID, "mount_path", ms.MountPath, "target_iqn", ms.TargetIQN)
+
+	return &unmountTail{allocationID: allocationID, ms: ms, rt: rt}, nil
+}
+
+// unmountTail 是"用户已经看不到这块盘"之后剩下的收尾工作。
+type unmountTail struct {
+	allocationID string
+	ms           MountState
+	rt           mountRuntime
+}
+
+// finishUnmount 执行卸载收尾（②–⑤）：磁盘下线 → 断开会话 → 取消持久化 → 注销缓存目标 →
+// 清发起端缓存/门户 → 回写 release。
+//
+// 全程**没有失败分支**：每一步失败只记日志、继续往下走。理由与以前一致 —— 挂载点已经移除，
+// 这些只是清残留，任何一步失败都不该让界面回到"还挂着"。
+//
+// 它通常跑在后台 goroutine 里（见 unmount），所以自带时间上限，并与父 ctx 的取消解耦：
+// 前端拿到卸载响应就断开连接是常态，收尾不能因此半途而废。
+func (e *mountEngine) finishUnmount(parent context.Context, tail *unmountTail) {
+	if tail == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), unmountTailTimeout)
+	defer cancel()
+
+	ms, rt, allocationID := tail.ms, tail.rt, tail.allocationID
+	start := time.Now()
 
 	// ② 磁盘 Offline —— Disconnect 的前置条件（否则 Disconnect-IscsiTarget 报 0xefff0040）。
 	//
@@ -858,10 +965,66 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) er
 		}
 	}
 
-	e.a.store.DeleteMount(allocationID)
-	e.a.hub.Publish(Event{Type: "unmount", Data: map[string]any{"allocation_id": allocationID}})
-	e.a.logger.Info("卸载完成", "allocation_id", allocationID, "mount_path", ms.MountPath)
-	return nil
+	e.a.logger.Info("卸载收尾完成", "allocation_id", allocationID,
+		"mount_path", ms.MountPath, "elapsed_ms", time.Since(start).Milliseconds())
+}
+
+// beginTeardown 登记"这条 IQN 有一段收尾在跑"，返回的 done 必须在收尾结束时调用。
+func (e *mountEngine) beginTeardown(targetIQN string) func() {
+	iqn := strings.ToLower(strings.TrimSpace(targetIQN))
+	if iqn == "" {
+		return func() {}
+	}
+	e.teardownMu.Lock()
+	if e.teardowns == nil {
+		e.teardowns = make(map[string]*teardownWait)
+	}
+	st := e.teardowns[iqn]
+	if st == nil {
+		st = &teardownWait{done: make(chan struct{})}
+		e.teardowns[iqn] = st
+	}
+	st.refs++
+	e.teardownMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			e.teardownMu.Lock()
+			defer e.teardownMu.Unlock()
+			st.refs--
+			if st.refs <= 0 {
+				delete(e.teardowns, iqn)
+				close(st.done)
+			}
+		})
+	}
+}
+
+// waitTeardown 等这条 IQN 上正在跑的后台收尾结束，最多等 teardownWaitLimit。
+// 返回 true 表示确实等过（用于日志）；超时或没有收尾在跑都继续挂载流程。
+func (e *mountEngine) waitTeardown(ctx context.Context, targetIQN string) bool {
+	iqn := strings.ToLower(strings.TrimSpace(targetIQN))
+	if iqn == "" {
+		return false
+	}
+	e.teardownMu.Lock()
+	st := e.teardowns[iqn]
+	e.teardownMu.Unlock()
+	if st == nil {
+		return false
+	}
+
+	timer := time.NewTimer(teardownWaitLimit)
+	defer timer.Stop()
+	select {
+	case <-st.done:
+	case <-ctx.Done():
+	case <-timer.C:
+		e.a.logger.Warn("等待上一次卸载收尾超时，继续挂载",
+			"target_iqn", targetIQN, "timeout", teardownWaitLimit.String())
+	}
+	return true
 }
 
 // cleanupInitiatorEntries 卸载后清理发起端里这条挂载留下的条目（尽力而为）。

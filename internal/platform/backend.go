@@ -314,7 +314,14 @@ type IscsiBackend interface {
 	Available(ctx context.Context) error
 
 	// EnsureTarget 幂等地把目标收敛到 spec 描述的期望状态（不存在则创建）。
-	EnsureTarget(ctx context.Context, spec TargetSpec) error
+	//
+	// 返回**顺带读回**的平台实际状态（可能为 nil——后端在收敛过程中没有拿到现成读数时，
+	// 调用方需要就只能自己再调 GetTarget）。之所以让它带返回值：Windows 侧在改动启用状态后
+	// 必须回读校验，那份数据就是"平台实际 IQN + 授权 + 映射"，而挂载路径以前为了拿这些
+	// 又要多起一次 PowerShell（实测 5~7 秒，首次挂载必然命中）。
+	//
+	// 返回值里的 IQN 是**客户端登录必须用**的那个名字（Windows 会改写目标名，与 spec.Name 不同）。
+	EnsureTarget(ctx context.Context, spec TargetSpec) (*TargetInfo, error)
 
 	// RemoveTarget 删除目标（含其名下全部映射与授权）。幂等。
 	RemoveTarget(ctx context.Context, name string) error

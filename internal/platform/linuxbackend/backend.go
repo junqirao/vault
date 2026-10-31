@@ -62,12 +62,16 @@ func New(lvm *linuxlvm.Manager, lio *liotarget.Manager, logger *slog.Logger) *Ba
 func (b *Backend) Available(ctx context.Context) error { return b.lio.Available(ctx) }
 
 // EnsureTarget 先把待发布的 LV 激活，再交给 LIO 收敛目标完整期望状态。
-func (b *Backend) EnsureTarget(ctx context.Context, spec platform.TargetSpec) error {
+//
+// 返回 nil 表示"没有顺带读回的实际状态"：LIO 写 configfs 本身就是一次本地写，不存在
+// Windows 那种"下发后名字会被平台改写、必须回读"的问题，因此不额外付一次读取代价。
+func (b *Backend) EnsureTarget(ctx context.Context, spec platform.TargetSpec) (*platform.TargetInfo, error) {
 	if spec.BackingRef != "" {
 		if err := b.activate(ctx, spec.BackingRef, spec.ReadOnly); err != nil {
-			return err
+			return nil, err
 		}
 	}
+	// liotarget 自己返回 nil（configfs 本地写，无需回读），这里只透传。
 	return b.lio.EnsureTarget(ctx, spec)
 }
 

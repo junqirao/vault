@@ -38,7 +38,7 @@ func newRenameBackend(rewrite func(string) string) *renameIscsiBackend {
 	return &renameIscsiBackend{actual: make(map[string]platform.TargetInfo), rewrite: rewrite}
 }
 
-func (f *renameIscsiBackend) EnsureTarget(_ context.Context, spec platform.TargetSpec) error {
+func (f *renameIscsiBackend) EnsureTarget(_ context.Context, spec platform.TargetSpec) (*platform.TargetInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pushed = append(f.pushed, spec)
@@ -56,7 +56,9 @@ func (f *renameIscsiBackend) EnsureTarget(_ context.Context, spec platform.Targe
 		Initiators: append([]string(nil), spec.Initiators...),
 		Devices:    devices,
 	}
-	return nil
+	// 返回 nil：这个假后端不模拟"下发时顺带读回"，让 Publish 走原有的单独读回分支
+	// （平台改写名字的场景正是靠那条路径取实际 IQN 的）。
+	return nil, nil
 }
 
 func (f *renameIscsiBackend) GetTarget(_ context.Context, name string) (*platform.TargetInfo, error) {
@@ -307,7 +309,7 @@ func TestPushTargetSendsFullIQN(t *testing.T) {
 	svc := newIqnTestService(t, backend)
 	target, _ := seedPublishFixture(t, svc, "vault-aaaa-bbbb")
 
-	if pushed, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
+	if pushed, _, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
 		t.Fatalf("下发失败：pushed=%v err=%v", pushed, err)
 	}
 	name := backend.lastPushed().Name
@@ -410,16 +412,18 @@ func newRewritingTargetBackend() *rewritingTargetBackend {
 	return &rewritingTargetBackend{actual: make(map[string]platform.TargetInfo)}
 }
 
-func (f *rewritingTargetBackend) EnsureTarget(_ context.Context, spec platform.TargetSpec) error {
+func (f *rewritingTargetBackend) EnsureTarget(_ context.Context, spec platform.TargetSpec) (*platform.TargetInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.actual[spec.Name] = platform.TargetInfo{
+	info := platform.TargetInfo{
 		Name:       spec.Name,
 		IQN:        legacyWinIQNPrefix + "win-host-" + spec.Name + "-target",
 		Enabled:    spec.Enabled,
 		Initiators: append([]string(nil), spec.Initiators...),
 	}
-	return nil
+	f.actual[spec.Name] = info
+	// 与真实后端一致：下发时顺带把平台实际状态带回去（Windows 侧启用后本来就要回读校验）。
+	return &info, nil
 }
 
 func (f *rewritingTargetBackend) GetTarget(_ context.Context, name string) (*platform.TargetInfo, error) {

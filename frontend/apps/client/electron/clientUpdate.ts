@@ -212,6 +212,25 @@ async function resolveReadyClient(currentVersion: string): Promise<{ version: st
   return { version, exe: path.join(dir, 'Vault.exe') }
 }
 
+/**
+ * "启动即隐藏"的探针与对应的环境变量名。
+ *
+ * 切换器只是"等旧进程退出 → 启动新版本 exe"，命令行参数到不了新进程（见
+ * cmd/vault-updator）。而新版本该不该藏窗口取决于**它自己是怎么被拉起来的**：
+ * 跟随升级链（自启 → 自启更新）必须继续藏，用户手动启动必须出窗口。
+ * 所以这里把当前进程的"隐藏启动"状态通过环境变量交给切换器，切换器再原样带给新实例；
+ * 用户手动双击的那一次是全新的进程，环境里没有这个变量，自然出窗口。
+ */
+const CLIENT_HIDDEN_ENV = 'VAULT_CLIENT_HIDDEN'
+
+/** 由主进程注入"当前是否隐藏启动"（见 main.ts 的 startHidden）。 */
+let hiddenStartProbe: () => boolean = () => false
+
+/** 注册"当前是否隐藏启动"的探针；主进程启动时调用一次。 */
+export function setHiddenStartProbe(probe: () => boolean): void {
+  hiddenStartProbe = probe
+}
+
 /** 独立 updator 的路径：与 Vault.exe 同级（electron-builder 的 extraFiles 放的）。 */
 function updatorExePath(): string {
   return path.join(path.dirname(app.getPath('exe')), 'Vault-Updator.exe')
@@ -247,7 +266,10 @@ async function launchUpdator(ready: { version: string; exe: string }): Promise<b
       cwd: path.dirname(exe),
       detached: true,
       stdio: 'ignore',
-      windowsHide: true
+      windowsHide: true,
+      // 让切换器（以及它拉起的新版本）继承"这次是后台启动"：见 CLIENT_HIDDEN_ENV 的说明。
+      // 显式给 0 而不是省略：环境里可能残留上一轮的 1（切换器是独立进程，别靠运气）。
+      env: { ...process.env, [CLIENT_HIDDEN_ENV]: hiddenStartProbe() ? '1' : '0' }
     })
     // 不等待：updator 必须独立于本进程存活，本进程随后就会退出。
     child.unref()

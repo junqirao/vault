@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 
 	"vault/internal/domain"
 	"vault/internal/job"
@@ -41,7 +42,7 @@ func (f *fakeIscsiBackend) RemoveTarget(_ context.Context, name string) error {
 	return nil
 }
 
-func (f *fakeIscsiBackend) EnsureTarget(_ context.Context, spec platform.TargetSpec) error {
+func (f *fakeIscsiBackend) EnsureTarget(_ context.Context, spec platform.TargetSpec) (*platform.TargetInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.pushCount++
@@ -49,13 +50,14 @@ func (f *fakeIscsiBackend) EnsureTarget(_ context.Context, spec platform.TargetS
 	if spec.BackingRef != "" {
 		devices = []string{spec.BackingRef}
 	}
-	f.actual[spec.Name] = platform.TargetInfo{
+	info := platform.TargetInfo{
 		Name:       spec.Name,
 		Enabled:    spec.Enabled,
 		Initiators: append([]string(nil), spec.Initiators...),
 		Devices:    devices,
 	}
-	return nil
+	f.actual[spec.Name] = info
+	return &info, nil
 }
 
 func (f *fakeIscsiBackend) ListTargets(context.Context) ([]platform.TargetInfo, error) {
@@ -178,7 +180,7 @@ func TestPushTargetSkipsWhenUnchanged(t *testing.T) {
 		t.Fatalf("建目标记录失败：%v", err)
 	}
 
-	pushed, err := svc.pushTarget(ctx, target, true)
+	pushed, _, err := svc.pushTarget(ctx, target, true)
 	if err != nil {
 		t.Fatalf("首次下发失败：%v", err)
 	}
@@ -190,7 +192,7 @@ func TestPushTargetSkipsWhenUnchanged(t *testing.T) {
 	}
 
 	// ② 完全没变：必须跳过，而且一次平台读回都不做。
-	pushed, err = svc.pushTarget(ctx, target, true)
+	pushed, _, err = svc.pushTarget(ctx, target, true)
 	if err != nil {
 		t.Fatalf("重复下发失败：%v", err)
 	}
@@ -215,7 +217,7 @@ func TestPushTargetSkipsWhenUnchanged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("重启后重新加载目标失败：%v", err)
 	}
-	if pushed, err = restarted.pushTarget(ctx, fresh, true); err != nil || pushed {
+	if pushed, _, err = restarted.pushTarget(ctx, fresh, true); err != nil || pushed {
 		t.Fatalf("重启后应凭 DB 记账跳过下发，pushed=%v err=%v", pushed, err)
 	}
 	if got := backend.reads(); got != 0 {
@@ -223,11 +225,62 @@ func TestPushTargetSkipsWhenUnchanged(t *testing.T) {
 	}
 
 	// ④ 期望状态变化（停用）：指纹不再命中，必须真的下发。
-	if pushed, err = restarted.pushTarget(ctx, fresh, false); err != nil || !pushed {
+	if pushed, _, err = restarted.pushTarget(ctx, fresh, false); err != nil || !pushed {
 		t.Fatalf("期望状态变化后必须重新下发，pushed=%v err=%v", pushed, err)
 	}
 	if got := backend.pushes(); got != 2 {
 		t.Fatalf("期望状态变化后必须重新下发，实际下发次数=%d", got)
+	}
+}
+
+// TestPublishSkipsTargetLockWhenAlreadyApplied 锁定"已下发、且已读回实际 IQN"时**不取目标锁**。
+//
+// 预创建（JobCreateDiff 结尾的 prePublishTarget）会长时间持有目标锁：Windows 上一次全量下发
+// 实测约 35 秒。而挂载排队等到的这把锁，只换来一次"已下发、跳过"的判定 —— 用户看到的就是
+// 白白卡半分钟（真实反馈："太慢了"）。所以指纹命中且 actual_iqn 已落库时必须直接返回，
+// 重新挂载、第二个客户端挂同一个库都走这条路。
+func TestPublishSkipsTargetLockWhenAlreadyApplied(t *testing.T) {
+	ctx := context.Background()
+	backend := newFakeIscsiBackend()
+	svc := newPushTestService(t, backend)
+	target, allocID := seedPublishFixture(t, svc, "vault-lock-fastpath")
+
+	// 首次发布：现场下发一次，并把平台实际 IQN 读回落库。
+	if _, err := svc.Publish(ctx, allocID); err != nil {
+		t.Fatalf("首次挂载发布失败：%v", err)
+	}
+	pushes := backend.pushes()
+	if pushes == 0 {
+		t.Fatal("首次发布必须下发一次")
+	}
+
+	fresh, err := svc.Store.GetIscsiTarget(ctx, target.ID)
+	if err != nil {
+		t.Fatalf("重新加载目标失败：%v", err)
+	}
+	if fresh.ActualIQN == "" {
+		t.Fatal("首次发布后必须把实际 IQN 落库，否则快路径无法成立")
+	}
+
+	// 模拟"预创建正持着目标锁"（它要一直持到全量下发结束）。
+	unlock := svc.Locks.Lock(lock.TargetKey(fresh.TargetName))
+	defer unlock()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := svc.Publish(ctx, allocID)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("第二次挂载发布失败：%v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("已下发状态下仍在等目标锁：预创建持锁 30 秒以上，用户会白卡半分钟")
+	}
+	if got := backend.pushes(); got != pushes {
+		t.Fatalf("已下发状态不该再下发，下发次数 %d → %d", pushes, got)
 	}
 }
 
@@ -241,7 +294,7 @@ func TestPushTargetKeepsFastPathOnExternalDrift(t *testing.T) {
 	svc := newPushTestService(t, backend)
 	target, _ := seedPublishFixture(t, svc, "vault-eeee-ffff")
 
-	if pushed, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
+	if pushed, _, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
 		t.Fatalf("首次下发失败：pushed=%v err=%v", pushed, err)
 	}
 
@@ -251,7 +304,7 @@ func TestPushTargetKeepsFastPathOnExternalDrift(t *testing.T) {
 	})
 
 	// 挂载路径只认记账：仍跳过，且不读回平台。
-	if pushed, err := svc.pushTarget(ctx, target, true); err != nil || pushed {
+	if pushed, _, err := svc.pushTarget(ctx, target, true); err != nil || pushed {
 		t.Fatalf("挂载路径只认记账，应当跳过：pushed=%v err=%v", pushed, err)
 	}
 	if got := backend.reads(); got != 0 {
@@ -285,7 +338,7 @@ func TestReconcileTargetsRebuildsMissingTargetWithSingleScan(t *testing.T) {
 	svc := newPushTestService(t, backend)
 	target, _ := seedPublishFixture(t, svc, "vault-1111-2222")
 
-	if pushed, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
+	if pushed, _, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
 		t.Fatalf("首次下发失败：pushed=%v err=%v", pushed, err)
 	}
 	if got := backend.pushes(); got != 1 {
@@ -357,7 +410,7 @@ func TestTeardownDiskTargetsRemovesTargetAndAllocation(t *testing.T) {
 	if err := st.CreateIscsiTarget(ctx, target); err != nil {
 		t.Fatalf("建目标记录失败：%v", err)
 	}
-	if _, err := svc.pushTarget(ctx, target, true); err != nil {
+	if _, _, err := svc.pushTarget(ctx, target, true); err != nil {
 		t.Fatalf("下发目标失败：%v", err)
 	}
 
@@ -382,7 +435,7 @@ func TestPushTargetForgetsAfterRemove(t *testing.T) {
 	svc := newIqnTestService(t, backend)
 	target, _ := seedPublishFixture(t, svc, "vault-cccc-dddd")
 
-	if pushed, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
+	if pushed, _, err := svc.pushTarget(ctx, target, true); err != nil || !pushed {
 		t.Fatalf("下发失败：pushed=%v err=%v", pushed, err)
 	}
 
@@ -400,7 +453,7 @@ func TestPushTargetForgetsAfterRemove(t *testing.T) {
 	// 再下发一次：必须真的下发（平台上已经没有这个目标了）。
 	// 拆除本身会下发一次（Enabled=false 停用），所以只比对"这一步有没有多出一次下发"。
 	before := backend.pushes()
-	if pushed, err := svc.pushTarget(ctx, stored, true); err != nil || !pushed {
+	if pushed, _, err := svc.pushTarget(ctx, stored, true); err != nil || !pushed {
 		t.Fatalf("拆除后必须重新下发：pushed=%v err=%v", pushed, err)
 	}
 	if got := backend.pushes(); got != before+1 {

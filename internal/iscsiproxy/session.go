@@ -84,10 +84,13 @@ type session struct {
 	initMRDSL     atomic.Int32 // 命中注入每帧都要读，走原子量而不是 negMu
 	tgtMRDSL      int
 
-	ittMu     sync.Mutex
-	pending   map[uint32]*pending
-	pendingN  atomic.Int32 // collectTI 的快速路径：为 0 时跳过锁与 map 查找
-	closeOnce sync.Once
+	ittMu   sync.Mutex
+	pending map[uint32]*pending
+	// pendingBytes 是表里所有条目钉住的暂存字节数（只在 ittMu 下读写）：
+	// 条数有上限不等于内存有上限，一条 4MiB 读的缓冲抵得上一千条 4KiB 读。
+	pendingBytes int64
+	pendingN     atomic.Int32 // collectTI 的快速路径：为 0 时跳过锁与 map 查找
+	closeOnce    sync.Once
 
 	// unmapPending 收集 UNMAP 命令的参数列表：被解除映射的范围不在 CDB 里，而在
 	// 紧随其后的 Data-Out 载荷里。命令与载荷都只在 I→T 泵（pumpIT）里出现，所以
@@ -302,7 +305,6 @@ func (s *session) handleCommandIT(f *frame) bool {
 		// 计在**命令观测**层，而不是缓存的命中层：这样只要代理看到读流量，
 		// 读 IOPS 就有数（缓存尚未绑定/首次未命中也不例外）。命中率另用 RequestHits。
 		s.tgt.stats.reads.Add(1)
-		s.countReadBytes(cdb)
 		return s.handleRead(f)
 	case iscsi.SCSIInquiry:
 		s.handleInquiry(f)
@@ -364,37 +366,26 @@ func readBufPut(b []byte) {
 	readBufPools[readBufClass(cap(b))].Put(b[:cap(b)])
 }
 
-// countReadBytes adds one read command's CDB-declared byte length to the target's
-// throughput counter.
-//
-// Length is unknown until READ CAPACITY has been observed (block size 0): those
-// commands only bump the IOPS counter, never the byte counter.
-func (s *session) countReadBytes(cdb []byte) {
-	bs := s.tgt.lunBlockSize()
-	if bs == 0 {
-		return
-	}
-	p, err := iscsi.ParseReadWrite(cdb)
-	if err != nil || p.Blocks <= 0 {
-		return
-	}
-	s.tgt.stats.readBytes.Add(int64(p.Blocks) * int64(bs))
-}
-
 // handleRead serves a read from the cache when the whole range is present in L1
 // or L2, otherwise registers it for a tee fill and lets it pass through.
+//
+// 字节计数也在这里做，而不是另开一个只解析 CDB 的入口：同一条命令的 CDB 只值得
+// 解析一次，而计数必须命中**所有**命令（容量未观测到、解析失败、超大读也要只增
+// 不减地反映流量），所以两件事共用这一次解析。
 func (s *session) handleRead(f *frame) bool {
 	t := s.tgt
+	p, err := iscsi.ParseReadWrite(f.hdr.CDB())
 	bs := t.lunBlockSize()
-	if bs == 0 {
+	// Length is unknown until READ CAPACITY has been observed (block size 0):
+	// those commands only bump the IOPS counter, never the byte counter.
+	if err == nil && p.Blocks > 0 && bs != 0 {
+		t.stats.readBytes.Add(int64(p.Blocks) * int64(bs))
+	}
+	if bs == 0 || err != nil {
 		return false
 	}
 	c := t.getCache()
 	if c == nil {
-		return false
-	}
-	p, err := iscsi.ParseReadWrite(f.hdr.CDB())
-	if err != nil {
 		return false
 	}
 	length := int64(p.Blocks) * int64(bs)
@@ -522,6 +513,7 @@ const (
 type unmapPending struct {
 	want int
 	buf  []byte
+	got  int
 }
 
 // invalidateWriteSame 只失效 WRITE SAME(10/16) 覆盖的那段范围。
@@ -647,15 +639,25 @@ func (s *session) observeDataOut(f *frame) {
 	if len(data) == 0 {
 		return
 	}
-	if len(u.buf)+len(data) > u.want+16 {
+	// 参数列表可能分成多个 Data-Out 送达，段在列表里的位置由 BufOffset 给出。
+	// 按偏移落位而不是 append：一个重传（或任何非零起始偏移）的段都不会把列表
+	// 拼错位，而 append 会把它接在末尾、把后面的描述符整体拱走。
+	off := int(f.hdr.BufOffset())
+	if off < 0 || off+len(data) > u.want+16 {
 		// 载荷比 CDB 声称的还长：这条命令的形态不认识，退回整盘失效。
 		delete(s.unmapPending, itt)
 		s.dropAll("unmap-dataout-overflow")
 		return
 	}
+	if u.buf == nil {
+		u.buf = make([]byte, u.want+16)
+	}
 	// frame 的缓冲只活到下一帧，所以必须复制出来。
-	u.buf = append(u.buf, data...)
-	if len(u.buf) < u.want {
+	copy(u.buf[off:], data)
+	if off+len(data) > u.got {
+		u.got = off + len(data)
+	}
+	if u.got < u.want {
 		return
 	}
 	delete(s.unmapPending, itt)
@@ -696,7 +698,9 @@ func (s *session) applyUnmapRanges(list []byte) {
 // "整盘失效"（缓存全没了）。没有 reason，事后只能靠猜。
 func (s *session) dropAll(reason string) {
 	t := s.tgt
-	t.stats.writes.Add(1)
+	// 注意：写命令的计数由调用方在它自己那一层做（handleCommandIT 的整盘写、
+	// invalidateWriteSame、watchUnmap）。这里再加一次会让这些兜底路径把一次写
+	// 报成两次，写 IOPS 直接翻倍。
 	c := t.getCache()
 	if c == nil {
 		return
@@ -800,12 +804,30 @@ func (s *session) injectLocked(cmd *iscsi.BHS, data []byte) error {
 	statSN := s.lastStat + 1
 	mrdsl := s.maxSendSegment()
 	itt, lun := cmd.ITT(), cmd.LUN()
+	n := len(data)
 
-	out := injectBufGet(injectBufNeed(len(data), mrdsl))
+	// 单段命中走零拷贝：批里没有待发字节时，直接把 BHS + 载荷 + 填充 gather 出
+	// 去，跳过装配缓冲。4KiB 随机命中（以及 MRDSL ≥ 读长的块读）都是单段，每命中
+	// 一次就省掉整块载荷的拷贝和一次注入缓冲的取放。批非空时必须走下面的装配
+	// 路径，否则注入会插到已攒的转发帧前面，StatSN 立刻倒退。
+	if n <= mrdsl && s.tiBatch.idle() {
+		var hdr iscsi.BHS
+		iscsi.FillDataInHeader(&hdr, itt, iscsi.ReservedTag, statSN, exp, max,
+			0, 0, n, true, true, iscsi.StatusGood, 0, false, false)
+		hdr.SetLUN(lun)
+		f := frame{hdr: hdr, body: data, padLen: (4 - n%4) % 4}
+		if err := writeFrame(s.it, &f); err != nil {
+			return err
+		}
+		s.lastStat = statSN
+		s.offset.Add(1)
+		return nil
+	}
+
+	out := injectBufGet(injectBufNeed(n, mrdsl))
 	defer injectBufPut(out)
 	pos := 0
 	seg, dataSN, bufOffset := 0, uint32(0), uint32(0)
-	n := len(data)
 	for {
 		chunk := n - seg
 		if chunk > mrdsl {
@@ -860,16 +882,54 @@ func (s *session) maxSendSegment() int {
 }
 
 // registerPending adds a watched command, reporting whether it was stored: a
-// full table drops the observation, never the command.
+// full table (or staging budget) drops the observation, never the command.
+//
+// 条数与字节双预算：条数管的是表本身，字节管的是这些条目钉住的暂存缓冲总量。
+// 只数条数等于没有上限——一条 4MiB 读的缓冲比一条 4KiB 读大一千倍。
 func (s *session) registerPending(itt uint32, p *pending) bool {
 	s.ittMu.Lock()
-	ok := len(s.pending) < maxPending
-	if ok {
-		s.pending[itt] = p
+	old, exists := s.pending[itt]
+	if !exists && (len(s.pending) >= maxPending || s.pendingBytes+int64(len(p.buf)) > maxPendingBytes) {
+		s.ittMu.Unlock()
+		// 这条计数是"缓存不再回填"的唯一可观测证据：表没排空时它会一直涨。
+		s.tgt.stats.pendingDropped.Add(1)
+		return false
+	}
+	s.pending[itt] = p
+	s.pendingBytes += int64(len(p.buf))
+	if exists && old != nil {
+		s.pendingBytes -= int64(len(old.buf))
+	}
+	s.pendingN.Store(int32(len(s.pending)))
+	s.ittMu.Unlock()
+	if exists && old != nil {
+		// 同一个 ITT 被复用：旧条目再也不会被消费，它的暂存缓冲要还回池子，
+		// 否则每次复用都白扔一块（失败收尾的读正是这么被复用的）。
+		releasePending(old)
+	}
+	return true
+}
+
+// lookupPending returns the watched command for itt without removing it.
+func (s *session) lookupPending(itt uint32) *pending {
+	s.ittMu.Lock()
+	p := s.pending[itt]
+	s.ittMu.Unlock()
+	return p
+}
+
+// takePending removes the watched command for itt and releases its share of the
+// staging budget. The caller owns the returned entry.
+func (s *session) takePending(itt uint32) *pending {
+	s.ittMu.Lock()
+	p := s.pending[itt]
+	if p != nil {
+		delete(s.pending, itt)
+		s.pendingBytes -= int64(len(p.buf))
 		s.pendingN.Store(int32(len(s.pending)))
 	}
 	s.ittMu.Unlock()
-	return ok
+	return p
 }
 
 // releasePending recycles the pooled buffer of a pending the proxy is done with
@@ -884,13 +944,25 @@ func releasePending(p *pending) {
 // collectTI tees a Data-In segment into the buffer of the command it belongs to
 // and completes it on the final PDU.
 func (s *session) collectTI(f *frame) {
-	if f.hdr.Opcode() != iscsi.OpDataIn || s.pendingN.Load() == 0 {
+	if s.pendingN.Load() == 0 {
+		return
+	}
+	switch f.hdr.Opcode() {
+	case iscsi.OpDataIn:
+	case iscsi.OpSCSIResponse:
+		// 后端用 SCSI Response 收尾的读（CHECK CONDITION、介质错误、被 ABORT
+		// 的任务）不会再有 Data-In。条目若留在这里，暂存缓冲再也回不了池子，而且
+		// 攒满 maxPending 之后这个会话就再也不回填缓存——静默失效，没有任何计数
+		// 能看出来（真机表现与"读 IOPS 有数、缓存占用从此不涨"同型）。
+		if p := s.takePending(f.hdr.ITT()); p != nil {
+			releasePending(p)
+		}
+		return
+	default:
 		return
 	}
 	itt := f.hdr.ITT()
-	s.ittMu.Lock()
-	p := s.pending[itt]
-	s.ittMu.Unlock()
+	p := s.lookupPending(itt)
 	if p == nil {
 		return
 	}
@@ -910,10 +982,10 @@ func (s *session) collectTI(f *frame) {
 	if f.hdr.Flags()&iscsi.DataInFlagStatus == 0 {
 		return
 	}
-	s.ittMu.Lock()
-	delete(s.pending, itt)
-	s.pendingN.Store(int32(len(s.pending)))
-	s.ittMu.Unlock()
+	p = s.takePending(itt)
+	if p == nil {
+		return
+	}
 	if f.hdr[3] != iscsi.StatusGood {
 		// The command failed, so there is nothing to observe and nothing read the
 		// staged buffer.

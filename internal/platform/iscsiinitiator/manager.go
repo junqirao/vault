@@ -403,11 +403,13 @@ func (m *Manager) RemovePortal(ctx context.Context, address string, port int) er
 	return nil
 }
 
-// PruneSessions 清理发起端里属于本系统、但已无对应挂载的残留会话、持久目标与无用门户，
-// 返回清理条数。
+// PruneSessions 清理发起端里属于本系统、但已无对应挂载的残留会话、已发现目标缓存、
+// 持久目标与无用门户，返回清理条数。
 //
-// keep 是"当前仍在挂载的目标 IQN"保留清单。只动短名以 vault- / vcache- 开头的目标，
-// 绝不碰用户自己配的 iSCSI；门户只删"没有任何会话在用"的（见 initiator_prune_sessions.ps1）。
+// keep 是"当前仍在挂载的目标 IQN"保留清单。判定"属于本系统"看的是 IQN 命名空间
+// （*.vault），不再只看短名前缀 —— 历史版本的 vcache / cached-disk0 目标既不是 vault-
+// 也不是 vcache- 开头，只认前缀会让它们永久残留（真实反馈：每次开资源管理器都卡几分钟）。
+// 门户只删"没有任何会话在用"的（见 initiator_prune_sessions.ps1）。
 func (m *Manager) PruneSessions(ctx context.Context, keep []string) (int, error) {
 	if keep == nil {
 		keep = []string{}
@@ -420,12 +422,14 @@ func (m *Manager) PruneSessions(ctx context.Context, keep []string) (int, error)
 		Removed           int `json:"removed"`
 		PersistentRemoved int `json:"persistent_removed"`
 		PortalsRemoved    int `json:"portals_removed"`
+		TargetsRemoved    int `json:"targets_removed"`
 	}
 	if err := m.ps.RunScriptJSON(ctx, winps.ScriptInitiatorPruneSessions, []winps.Param{param}, &result); err != nil {
 		return 0, err
 	}
 	m.logger.Info("已清理 iSCSI 残留",
 		"removed", result.Removed, "persistent_removed", result.PersistentRemoved,
-		"portals_removed", result.PortalsRemoved, "keep", len(keep))
-	return result.Removed + result.PersistentRemoved + result.PortalsRemoved, nil
+		"portals_removed", result.PortalsRemoved, "targets_removed", result.TargetsRemoved,
+		"keep", len(keep))
+	return result.Removed + result.PersistentRemoved + result.PortalsRemoved + result.TargetsRemoved, nil
 }

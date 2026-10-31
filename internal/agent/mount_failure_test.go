@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"vault/internal/apperr"
 	"vault/internal/platform/iscsiinitiator"
@@ -212,4 +213,49 @@ func TestErrUnmountFailedCarriesStage(t *testing.T) {
 	if got, _ := err.Args["stage"].(string); got != "disconnect" {
 		t.Fatalf("stage 参数 = %v，期望 disconnect", err.Args["stage"])
 	}
+}
+
+// TestTeardownWaitBlocksMountUntilCleanupDone 锁定"卸载收尾还在跑时，重挂载必须等它跑完"。
+//
+// 卸载对用户可见的部分（移除挂载点 + 删记录）先返回，断会话 / 删目标挪进后台（见
+// mountEngine.unmount）。用户"卸了马上又挂回来"时，后台正对着同一条 IQN 干活 ——
+// 不等就会出现"新会话刚连上就被后台 Disconnect/RemoveTarget 拆掉"的诡异现象。
+func TestTeardownWaitBlocksMountUntilCleanupDone(t *testing.T) {
+	a := newPhaseTestAgent(t)
+	const iqn = "iqn.2024-01.com.vault:repo-alloc-target"
+
+	if waited := a.engine.waitTeardown(context.Background(), iqn); waited {
+		t.Fatal("没有收尾在跑时不应等待")
+	}
+
+	done := a.engine.beginTeardown(iqn)
+	waitDone := make(chan bool, 1)
+	go func() { waitDone <- a.engine.waitTeardown(context.Background(), iqn) }()
+	select {
+	case <-waitDone:
+		t.Fatal("收尾未结束，等待不应返回")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	// 同一条 IQN 上两段收尾并存（理论上不会，但计数必须正确）：只结束一段仍然要等。
+	doneSecond := a.engine.beginTeardown(iqn)
+	done()
+	select {
+	case <-waitDone:
+		t.Fatal("还有一段收尾在跑，等待不应返回")
+	case <-time.After(100 * time.Millisecond):
+	}
+	doneSecond()
+
+	select {
+	case waited := <-waitDone:
+		if !waited {
+			t.Fatal("确实等待过，应返回 true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("收尾结束后等待应立即返回")
+	}
+
+	// 重复调用不应 panic（sync.Once 保护）。
+	done()
 }

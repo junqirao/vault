@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"vault/internal/apperr"
@@ -58,6 +59,12 @@ type IscsiService struct {
 	// 只用于测试注入：把 60 秒的真实预算压到毫秒级，才能覆盖"超时"与"跨多次轮询后成功"
 	// 两条分支，而不必让测试真的睡一分钟。生产装配不要设置它，否则等于出现了第二个真源。
 	backingWaitTimeout time.Duration
+	// legacyMigrated 记录"这个 IQN 的旧命名迁移已经查过了"。
+	//
+	// 迁移（migrateLegacyTargetName）要枚举平台上的**全部**目标做一次性清理，Windows 实测
+	// 约 10 秒、目标越多越慢；而它只在旧版本建过短名目标时才有事可做 —— 现在新建的目标一律
+	// 用完整 IQN，同一个目标没必要每次都查。进程重启后最多重查一次，失败不记账（下次重试）。
+	legacyMigrated sync.Map
 }
 
 // targetIQN 返回该目标**应当下发给客户端**的 IQN：优先用下发/对账时读回并持久化的实际名字，
@@ -233,12 +240,23 @@ func (s *IscsiService) migrateLegacyTargetNameFrom(ctx context.Context, shortNam
 	}
 	targets := known
 	if targets == nil {
+		// 同一个目标只查一次：这只是一次性历史迁移，却要枚举平台上的**全部**目标
+		// （Windows 实测约 10 秒，目标越多越慢），而它恰恰落在首次挂载的等待路径上。
+		// 失败不记账，下次还会重试（宁可多查一次，也不能漏掉真正的旧目标）。
+		key := strings.ToLower(strings.TrimSpace(iqn))
+		if key == "" {
+			return
+		}
+		if _, done := s.legacyMigrated.Load(key); done {
+			return
+		}
 		var err error
 		targets, err = s.Iscsi.ListTargets(ctx)
 		if err != nil {
 			s.Log.Warn("列出 iSCSI 目标失败，跳过旧命名迁移", "target", shortName, "error", err)
 			return
 		}
+		s.legacyMigrated.Store(key, struct{}{})
 	}
 	for i := range targets {
 		name := strings.TrimSpace(targets[i].Name)
@@ -717,12 +735,26 @@ func (s *IscsiService) ensureUserTarget(ctx context.Context, repo *domain.Reposi
 	iqn := target.IQN(s.iqnPrefix())
 	// 这里是整条预创建链路最慢的一步：Windows 上一次全量下发实测约 35 秒（见 IscsiService 说明）。
 	// 付一次就够 —— 期望状态与"已下发"记账都进了 DB，之后的每次挂载只是分发。
-	if _, err := s.pushTarget(ctx, target, true); err != nil {
-		return err
+	pushed, info, pushErr := s.pushTarget(ctx, target, true)
+	if pushErr != nil {
+		return pushErr
 	}
 	// 读回平台侧**实际**的目标名（可能被改写）并落库：下发过一次之后，
 	// 挂载路径直接用这个值，不必每次再读回。
-	if found := s.discoverActualTargetName(ctx, iqn, target.TargetName); found != "" {
+	//
+	// 下发那一步若已把平台实际状态带回来（Windows 后端就是这样），就不要再跑一次 PowerShell ——
+	// 每次预创建都省 5~7 秒，也把"持锁 35 秒"这段缩短，挂载请求等锁的时间跟着变短。
+	found := ""
+	if info != nil {
+		found = strings.TrimSpace(info.IQN)
+		if found == "" {
+			found = strings.TrimSpace(info.Name)
+		}
+	}
+	if pushed && found == "" {
+		found = s.discoverActualTargetName(ctx, iqn, target.TargetName)
+	}
+	if found != "" {
 		s.rememberActualIQN(ctx, target, found)
 	}
 	if err := s.Store.SetIscsiTargetEnabled(ctx, target.ID, true); err != nil {
@@ -801,25 +833,59 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 	}
 	awaitDiskMs := time.Since(started).Milliseconds()
 
-	unlock, lockErr := s.Locks.LockContext(ctx, lock.TargetKey(target.TargetName))
-	if lockErr != nil {
-		return nil, lockErr
-	}
-	defer unlock()
-	// 拿到锁后重读一次下发记账：target 是锁外读的快照，而"预创建"（JobCreateDiff 结尾的
-	// prePublishTarget）可能刚下发过同一份期望状态并写回指纹 —— 不重读就会把这次挂载的
-	// 十几秒再付一遍（见 refreshAppliedFromStore 的说明）。
+	// ---- 快路径：这份期望状态早就下发过、实际 IQN 也读回过 ----
+	//
+	// 此时平台侧没有任何要改的东西，**不该再去抢目标锁**：预创建（JobCreateDiff 结尾的
+	// prePublishTarget）动辄持锁 30 秒以上，而挂载等到的锁只换来一次"已下发、跳过"的判定。
+	// 用户看到的就是"卡了半分钟"，其实什么都没做。
+	//
+	// 重新挂载（卸载后马上挂回来）、第二个客户端挂同一个库，走的都是这条路：
+	// 一次 PowerShell 都不用付，直接拿落库的实际 IQN 下发。
+	//
+	// 必须先重读记账：target 是锁外读的快照，而预创建可能刚好在这一刻写完指纹。
 	s.refreshAppliedFromStore(ctx, target)
-
 	iqn := target.IQN(s.iqnPrefix())
+	alreadyApplied := false
+	if spec, specErr := s.buildTargetSpec(ctx, target, true); specErr == nil {
+		alreadyApplied = strings.TrimSpace(target.ActualIQN) != "" && s.targetApplied(target, spec)
+	}
 
-	// 阶段推进：分配阶段（首次挂载 / 配置变更）要全量下发一次，Windows 实测约 35 秒
-	// （两次 Set-IscsiServerTarget 各约 15 秒 + 一次映射约 5 秒）；分发阶段整段跳过。
-	// 两者的分工见 IscsiService 的说明。
-	s.emitMountPhase(allocationID, MountPhaseConfiguringTarget)
-	pushed, err := s.pushTarget(ctx, target, true)
-	if err != nil {
-		return nil, err
+	var (
+		pushed bool
+		info   *platform.TargetInfo
+		found  string
+	)
+	if alreadyApplied {
+		s.Log.Info("目标已按期望状态下发过且已读回，跳过等锁与下发",
+			"allocation_id", allocationID, "target", s.targetIQN(target))
+	} else {
+		unlock, lockErr := s.Locks.LockContext(ctx, lock.TargetKey(target.TargetName))
+		if lockErr != nil {
+			return nil, lockErr
+		}
+		defer unlock()
+		// 拿到锁后再重读一次下发记账：等锁这段时间里"预创建"可能已经把同一份期望状态
+		// 下发并写回指纹 —— 不重读就会把这次挂载的十几秒再付一遍（见 refreshAppliedFromStore）。
+		s.refreshAppliedFromStore(ctx, target)
+		iqn = target.IQN(s.iqnPrefix())
+
+		// 阶段推进：分配阶段（首次挂载 / 配置变更）要全量下发一次，Windows 实测约 35 秒
+		// （两次 Set-IscsiServerTarget 各约 15 秒 + 一次映射约 5 秒）；分发阶段整段跳过。
+		// 两者的分工见 IscsiService 的说明。
+		s.emitMountPhase(allocationID, MountPhaseConfiguringTarget)
+		var pushErr error
+		pushed, info, pushErr = s.pushTarget(ctx, target, true)
+		if pushErr != nil {
+			return nil, pushErr
+		}
+		if info != nil {
+			// 下发时脚本在启用后本来就要回读校验，那份数据直接当"实际 IQN + 诊断"用，
+			// 不必再起一次 PowerShell（见 iscsitarget.Manager.SetTargetInfo）。
+			found = strings.TrimSpace(info.IQN)
+			if found == "" {
+				found = strings.TrimSpace(info.Name)
+			}
+		}
 	}
 
 	// 实际 IQN 与诊断只在"刚下发过 / 还没读回过"时做：两者都要再起一次 PowerShell，
@@ -830,7 +896,13 @@ func (s *IscsiService) Publish(ctx context.Context, allocationID string) (*domai
 		// 为什么合并成一次：原先这两件事各起一次 GetTarget（Windows 上一次 PowerShell 实测
 		// 5~7 秒），而首次挂载必然走到这里（还没读回过）—— 十几秒白白叠在用户的等待里，
 		// 正好是客户端超时的最后一段。
-		info, found, readErr := s.readBackTarget(ctx, iqn, target.TargetName)
+		//
+		// 如今多数情况下下发那一步已经把这份数据带回来了（found 非空 / info 非空），
+		// 只有后端没能顺带读回时（LIO、或脚本未改动启用状态）才真正再跑一次。
+		var readErr error
+		if found == "" || info == nil {
+			info, found, readErr = s.readBackTarget(ctx, iqn, target.TargetName)
+		}
 		if found != "" {
 			switch {
 			case strings.EqualFold(found, iqn):
@@ -1053,7 +1125,7 @@ func (s *IscsiService) teardownTargetLocked(ctx context.Context, shortName, iqn 
 		}
 	}
 	if !opt.skipDisable {
-		if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: iqn, Enabled: false}); err != nil {
+		if _, err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: iqn, Enabled: false}); err != nil {
 			s.Log.Warn("停用目标失败", "target", shortName, "iqn", iqn, "error", err)
 		}
 	}
@@ -1233,7 +1305,7 @@ func (s *IscsiService) DisableTarget(ctx context.Context, targetName string) err
 			if err := s.forcePushTarget(ctx, target, false); err != nil {
 				return err
 			}
-		} else if err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: targetName, Enabled: false}); err != nil {
+		} else if _, err := s.Iscsi.EnsureTarget(ctx, platform.TargetSpec{Name: targetName, Enabled: false}); err != nil {
 			// DB 无记录：退化为"仅停用"的最小期望状态，保证目标确实被关掉。
 			return err
 		}
@@ -1414,25 +1486,26 @@ func (s *IscsiService) backingWaitLimit() time.Duration {
 //
 // 平台侧被外部删除/停用由对账器收敛（见 ReconcileTargets），代价是发现得晚（对账周期），
 // 换来的是挂载路径不再付这份钱。
-func (s *IscsiService) pushTarget(ctx context.Context, target *domain.IscsiTarget, enabled bool) (bool, error) {
+func (s *IscsiService) pushTarget(ctx context.Context, target *domain.IscsiTarget, enabled bool) (bool, *platform.TargetInfo, error) {
 	if s.Iscsi == nil {
-		return false, errNotImplemented
+		return false, nil, errNotImplemented
 	}
 	spec, err := s.buildTargetSpec(ctx, target, enabled)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 	if s.targetApplied(target, spec) {
 		s.Log.Info("iSCSI 目标已按当前期望状态下发过，跳过下发", "target", spec.Name)
-		return false, nil
+		return false, nil, nil
 	}
 	// 一次性迁移：清掉"旧命名"（短名）的目标，否则同一个 VHDX 会同时被两个目标映射。
-	// 只在真要下发时做 —— 它要枚举平台上的全部目标，同样是一次 PowerShell。
+	// 只在真要下发时做，且同一目标只做一次（它要枚举平台上的全部目标，同样是一次 PowerShell）。
 	s.migrateLegacyTargetName(ctx, target.TargetName, spec.Name)
-	if err := s.applyTargetSpec(ctx, target, spec); err != nil {
-		return false, err
+	info, err := s.applyTargetSpec(ctx, target, spec)
+	if err != nil {
+		return false, nil, err
 	}
-	return true, nil
+	return true, info, nil
 }
 
 // forcePushTarget 无条件全量下发（对账、鉴权变更、停用等"已经确知平台现状与期望不符"的场景）。
@@ -1444,16 +1517,20 @@ func (s *IscsiService) forcePushTarget(ctx context.Context, target *domain.Iscsi
 	if err != nil {
 		return err
 	}
-	return s.applyTargetSpec(ctx, target, spec)
+	_, err = s.applyTargetSpec(ctx, target, spec)
+	return err
 }
 
 // applyTargetSpec 下发一个构造好的期望状态，并把"已下发"记账写回 DB。
-func (s *IscsiService) applyTargetSpec(ctx context.Context, target *domain.IscsiTarget, spec platform.TargetSpec) error {
-	if err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
-		return err
+//
+// 返回平台**顺带读回**的实际状态（可能为 nil，见 platform.IscsiBackend.EnsureTarget）。
+func (s *IscsiService) applyTargetSpec(ctx context.Context, target *domain.IscsiTarget, spec platform.TargetSpec) (*platform.TargetInfo, error) {
+	info, err := s.Iscsi.EnsureTarget(ctx, spec)
+	if err != nil {
+		return nil, err
 	}
 	s.markApplied(ctx, target, spec)
-	return nil
+	return info, nil
 }
 
 // targetApplied 判断"当前这份期望状态是否已经成功下发到平台"。
@@ -1681,7 +1758,7 @@ func (s *IscsiService) pushInitiatorIDs(ctx context.Context, target *domain.Iscs
 		return err
 	}
 	spec.Initiators = initiatorValues(ids)
-	if err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
+	if _, err := s.Iscsi.EnsureTarget(ctx, spec); err != nil {
 		return err
 	}
 	// 白名单是期望状态的一部分：必须记账，否则下次挂载会因为指纹不一致而白跑一次全量下发。

@@ -67,6 +67,73 @@ function Get-ParameterElementType {
     return $type
 }
 
+# 把一个目标对象压成"上层可直接用"的快照（name / iqn / enabled / initiator_ids / mapped_devices）。
+#
+# 为什么在本脚本里做：启用/停用后的回读校验（下面的 $verify = Get-IscsiServerTarget）
+# 本来就要跑一次，而这次读回的数据和 iscsi_get_targets.ps1 查出来的完全一样。上层为了拿
+# "平台实际 IQN"（Windows 会改写目标名）与排障详情，原先还要再起一次 PowerShell ——
+# 实测 5~7 秒，且**首次挂载必然**要多付这一趟。顺带带回即可整段省掉。
+# 字段归一规则与 iscsi_get_targets.ps1 必须保持一致（两处改动要同步）。
+function Get-TargetSnapshot {
+    param($Target)
+    $targetName = ''
+    try { $targetName = [string]$Target.TargetName } catch { }
+    $targetIqn = ''
+    try { $targetIqn = [string]$Target.TargetIqn } catch { }
+
+    $canonicalTypes = @{
+        'iqn'         = 'IQN'
+        'ipaddress'   = 'IPAddress'
+        'ipv6address' = 'IPv6Address'
+        'dnsname'     = 'DNSName'
+        'macaddress'  = 'MACAddress'
+    }
+    $initiatorIds = @()
+    foreach ($id in @($Target.InitiatorIds)) {
+        if ($null -eq $id) { continue }
+        $method = ''
+        try { $method = [string]$id.Method } catch { }
+        $value = ''
+        try { $value = [string]$id.Value } catch { }
+        if ($method) {
+            $key = $method.ToLowerInvariant()
+            if ($canonicalTypes.ContainsKey($key)) { $method = $canonicalTypes[$key] }
+            $initiatorIds += ($method + ':' + $value)
+        } else {
+            $initiatorIds += $value
+        }
+    }
+
+    $devices = @()
+    foreach ($mapping in @($Target.LunMappings)) {
+        if ($null -eq $mapping) { continue }
+        $path = ''
+        try { $path = [string]$mapping.Path } catch { }
+        if ($path) { $devices += $path }
+    }
+
+    # 启用状态：与 iscsi_get_targets.ps1 同一条判定（优先 Enabled 属性，缺失时按 Status
+    # 名称判定 —— 实测部分版本的目标对象没有 Enabled 属性，此时 [bool]$null 恒为假）。
+    $status = ''
+    try { $status = [string]$Target.Status } catch { }
+    $enabled = $false
+    $enabledProperty = $Target.PSObject.Properties['Enabled']
+    if ($enabledProperty -and $null -ne $enabledProperty.Value) {
+        $enabled = [bool]$enabledProperty.Value
+    } elseif ($Target.PSObject.Properties['Status']) {
+        $enabled = -not ($status -match '^(Disabled|Stopped|Offline|Inactive)$')
+    }
+
+    return [pscustomobject]@{
+        name           = $targetName
+        iqn            = $targetIqn
+        enabled        = $enabled
+        status         = $status
+        initiator_ids  = $initiatorIds
+        mapped_devices = $devices
+    }
+}
+
 # 把 "类型:值" 形式的授权标识转换成目标参数**实际需要**的类型。
 #
 # ⚠️ 实测（Windows Server，InitiatorId 的真实签名）：
@@ -320,6 +387,10 @@ try {
     # 而 -Enable $true（空格）**不报错但不生效**，目标停留在 Disabled，客户端登录报
     # "target name is not found or is marked as hidden from login"（真实事故）。
     # 冒号语法对 switch 与 bool 两种参数形态都正确绑定。
+    # 回读快照：仅在本次真正改动了启用状态时可用（那种情况下脚本内部必须读回校验，
+    # 见下面的 $verify）。未改动启用状态时保持 $null，由上层自行决定是否另行读回。
+    $verifyInfo = $null
+    $actualTargetIQN = ''
     if ($Enabled -ne '') {
         $step = 'set_enabled'
         $enableFlag = [System.Boolean]::Parse($Enabled)
@@ -341,6 +412,10 @@ try {
         if (-not $enableFlag -and -not $looksDisabled) {
             throw ("目标停用未生效（Status=$verifyStatus）")
         }
+
+        # 这次读回的数据直接带回给上层（省掉挂载路径上一次 5~7 秒的额外 PowerShell）。
+        $verifyInfo = Get-TargetSnapshot -Target $verify
+        $actualTargetIQN = [string]$verifyInfo.iqn
     }
 
     # 单向 CHAP
@@ -370,6 +445,11 @@ try {
         step                  = 'done'
         action                = $action
         target_name           = $TargetName
+        # 平台侧**实际对外**的 IQN（Windows 会把目标名改写成 iqn.1991-05.com.microsoft:...）：
+        # 客户端登录必须用它。空串表示本次没有读回（未改动启用状态）。
+        target_iqn            = $actualTargetIQN
+        # 本次改动启用状态时顺带读回的平台实际状态（见 Get-TargetSnapshot）。
+        verify                = $verifyInfo
         initiator_ids_updated = [bool]($InitiatorIdsJson -ne '')
         # 授权列表实际采用的绑定方式：string（原样传字符串）/ object:<类型名>（反射构造）
         initiator_bind        = $bindMode

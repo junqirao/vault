@@ -42,6 +42,9 @@ func (m *Manager) Available(ctx context.Context) error {
 
 // EnsureTarget 幂等地把目标收敛到 spec 描述的**完整期望状态**（全量语义）。
 //
+// 返回值里的 *platform.TargetInfo 恒为 nil：Windows 需要它是因为平台会改写目标名（客户端
+// 登录必须用实际 IQN），而 LIO 的名字由我们归一化后自己写进 configfs，不存在被改写的可能。
+//
 // 收敛顺序（每一步都幂等，且每次下发后都回读 configfs 复验后置条件）：
 //  1. 归一化 IQN（转小写，必要时补前缀）；
 //  2. 目标对象（targetcli 建目标时一并建立 tpg1）；缺 tpg1 的半成品残骸直接重建；
@@ -62,18 +65,18 @@ func (m *Manager) Available(ctx context.Context) error {
 // 复现同一语义：否则 LIO 不会为登录中的 initiator 建动态 ACL，
 // core_tpg_check_initiator_node_acl() 直接返回 NULL，客户端登录被拒并报
 // "Authorization Failure"（现象是门户可达、目标能发现，就是连不上）。
-func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) error {
+func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) (*platform.TargetInfo, error) {
 	if strings.TrimSpace(spec.Name) == "" {
-		return apperr.InvalidParam("target_name")
+		return nil, apperr.InvalidParam("target_name")
 	}
 	// CHAP 凭据必须成对出现；密钥长度受 LIO 内核限制。
 	chap := spec.ChapUser != "" && spec.ChapSecret != ""
 	if (spec.ChapUser == "") != (spec.ChapSecret == "") {
-		return apperr.InvalidParam("chap")
+		return nil, apperr.InvalidParam("chap")
 	}
 	if chap {
 		if err := validateChapSecret(spec.ChapSecret); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	if spec.EnableReverseChap {
@@ -85,17 +88,17 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 	defer m.mu.Unlock()
 
 	if err := ctxErr(ctx); err != nil {
-		return err
+		return nil, err
 	}
 	if err := m.ensureReady(ctx); err != nil {
-		return err
+		return nil, err
 	}
 
 	iqn := m.normalizeTargetName(spec.Name)
 
 	// 2. 目标对象（targetcli 建目标时会一并建立 tpg1）。
 	if err := m.ensureTargetObject(ctx, iqn); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 3. 期望的 ACL 集合。排序后使用，让命令顺序与日志可复现（map 遍历顺序是随机的）。
@@ -138,7 +141,7 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 		chapUser:     spec.ChapUser,
 		chapSecret:   spec.ChapSecret,
 	}); err != nil {
-		return err
+		return nil, err
 	}
 
 	// 5. backstore 及其 attrib（UNMAP 仿真 / SSD 声明）。名字由目标名稳定派生，
@@ -147,10 +150,10 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 	if strings.TrimSpace(spec.BackingRef) != "" {
 		bs = backstoreNameForTarget(iqn)
 		if err := m.ensureBackstore(ctx, bs, spec.BackingRef); err != nil {
-			return err
+			return nil, err
 		}
 		if err := m.applyBackstoreAttribs(ctx, bs); err != nil {
-			return err
+			return nil, err
 		}
 	}
 
@@ -168,18 +171,18 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 			if _, ok := want[ini]; !ok {
 				m.logger.Info("移除不再授权的 initiator", "target", iqn, "initiator", ini)
 				if err := m.removeACL(ctx, iqn, ini); err != nil {
-					return err
+					return nil, err
 				}
 			}
 		}
 	}
 	for _, ini := range wantList {
 		if err := m.ensureACL(ctx, iqn, ini); err != nil {
-			return err
+			return nil, err
 		}
 		if chap {
 			if err := m.setACLAuth(ctx, iqn, ini, spec.ChapUser, spec.ChapSecret); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
@@ -190,17 +193,23 @@ func (m *Manager) EnsureTarget(ctx context.Context, spec platform.TargetSpec) er
 	// demo_mode_write_protect 决定（见 applyTpgAttribs）。
 	if bs != "" {
 		if err := m.ensureTpgMapping(ctx, iqn, bs); err != nil {
-			return err
+			return nil, err
 		}
 		for _, ini := range wantList {
 			if err := m.ensureACLMapping(ctx, iqn, ini, bs, spec.ReadOnly); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
 
 	// 8. 最后才 enable（避免"先开服后配盘"造成客户端看到残缺配置）。
-	return m.setEnabled(ctx, iqn, spec.Enabled)
+	if err := m.setEnabled(ctx, iqn, spec.Enabled); err != nil {
+		return nil, err
+	}
+
+	// 平台实际状态在 configfs 里本来就是本地文件，读回只是白扫一遍目录；返回 nil 表示
+	// "没有顺带读回"，上层会按需自己调 GetTarget（见 platform.IscsiBackend.EnsureTarget）。
+	return nil, nil
 }
 
 // RemoveTarget 删除目标及其名下全部授权与映射。幂等（目标不存在视为成功）。

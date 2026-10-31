@@ -114,7 +114,8 @@ function StorageUsageRow({
  * 存储库首页的「存储」总览卡片。
  *
  * 与「我的配额」模块同款排版：一行总量 + 一条进度条 + 底部"剩余 / 存储数量"。
- * 不在首页罗列每个存储，明细只在只读存储页看；入口是**标题后的箭头按钮**，
+ * 不在首页罗列每个存储，明细只在只读存储页看；入口是**标题 + 箭头合成的 text 按钮**
+ * （一级文字 + 组件自带的尾置图标，"存储 →" 整体可点，点击面积也比单独一个小箭头大），
  * 卡片本身不再整块可点（避免与卡片内其他区域的可点语义混淆、也不再给整张卡片
  * 加上悬停变色）。管理入口在只读存储页右上角（见 StorageUsagePage）。
  */
@@ -145,16 +146,24 @@ export function StorageUsageCard({
   ) : (
     <>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
-        <Typography.Text strong>{t('storage.title')}</Typography.Text>
+        {/*
+          入口就是「存储 →」这一颗按钮：箭头用 Button 自带的 icon + iconPosition="end"，
+          不手写 span/SVG —— 手写的话箭头和文字各自占一行内位置，字号、行高、间距全要自己
+          调，结果就是箭头离标题很远、基线也对不齐（真实反馈："这个按钮要对齐，不要离太远"）。
+          paddingInline: 0 保证标题左边缘与下面「我的配额」标题对齐（两张卡上下叠在同一模块里）。
+        */}
         <Tooltip title={t('storage.usage.detail')}>
           <Button
             type="text"
             size="small"
             aria-label={t('storage.usage.detail')}
             icon={<ArrowRightOutlined />}
+            iconPosition="end"
             onClick={onOpen}
-            style={{ alignSelf: 'center' }}
-          />
+            style={{ paddingInline: 0, height: 'auto', fontWeight: 600 }}
+          >
+            {t('storage.title')}
+          </Button>
         </Tooltip>
         <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
           {`${t('storage.usage.used')} ${formatBytes(aggregate.used)} / ${formatBytes(aggregate.total)}`}

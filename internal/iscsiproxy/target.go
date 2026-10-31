@@ -29,6 +29,11 @@ const (
 	// maxPending bounds the per-session in-flight command table. A full table
 	// drops the observation, never the command.
 	maxPending = 256
+	// maxPendingBytes bounds the staging buffers those entries pin. A count alone
+	// is not a memory bound: one 4MiB read stages a thousand times the buffer a
+	// 4KiB read does, so 256 entries can pin a gigabyte. A full budget drops the
+	// observation, never the command (see session.registerPending).
+	maxPendingBytes = 64 << 20
 	// scanBuckets mirrors the cache package's sequential-scan detector fan-out.
 	scanBuckets = 64
 )
@@ -102,6 +107,10 @@ type counters struct {
 	// tell a range invalidation (cheap, keeps the cache warm) from a whole-cache
 	// drop (wipes it), and "缓存突然从几百 MB 掉到几 KB" is exactly the latter.
 	wholeDrops atomic.Int64
+	// pendingDropped counts read observations a session could not stage (table
+	// or staging budget full). Each one only costs a future miss, but a value
+	// that keeps growing means the table is not draining.
+	pendingDropped atomic.Int64
 }
 
 // target serves one allocation: a listener the initiator connects to, a backend
@@ -119,12 +128,15 @@ type target struct {
 	ln   net.Listener
 	addr net.Addr
 
-	mu          sync.Mutex
-	closed      bool
-	cache       *cache.Cache
-	l2          *l2.File
-	blockSize   uint32
-	blockCount  uint64
+	mu     sync.Mutex
+	closed bool
+	// cache/l2/blockSize/blockCount 用原子量而不是 mu：它们在同一把锁里发布一次
+	// 之后就不再变，而每条读/写命令都要读一遍几何（见 lunBlockSize/getCache）。
+	// 把它们留在 mu 下等于让所有会话在同一把互斥锁上排队，哪怕值永远不变。
+	cache       atomic.Pointer[cache.Cache]
+	l2          atomic.Pointer[l2.File]
+	blockSize   atomic.Uint32
+	blockCount  atomic.Uint64
 	serial      string
 	wwid        string
 	bindStarted bool
@@ -238,6 +250,12 @@ func (t *target) handle(ic net.Conn) {
 	tuneSocket(bc)
 	s := newSession(t, ic, bc)
 	t.addSession(s)
+	// 登记可能落在 close() 摘走会话列表之后：目标已经在收摊，没人会来关这条会话，
+	// 它会一直挂到发起端自己断开，而 close() 正卡在 sessWG.Wait() 上等它（快照
+	// 也就跟着推迟）。这里补一次自检把那个窗口封掉。
+	if t.isClosed() {
+		s.close()
+	}
 	s.run()
 	t.removeSession(s)
 }
@@ -263,15 +281,11 @@ func (t *target) isClosed() bool {
 // getCache returns the bound cache, or nil while the target is unbound (all
 // traffic is a pure pass-through until the backing LUN's identity is seen).
 func (t *target) getCache() *cache.Cache {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.cache
+	return t.cache.Load()
 }
 
 func (t *target) getL2() *l2.File {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.l2
+	return t.l2.Load()
 }
 
 // dropCache throws away every cached block of both levels and leaves the target,
@@ -303,18 +317,14 @@ func (t *target) dropCache() bool {
 // lunBlockSize returns the backing LUN's logical block size, or 0 until a READ
 // CAPACITY response has been observed.
 func (t *target) lunBlockSize() uint32 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.blockSize
+	return t.blockSize.Load()
 }
 
 // lunBlockCount returns the backing LUN's logical block count, or 0 until a
 // READ CAPACITY response has been observed. It bounds the ranges a WRITE SAME
 // or an UNMAP may name.
 func (t *target) lunBlockCount() uint64 {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.blockCount
+	return t.blockCount.Load()
 }
 
 // identitySeen reports whether the LUN has been described well enough to bind a
@@ -322,7 +332,7 @@ func (t *target) lunBlockCount() uint64 {
 func (t *target) identitySeen() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.blockSize != 0 && (t.serial != "" || t.wwid != "")
+	return t.blockSize.Load() != 0 && (t.serial != "" || t.wwid != "")
 }
 
 func (t *target) setSerial(s string) {
@@ -342,10 +352,13 @@ func (t *target) setWWID(s string) {
 }
 
 func (t *target) setCapacity(blockSize uint32, blockCount uint64) {
+	if blockSize == 0 {
+		return
+	}
 	t.mu.Lock()
-	if t.blockSize == 0 && blockSize > 0 {
-		t.blockSize = blockSize
-		t.blockCount = blockCount
+	if t.blockSize.Load() == 0 {
+		t.blockSize.Store(blockSize)
+		t.blockCount.Store(blockCount)
 	}
 	t.mu.Unlock()
 }
@@ -360,7 +373,8 @@ func (t *target) maybeBind() {
 		t.mu.Unlock()
 		return
 	}
-	if t.blockSize == 0 || (t.serial == "" && t.wwid == "") {
+	bs, bc := t.blockSize.Load(), t.blockCount.Load()
+	if bs == 0 || (t.serial == "" && t.wwid == "") {
 		t.mu.Unlock()
 		return
 	}
@@ -369,15 +383,15 @@ func (t *target) maybeBind() {
 		TargetIQN:  t.iqn,
 		Serial:     t.serial,
 		WWID:       t.wwid,
-		BlockCount: t.blockCount,
-		BlockSize:  t.blockSize,
+		BlockCount: bc,
+		BlockSize:  bs,
 	}
 	cc := t.cc
 	// A cache larger than the LUN it caches can only hold data that does not
 	// exist, and sizing one for it is what turned a few libraries into hundreds
 	// of gigabytes of cache budget. The LUN capacity is only known once a READ
 	// CAPACITY has been seen; until then the configured size is left alone.
-	if lunBytes := int64(t.blockCount) * int64(t.blockSize); lunBytes > 0 {
+	if lunBytes := int64(bc) * int64(bs); lunBytes > 0 {
 		if bounded := l2.BoundSize(cc.L2.SizeBytes, lunBytes); bounded != cc.L2.SizeBytes {
 			t.log.Info("iscsiproxy: L2 预算裁到后端容量",
 				"configured", cc.L2.SizeBytes, "lun_bytes", lunBytes, "using", bounded)
@@ -404,7 +418,8 @@ func (t *target) maybeBind() {
 		_ = closeCache(c, l2f)
 		return
 	}
-	t.cache, t.l2 = c, l2f
+	t.cache.Store(c)
+	t.l2.Store(l2f)
 	t.l1Binding = ns
 	t.mu.Unlock()
 	// L2 可能是关着的（未启用或本平台不可用），此时恢复数无意义，如实记 0。
@@ -489,8 +504,7 @@ func (t *target) close() error {
 		return nil
 	}
 	t.closed = true
-	c, l2f := t.cache, t.l2
-	t.cache, t.l2 = nil, nil
+	c, l2f := t.cache.Swap(nil), t.l2.Swap(nil)
 	t.mu.Unlock()
 
 	if t.ln != nil {
@@ -516,14 +530,15 @@ func (t *target) close() error {
 func (t *target) statsSnapshot() Stats {
 	st := Stats{
 		Proxy: StatsSnapshot{
-			Reads:         t.stats.reads.Load(),
-			Writes:        t.stats.writes.Load(),
-			ReadBytes:     t.stats.readBytes.Load(),
-			WriteBytes:    t.stats.writeBytes.Load(),
-			Invalidations: t.stats.invalidations.Load(),
-			LocalCmds:     t.stats.localCmds.Load(),
-			Passthrough:   t.stats.passthrough.Load(),
-			Degraded:      t.stats.degraded.Load(),
+			Reads:          t.stats.reads.Load(),
+			Writes:         t.stats.writes.Load(),
+			ReadBytes:      t.stats.readBytes.Load(),
+			WriteBytes:     t.stats.writeBytes.Load(),
+			Invalidations:  t.stats.invalidations.Load(),
+			LocalCmds:      t.stats.localCmds.Load(),
+			Passthrough:    t.stats.passthrough.Load(),
+			Degraded:       t.stats.degraded.Load(),
+			PendingDropped: t.stats.pendingDropped.Load(),
 		},
 		L1Restored: int(t.stats.l1Restored.Load()),
 		WholeDrops: int(t.stats.wholeDrops.Load()),
