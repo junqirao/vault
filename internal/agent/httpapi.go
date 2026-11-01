@@ -225,8 +225,12 @@ func normalizeLogDay(raw string) string {
 // handleHealth 返回健康信息（含管理员权限与真实连接状态）。
 //
 // 可选查询参数 expected_version：调用方（Electron 主进程）传入自身期望的代理版本号，
-// 服务端据此计算 version_mismatch，用于向界面提示"代理版本与客户端不一致"
-// （陈旧代理的典型特征，见 frontend/apps/client/electron/agent.ts 的说明）。
+// 服务端据此计算 version_mismatch，用于向界面提示"代理版本落后于客户端"。
+//
+// ⚠️ 只有**代理更旧**才算不一致：代理独立自更新时可能先于客户端本体升到新版本
+// （两条更新通道并不保证同时完成），此时"代理更新、客户端旧"是正常过渡态，不应告警。
+// 真正会出问题的是代理落后：旧代理可能缺少客户端已经依赖的能力。
+// 见 frontend/apps/client/electron/agent.ts 的版本判定与关于页的展示。
 //
 // 多服务端：servers 逐台给出连通状态；server（单数）是**主服务端**那一台的兼容字段
 // ——老客户端只读它，行为不变（见 serverView 的说明）。
@@ -260,7 +264,8 @@ func (a *Agent) handleHealth(w http.ResponseWriter, r *http.Request) {
 	}
 	if expected := strings.TrimSpace(r.URL.Query().Get("expected_version")); expected != "" {
 		payload["expected_version"] = expected
-		payload["version_mismatch"] = !sameVersion(a.version, expected)
+		// 只把"代理落后"判为不一致（见函数头注释）：代理更新不应该被标成错误。
+		payload["version_mismatch"] = versionOlder(a.version, expected)
 	}
 	a.writeJSON(w, http.StatusOK, payload)
 }
@@ -867,6 +872,16 @@ func (a *Agent) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, result)
 }
 
+// updateApplyRequest 是 POST /agent/update/apply 的请求体（可选）。
+type updateApplyRequest struct {
+	// CurrentVersion 当前正在运行的**客户端本体**版本（Electron app.getVersion()）。
+	//
+	// 由客户端传入，用于防止"代理自更新跑在客户端本体前面"：代理与本体是两条独立
+	// 更新通道，若本次发布同时带客户端本体产物，就应交给本体更新一起替换；单独把代理
+	// 升到比运行中本体更高的版本，会让界面上出现"本地服务与客户端版本不一致"。
+	CurrentVersion string `json:"current_version"`
+}
+
 // handleUpdateApply 应用更新。
 //
 // 全部前置步骤（再次验签 / 下载校验 / 写 pending / 启动 updater）都在 applyUpdate 内完成，
@@ -874,7 +889,12 @@ func (a *Agent) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 // 响应写出后再通知主程序退出（而不是在 applyUpdate 内部退出），
 // 避免本地 HTTP 服务在响应尚未落盘时被 Shutdown 掐断。
 func (a *Agent) handleUpdateApply(w http.ResponseWriter, r *http.Request) {
-	if err := a.applyUpdate(r.Context()); err != nil {
+	var req updateApplyRequest
+	// 请求体可选：老客户端不带它时退化为原来的行为（只做版本单调性判断）。
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req)
+	}
+	if err := a.applyUpdate(r.Context(), req.CurrentVersion); err != nil {
 		a.writeError(w, err)
 		return
 	}

@@ -98,6 +98,11 @@ const (
 	CodeUpdateInProgress = "update.in_progress"
 	// CodeUpdateNotAvailable 当前没有可用的更新（409）。
 	CodeUpdateNotAvailable = "update.not_available"
+	// CodeUpdateClientPending 本次发布同时包含客户端本体更新，本地服务应随本体一起替换（409）。
+	//
+	// 代理与本体的更新是两条独立通道：若允许代理先自更新到比运行中本体更高的版本，
+	// 界面上会出现"本地服务版本比客户端新"的不一致。见 applyUpdate 的说明。
+	CodeUpdateClientPending = "update.client_pending"
 	// CodeUpdateFailed 更新流程本身失败（500，args.stage 指明阶段）。
 	CodeUpdateFailed = "update.failed"
 	// CodeDigestMismatch 下载产物与清单声明的 sha256/大小不一致（422）。

@@ -22,7 +22,7 @@ interface VaultAgentInfo {
   version?: string | null
   /** 客户端期望的代理版本。 */
   expectedVersion?: string
-  /** 代理版本与客户端期望是否不一致（陈旧代理）。 */
+  /** 代理版本是否**落后**于客户端期望（陈旧代理；代理更新不置位）。 */
   versionMismatch?: boolean
 }
 
@@ -50,6 +50,13 @@ type AgentStreamMessage =
 
 /** preload 暴露的最小 API（见 electron/preload.ts）。 */
 interface VaultBridge {
+  /**
+   * 客户端**本体**版本（安装目录里正在运行的那一份，由主进程注入）。
+   *
+   * 与构建期注入的 __APP_VERSION__ 可能不同：渲染层资源可以被热更到比本体更新的版本。
+   * 浏览器 dev 下为空，调用方应回退到 __APP_VERSION__。
+   */
+  appVersion?: string
   getConfig: () => Promise<unknown>
   setConfig: (value: unknown) => Promise<boolean>
   getConfigPath: () => Promise<string>

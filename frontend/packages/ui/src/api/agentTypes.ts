@@ -765,6 +765,13 @@ export interface UpdateInfo {
    * 自动更新流程遇到非空会跳过整包安装（见 apps/client/src/flow/useAutoUpdate.ts）。
    */
   breaks_servers?: { server_name: string; max: string }[]
+  /**
+   * 本次发布的清单里是否同时带客户端本体产物（kind=client）。
+   *
+   * 为 true 时本次发布应走"客户端本体更新"（程序目录里自带同版本的 Vault-Agent.exe），
+   * 自动更新不应再单独把本地代理升到比运行中本体更高的版本。
+   */
+  client_available?: boolean
 }
 
 /** 渲染层资源热更状态（POST /agent/update/web/apply、GET /agent/update/web、web_update 事件）。 */

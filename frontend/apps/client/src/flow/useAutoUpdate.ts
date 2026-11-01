@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 
 import { agentApi, applyWebLayer, isAgentUnavailableError, type UpdateInfo } from '@vault/ui'
 
+import { CLIENT_VERSION } from '../config'
+
 /**
  * 两次自动检查之间的最小间隔（同一进程内）。
  *
@@ -147,12 +149,32 @@ async function runAutoUpdate(): Promise<RunOutcome> {
     return 'retry'
   }
 
+  /*
+   * 本次发布同时带客户端本体（kind=client）：
+   * 本体更新会连本地代理一起替换（程序目录里就带着同版本 Vault-Agent.exe）。此时
+   * **不要**再单独给代理做自更新——代理自更新与本体更新是两条独立通道，先完成的那条
+   * 会把版本拉到比另一条高，界面上就会出现"本地服务与客户端版本不一致"的告警。
+   * 把这次发布整体交给本体更新通道（见 electron/clientUpdate.ts 的 startClientUpdateWatch），
+   * 也跳过渲染层热更：否则界面会比本体新，同样会造成版本展示错位。
+   *
+   * 这个判断放在 breaks_servers 之前：即使这次升级需要用户确认，也不该先把界面/代理
+   * 单独升上去，否则用户还没确认就已经出现了版本错位。
+   */
+  const target = (info.version ?? '').trim()
+  if (info.available && info.client_available && target !== '' && isNewerVersion(target, CLIENT_VERSION)) {
+    console.info(
+      `[auto-update] 发布 ${target} 含客户端本体，优先由本体更新通道安装（当前本体 ${CLIENT_VERSION}）`
+    )
+    return 'done'
+  }
+
   if (info.available && (info.breaks_servers?.length ?? 0) === 0) {
     // 先等自动挂载这一轮结束，再让代理退出替换（见 MOUNT_IDLE_WAIT_MS 的说明）。
     if (await waitMountsIdle(Date.now() + MOUNT_IDLE_WAIT_MS)) {
       try {
         // 代理替换 exe 后退出，主进程重新拉起并在就绪后自动重载界面——全程无需用户操作。
-        await agentApi.applyUpdate()
+        // 带上本体版本：清单若同时带客户端本体，代理会拒绝单独跑在本体前面（见接口说明）。
+        await agentApi.applyUpdate(CLIENT_VERSION)
         return 'done'
       } catch (error) {
         console.warn(`[auto-update] apply failed: ${describe(error)}`)
@@ -226,6 +248,22 @@ async function waitMountsIdle(deadline: number): Promise<boolean> {
     if (Date.now() >= deadline) return false
     await sleep(MOUNT_POLL_MS)
   }
+}
+
+/** 语义化版本比较（`a > b`）；任一方不可解析时返回 false（保守：不跳过更新）。 */
+function isNewerVersion(a: string, b: string): boolean {
+  const parse = (value: string): number[] | null => {
+    const m = /^(\d+)\.(\d+)\.(\d+)/.exec(value.trim())
+    if (!m) return null
+    return [Number(m[1]), Number(m[2]), Number(m[3])]
+  }
+  const va = parse(a)
+  const vb = parse(b)
+  if (!va || !vb) return false
+  for (let i = 0; i < 3; i += 1) {
+    if (va[i] !== vb[i]) return va[i] > vb[i]
+  }
+  return false
 }
 
 function sleep(ms: number): Promise<void> {

@@ -143,6 +143,12 @@ type UpdateCheckResult struct {
 	PublicKeyFingerprint string `json:"public_key_fingerprint,omitempty"`
 	// BreaksServers 升级后将不再兼容的服务端列表（非空时需用户确认）。
 	BreaksServers []BreakServer `json:"breaks_servers,omitempty"`
+	// ClientAvailable 本次发布的清单里是否同时带**客户端本体**产物（kind=client）。
+	//
+	// 自动更新据此决定要不要单独升级本地代理：本体产物里已经包含同版本的
+	// Vault-Agent.exe，由本体更新通道一起替换即可；单独把代理升到比运行中的客户端
+	// 本体更高的版本会产生"本地服务比客户端新"的不一致（两条通道的完成时间不同）。
+	ClientAvailable bool `json:"client_available,omitempty"`
 }
 
 // pendingUpdate 是写入 update\pending.json 的"待确认更新"记录。
@@ -183,6 +189,9 @@ func (c *updateCandidate) result() *UpdateCheckResult {
 		ReleasedAt:           c.manifest.ReleasedAt,
 		PublicKeyFingerprint: UpdatePublicKeyFingerprint(),
 		BreaksServers:        c.breaks,
+		// 本体产物存在即说明这次发布要走"整包"（客户端本体更新会连带替换代理），
+		// 自动更新不应再单独给代理做自更新（见字段说明）。
+		ClientAvailable: c.manifest.FindArtifactKind(updatepkg.KindClient) != nil,
 	}
 }
 
@@ -544,7 +553,7 @@ func serverErrorFields(err error) (code, reason string, args map[string]any) {
 //  6. 写 update\pending.json；
 //  7. 复制自身为临时副本，并以 apply-update 子命令启动该副本；
 //  8. 返回 started=true，随后由调用方（handler）触发优雅退出。
-func (a *Agent) applyUpdate(ctx context.Context) error {
+func (a *Agent) applyUpdate(ctx context.Context, clientVersion string) error {
 	// ① 并发保护：一次只允许一个更新流程。
 	if !a.beginUpdate() {
 		return apperr.New(CodeUpdateInProgress, http.StatusConflict)
@@ -573,6 +582,24 @@ func (a *Agent) applyUpdate(ctx context.Context) error {
 			reason = res.Reason
 		}
 		return apperr.New(CodeUpdateNotAvailable, http.StatusConflict).WithArg("reason", reason)
+	}
+
+	// ③.5 不要单独把代理升到比运行中客户端本体更高的版本。
+	//
+	// 本次发布若同时带客户端本体产物，本体更新通道会连代理一起替换（程序目录里就带着
+	// 同版本的 Vault-Agent.exe）。代理自更新与本体更新是两条独立通道，谁先完成就会让
+	// 版本短暂不一致；如果代理先跳到新版本，界面上就会出现"本地服务版本比客户端新"的
+	// 橙色告警（真实反馈），而且旧本体与旧 preload 搭配新代理的组合没有经过验证。
+	// 此时返回软失败，让客户端先把本体换到同一版本（见 UpdateCheckResult.ClientAvailable）。
+	if client := strings.TrimSpace(clientVersion); client != "" &&
+		cand.manifest.FindArtifactKind(updatepkg.KindClient) != nil {
+		if newer, err := isNewer(cand.manifest.Version, client); err == nil && newer {
+			a.logger.Info("更新清单同时包含客户端本体，等待本体更新一起安装，跳过代理自更新",
+				"target", cand.manifest.Version, "client", client)
+			return apperr.New(CodeUpdateClientPending, http.StatusConflict).
+				WithArg("target", cand.manifest.Version).
+				WithArg("client", client)
+		}
 	}
 
 	// ④ 下载产物（边下边算 sha256，支持断点续传与重试）。
@@ -1063,6 +1090,22 @@ func sameVersion(a, b string) bool {
 		return strings.TrimSpace(a) == strings.TrimSpace(b)
 	}
 	return semver.Compare(va, vb) == 0
+}
+
+// versionOlder 判断 current 是否**严格旧于** baseline（语义比较）。
+//
+// 用于"代理版本是否落后于客户端"的判定：代理自更新独立于客户端本体更新，两个通道
+// 完成时间不同，代理比客户端新是正常过渡态（不应告警）；只有代理更旧才说明本地服务
+// 缺少客户端已经依赖的能力，需要提示用户。
+//
+// 任一侧无法解析时退回字符串不等比较（保守：宁可提示，也不放过真正不一致的版本）。
+func versionOlder(current, baseline string) bool {
+	cur, errCur := semver.Parse(current)
+	base, errBase := semver.Parse(baseline)
+	if errCur != nil || errBase != nil {
+		return !sameVersion(current, baseline)
+	}
+	return semver.Compare(cur, base) < 0
 }
 
 // versionAtLeast 判断 current 是否**不低于** target（语义比较）。

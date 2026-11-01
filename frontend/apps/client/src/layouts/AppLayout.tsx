@@ -22,7 +22,7 @@ import { useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 // 侧边栏品牌处展示对外的发布版本（内部构建号只在「关于」里展示）。
-import { RELEASE_CHANNEL, RELEASE_VERSION } from '../config'
+import { CLIENT_VERSION, RELEASE_CHANNEL, RELEASE_VERSION } from '../config'
 // 与本地条目比对服务端地址用同一口径：代理回传的 url 与本地 baseUrl 可能差一个尾斜杠。
 import { normalizeUrl, rememberManualServerSwitch } from '../store/appStore'
 
@@ -33,6 +33,7 @@ import {
   SystemDepsBanner,
   layout,
   palette,
+  isAgentVersionBehind,
   roleLabel,
   spacing,
   translateError,
@@ -77,6 +78,21 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
   const { servers, activeKey, active, setActive } = useServerConfig()
   const agent = useAgent()
   const agentVersion = useAgentVersion()
+  /*
+   * 本地服务版本与"是否不一致"必须来自同一口径。
+   *
+   * 主进程的版本信息是异步补全的（拉一次 /agent/health 后回填），失败时 version/mismatch
+   * 会一直为空；而健康快照是界面自己拉的，可能已经拿到版本。只信主进程的 mismatch 会
+   * 出现"版本号显示旧值、却不提示不一致"。这里保留主进程判定，并用**本体版本**兜底比对
+   * （clientVersion 取的是运行时本体版本，不是渲染层热更包的版本，见 config.ts）。
+   *
+   * 只在代理**落后**时告警：代理自更新可以先于客户端本体完成，"代理比客户端新"是正常
+   * 过渡态（本体随后会带着同版本代理重启），提示只会制造噪音。
+   */
+  const agentVersionText = agentVersion.agent || agent.health?.agent_version || ''
+  const expectedAgentVersion = agentVersion.expected || CLIENT_VERSION
+  const agentMismatch =
+    agentVersion.mismatch || isAgentVersionBehind(agentVersionText, expectedAgentVersion)
   // 服务端往返延迟（顶栏指标，每 10 秒自测一次）：见下面 latencyText / latencyColor。
   const latency = useServerLatency(active?.baseUrl)
   // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
@@ -287,7 +303,7 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
       {!agent.available ? <Typography.Text type="warning">{t('agent.hostMissing')}</Typography.Text> : null}
       {agent.health ? (
         <>
-          <Typography.Text>{`${t('agent.version')}: ${agent.health.agent_version}`}</Typography.Text>
+          <Typography.Text>{`${t('agent.version')}: ${agentVersionText || '-'}`}</Typography.Text>
           <Typography.Text>{`${t('agent.platform')}: ${agent.health.platform}`}</Typography.Text>
           <Typography.Text>
             {`${t('agent.admin')}: ${agent.health.admin ? t('agent.admin.yes') : t('agent.admin.no')}`}
@@ -343,11 +359,11 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
         </Typography.Text>
       ) : null}
       {agent.error ? <Typography.Text type="danger">{translateError(agent.error)}</Typography.Text> : null}
-      {agentVersion.mismatch ? (
+      {agentMismatch ? (
         <Typography.Text type="warning">
           {t('agent.versionMismatch.detail', {
-            agent: agentVersion.agent ?? '-',
-            client: agentVersion.expected || '-'
+            agent: agentVersionText || '-',
+            client: expectedAgentVersion || '-'
           })}
         </Typography.Text>
       ) : null}
@@ -477,7 +493,7 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
                   {t('agent.server.retry')}
                 </Button>
               ) : null}
-              {agentVersion.mismatch ? (
+              {agentMismatch ? (
                 <Tag color={palette.warning} style={{ cursor: 'pointer' }}>
                   {t('agent.versionMismatch')}
                 </Tag>

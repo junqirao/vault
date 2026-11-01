@@ -192,6 +192,12 @@ type Snapshot struct {
 	L1UsedBytes                                                                                   int64
 	L1LimitBytes                                                                                  int64
 	L1ResidentBytes                                                                               int64
+	// L2Skipped counts blocks a fill could not hand to an L2 writer because the
+	// population semaphore was full. A skipped block is lost for good: L2 then
+	// holds a partial range and a whole-command lookup cannot hit it. It should
+	// stay near zero; sustained growth explains "L2 is enabled but every read
+	// still goes to the backend".
+	L2Skipped int64
 }
 
 func (s *Stats) snapshot() Snapshot {
@@ -226,8 +232,9 @@ type Cache struct {
 	// them against an invalidation, which must wait for the populations already
 	// in flight before it drops a sector they carry pre-write data for. Both are
 	// unused when the cache has no L2.
-	l2Sem chan struct{}
-	fence l2Fence
+	l2Sem     chan struct{}
+	fence     l2Fence
+	l2Skipped atomic.Int64
 
 	// l2Gate orders a read's L2 lookup against an invalidation. A write holds it
 	// exclusively across its epoch bump and its L2 drop, so a sector a read takes
@@ -287,9 +294,22 @@ type Cache struct {
 }
 
 // l2WriteConcurrency bounds the background L2 populations. L2 is a secondary
-// cache: when this many writes are already outstanding a miss simply skips
-// populating L2 instead of delaying the read.
-const l2WriteConcurrency = 8
+// cache: when this many writes are already outstanding a miss skips populating
+// L2 instead of delaying the read.
+//
+// The bound has to be large enough that the skip is genuinely exceptional,
+// because a skipped population is lost for good and a partial L2 cannot serve
+// any whole command. The fill path hands one block per goroutine to this
+// semaphore, so a slot is held from the moment the fill worker decides to
+// populate L2 until the store write completes. At 8 slots the fills of a
+// sequential read queue faster than the writers drain (the backend read and the
+// fill workers do not wait for the L2 write), the semaphore stays full, and
+// roughly half the blocks of every pass were dropped. L2 then held a random
+// subset of the range, no whole-command lookup could hit it, and every read
+// fell back to the backing target — the cache looked "on" while providing only
+// L1. 64 slots leave enough headroom for a burst of fills without pinning more
+// than 64 * block size of staging buffers.
+const l2WriteConcurrency = 64
 
 // defaultL2InvQueueDepth bounds the deferred L2 invalidations queued by
 // InvalidateAsync. A full queue drops the L2 half of an invalidation: L1 — the
@@ -409,6 +429,7 @@ func (c *Cache) Stats() Snapshot {
 	s.L1UsedBytes = blocks * int64(c.blockSize)
 	s.L1LimitBytes = int64(c.totalBlocks) * int64(c.blockSize)
 	s.L1ResidentBytes = c.residentBytes(blocks, slots)
+	s.L2Skipped = c.l2Skipped.Load()
 	return s
 }
 
@@ -1367,6 +1388,7 @@ func (c *Cache) installValidated(blk uint64, blockOff int, data []byte, epoch ui
 			go c.writeL2(blk, first, data, rel)
 			return true
 		default:
+			c.l2Skipped.Add(1)
 		}
 	}
 	sh.mu.Unlock()

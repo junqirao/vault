@@ -59,6 +59,32 @@ func TestReconcileUpdateClearsPendingWhenCurrentNotOlder(t *testing.T) {
 	}
 }
 
+// TestVersionOlder 锁定"只有代理落后才告警"的口径：
+//
+// 代理自更新与客户端本体更新是两条独立通道，代理可能先完成自更新（比客户端新）。
+// 这个方向是正常过渡态，不能被当作版本不一致；只有代理更旧才需要提示。
+func TestVersionOlder(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		current  string
+		baseline string
+		want     bool
+	}{
+		{name: "代理更旧", current: "0.1.231", baseline: "0.1.232", want: true},
+		{name: "完全相同", current: "0.1.232", baseline: "0.1.232", want: false},
+		{name: "代理更新", current: "0.1.232", baseline: "0.1.231", want: false},
+		{name: "代理领先一个大版本", current: "1.0.0", baseline: "0.9.9", want: false},
+		{name: "无法解析时退回不等比较", current: "dev", baseline: "0.1.232", want: true},
+		{name: "无法解析且相同", current: "dev", baseline: "dev", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := versionOlder(tc.current, tc.baseline); got != tc.want {
+				t.Fatalf("versionOlder(%q, %q) = %v，期望 %v", tc.current, tc.baseline, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestReconcileUpdateKeepsPendingWhenCurrentOlder 锁定另一侧：版本确实没变/更旧时才
 // 保留 pending（等待下一次启动重试），不能误清。
 func TestReconcileUpdateKeepsPendingWhenCurrentOlder(t *testing.T) {

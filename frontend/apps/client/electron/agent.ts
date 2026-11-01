@@ -6,7 +6,7 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { app } from 'electron'
 
-import { agentDataDir } from './webapp'
+import { agentDataDir, compareVersions } from './webapp'
 
 /**
  * 本地代理（Vault-Agent.exe）生命周期管理。
@@ -30,7 +30,7 @@ export interface AgentInfo {
   version?: string | null
   /** 客户端期望的代理版本（app.getVersion()）。 */
   expectedVersion?: string
-  /** 代理版本与客户端期望不一致（陈旧代理，界面据此提示）。 */
+  /** 代理版本**落后**于客户端期望（陈旧代理，界面据此提示；代理更新是正常过渡态，不置位）。 */
   versionMismatch?: boolean
 }
 
@@ -807,7 +807,13 @@ export class AgentManager {
     try {
       const { version, mismatch } = await fetchHealth(baseUrl, token, expected)
       if (!this.info.available || this.info.baseUrl !== baseUrl) return
-      const inferred = expected !== '' && version !== null && version !== expected
+      /*
+       * 代理与客户端走两条独立的更新通道：代理自更新可能先完成，此时"代理比客户端新"
+       * 是正常过渡态（客户端本体随后会带着同版本代理重启），不能当错误提示。
+       * 只有代理**落后**才需要告警（旧代理缺少客户端已依赖的能力）。
+       */
+      const inferred =
+        expected !== '' && version !== null && compareVersions(version, expected) < 0
       this.publish({
         ...this.info,
         version,

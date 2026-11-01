@@ -826,7 +826,26 @@ func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 	// L1：全局预算按容量分摊，再按账本剩余夹紧。
 	l1 = splitCacheBudget(cfg.CacheL1Bytes, cacheMinL1Bytes, repos)[key]
 	usedL1, _ := m.quotaInUse(key)
-	l1 = clampQuota(l1, cfg.CacheL1Bytes-usedL1)
+	var over int64
+	l1, over = clampQuota(l1, cfg.CacheL1Bytes-usedL1, cacheMinL1Bytes)
+	if over > 0 {
+		// 账本被之前挂载的库占满时，仍然按分摊算法给这个库开缓存，而不是把份额
+		// 压到下限以下。压下去的直接后果是 EnsureTarget 返回错误、mount.go 回退
+		// 直连（真实现场：6 个库同时挂载，后几个的 L1 份额被夹到 1~41MiB，全部
+		// 退化成直连，读性能掉到缓存链路的几分之一）。超出的部分来自先挂载的库
+		// 当时多占的份额，会随它们重新挂载自然收敛；让一个库完全没有缓存，代价
+		// 远大于短期超出预算。
+		m.logger.Warn("L1 预算已被已挂载的库占满，按理论份额开缓存（暂时超出预算）",
+			"repo", key, "quota_bytes", l1, "used_bytes", usedL1, "over_bytes", over)
+	}
+	if l1 < cacheMinL1Bytes {
+		// 这里是**真的不够**：分摊集合已经大到每库连下限都分不到（例如 512 MiB
+		// 预算下开缓存的库超过 8 个）。调用方会回退直连；日志把预算与库数一起
+		// 打出来，用户才知道该调大 cache_l1_bytes 还是关掉部分库的缓存。
+		m.logger.Warn("L1 预算不足以覆盖每个开缓存的库，该库将回退直连",
+			"repo", key, "quota_bytes", l1, "min_bytes", cacheMinL1Bytes,
+			"budget_bytes", cfg.CacheL1Bytes, "cache_repos", len(repos))
+	}
 
 	// L2：每库一个固定上限，不参与分摊、也不受其他库影响。
 	if cfg.CacheL2Bytes > 0 {
@@ -839,17 +858,27 @@ func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 	return l1, l2
 }
 
-// clampQuota 把理论份额压到剩余预算之内（并保持 MiB 对齐）。
-// remaining <= 0 表示预算已经被其他库占满，本次只能拿 0：调用方据此降级
-// （L1 低于下限就回退直连、L2 低于下限就不开 L2），而不是继续超发。
-func clampQuota(want, remaining int64) int64 {
-	if want <= 0 || remaining <= 0 {
-		return 0
+// clampQuota 把理论份额压到剩余预算之内（并保持 MiB 对齐），返回压后的份额与
+// 超出剩余预算的字节数（0 表示没有超出）。
+//
+// 关键约束：**不能把份额压到 floor 以下**。remaining 小于 floor 时说明账本已被
+// 之前挂载的库占满（它们当时按更小的分摊集合拿走了更大的份额），此时把它压到 0
+// 或几 MiB，只会让 EnsureTarget 报"L1 配额低于下限"、挂载回退直连（见 mount.go）。
+// 一个库没有缓存，比短期超出预算的代价大得多，所以这里返回它的理论份额并让调用
+// 方把 over 记进日志；超出部分会随老库重新挂载收敛。
+//
+// remaining 落在 [floor, want) 时仍然夹紧：份额还在可用区间，没必要为几 MiB 超发。
+func clampQuota(want, remaining, floor int64) (quota, over int64) {
+	if want <= 0 {
+		return 0, 0
 	}
-	if want > remaining {
-		want = remaining / cacheQuotaGranularity * cacheQuotaGranularity
+	if remaining >= want {
+		return want, 0
 	}
-	return want
+	if remaining >= floor {
+		return remaining / cacheQuotaGranularity * cacheQuotaGranularity, 0
+	}
+	return want, want - remaining
 }
 
 // quotaInUse 返回除 key 之外所有活跃库已占用的配额之和。
@@ -1190,11 +1219,18 @@ func cacheRecommend(totalBytes int64, repos int) CacheRecommend {
 	return rec
 }
 
-// cachePoolRepos 返回配额分摊集合：配置里启用缓存的库、当前已经有缓存目标的库（active），
-// 外加 extra（本次要挂的那个库，配置可能刚改、还没落盘时以请求为准）。
+// cachePoolRepos 返回配额分摊集合：**当前已经有缓存目标的库**（active）、
+// 配置里明确会在启动后自动挂载的库（AutoMount），外加 extra（本次要挂的那个库，
+// 配置可能刚改、还没落盘时以请求为准）。
 //
-// active 不能省：缓存**默认开启**后，没有单独保存过偏好（不在 cfg.RepoMounts 里）的库也会
+// active 不能省：缓存默认开启后，没有单独保存过偏好（不在 cfg.RepoMounts 里）的库也会
 // 建立缓存目标；只看配置会让后挂的库把同一份 L1 预算再分一遍。
+//
+// 已配置但**不会自动挂载**的库不能进集合：它们此刻并没有使用 L1，却会按份数把预算
+// 从正在挂载的库手里分走。真实现场：配置里 6 个库开了缓存、只有 1 个手动挂载，
+// 结果这个库只分到 512 MiB / 6 ≈ 85 MiB；1 GiB 工作集放不进 L1，全部落到较慢的 L2，
+// 顺序读掉到 ~350 MB/s、4K 随机掉到 ~25 MB/s（用户以为 "512 MiB L1 绝对够"）。
+// 等它们真的挂载时 active 会包含它们，再按当时的分摊集合计算即可。
 //
 // 去空白、去重、稳定排序 —— 分摊结果不该随 map 迭代顺序变化。
 func cachePoolRepos(cfg Config, extra string, active []string) []string {
@@ -1216,7 +1252,7 @@ func cachePoolRepos(cfg Config, extra string, active []string) []string {
 		add(id)
 	}
 	for repoID, pref := range cfg.RepoMounts {
-		if pref.cacheEnabledOrDefault() {
+		if pref.cacheEnabledOrDefault() && pref.AutoMount {
 			add(repoID)
 		}
 	}
@@ -1293,6 +1329,9 @@ type CacheTargetStatus struct {
 	// L2Dropped 是核实失败的槽数：索引指向的槽已被后来的写改作他用，读到这里本会拿到
 	// 别的块的数据，现已按未命中处理。持续增长说明索引落盘跟不上写入，可以据此调大预算。
 	L2Dropped int `json:"l2_dropped"`
+	// L2Skipped 是回填时因 L2 写入并发已满而**没能写入 L2** 的块数。它不是可以忽略的
+	// 计数：L2 缺一块，整条读命令就命中不了，只能回后端。持续增长时读性能会掉到后端速度。
+	L2Skipped int64 `json:"l2_skipped"`
 	// Reads 是读命令数；RequestHits 是**整条命令**完全由缓存满足的次数。
 	Reads       int64 `json:"reads"`
 	RequestHits int64 `json:"request_hits"`
@@ -1372,6 +1411,7 @@ func (m *cacheManager) Status() CacheStatus {
 			L2Restored:      stats.L2Restored,
 			L2Unverified:    stats.L2Unverified,
 			L2Dropped:       stats.L2Dropped,
+			L2Skipped:       cs.L2Skipped,
 		}
 		if stats.BlockSize > 0 && stats.L2Slots > 0 {
 			slot := int64(stats.BlockSize)

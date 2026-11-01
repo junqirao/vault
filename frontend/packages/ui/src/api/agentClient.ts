@@ -59,15 +59,52 @@ export interface VaultAgentInfo {
   version?: string | null
   /** 客户端期望的代理版本。 */
   expectedVersion?: string
-  /** 代理版本与客户端期望是否不一致（陈旧代理）。 */
+  /** 代理版本是否**落后**于客户端期望（陈旧代理；代理更新不置位）。 */
   versionMismatch?: boolean
 }
 
-/** 代理版本状态（来自主进程的 AgentInfo，供顶栏提示"代理版本不一致"）。 */
+/** 代理版本状态（来自主进程的 AgentInfo，供顶栏提示"代理版本落后"）。 */
 export interface AgentVersionInfo {
   agent: string | null
   expected: string
   mismatch: boolean
+}
+
+/** 把版本号解析为数字段；任一段不是数字（含 -beta 等后缀）时返回 null。 */
+function parseVersionParts(value: string): number[] | null {
+  const cleaned = value.trim().replace(/^v/i, '').split(/[-+]/)[0]
+  if (cleaned === '') return null
+  const parts = cleaned.split('.')
+  const nums: number[] = []
+  for (const part of parts) {
+    if (!/^\d+$/.test(part)) return null
+    nums.push(Number(part))
+  }
+  return nums.length > 0 ? nums : null
+}
+
+/**
+ * 判断本地服务版本是否**落后于**客户端（只有这个方向需要告警）。
+ *
+ * 代理与客户端走两条独立的更新通道：代理自更新可能先完成，"代理比客户端新"是正常
+ * 过渡态（客户端本体随后会带着同版本代理重启）。主进程已经按这个口径判定
+ * versionMismatch；这里提供同一口径的兜底，供主进程异步补全尚未落位时使用。
+ * 版本不可解析时退回字符串不等比较（宁可提示，也不放过真正不一致）。
+ */
+export function isAgentVersionBehind(agent: string, expected: string): boolean {
+  const a = agent.trim()
+  const b = expected.trim()
+  if (a === '' || b === '') return false
+  const va = parseVersionParts(a)
+  const vb = parseVersionParts(b)
+  if (!va || !vb) return a !== b
+  const len = Math.max(va.length, vb.length)
+  for (let i = 0; i < len; i += 1) {
+    const x = va[i] ?? 0
+    const y = vb[i] ?? 0
+    if (x !== y) return x < y
+  }
+  return false
 }
 
 /** 一次代理请求（与 electron/agent.ts 的 AgentRequestOptions 对应）。 */
@@ -919,8 +956,16 @@ export const agentApi = {
     return request<UpdateInfo>({ method: 'POST', path: '/agent/update/check', timeoutMs: 60000 })
   },
 
-  applyUpdate(): Promise<{ started: true }> {
-    return request({ method: 'POST', path: '/agent/update/apply', timeoutMs: 60000 })
+  /**
+   * 应用自更新（本地代理）。
+   *
+   * currentVersion 传**正在运行的客户端本体**版本：本次发布若同时带客户端本体产物，
+   * 代理会拒绝单独升级到自己（返回 reason=client_update_pending），避免代理版本跑到
+   * 本体前面。省略时退化为旧行为（只做版本单调性判断）。
+   */
+  applyUpdate(currentVersion?: string): Promise<{ started: true }> {
+    const body = currentVersion?.trim() ? { current_version: currentVersion.trim() } : undefined
+    return request({ method: 'POST', path: '/agent/update/apply', body, timeoutMs: 60000 })
   },
 
   /** 客户端资源热更：202 立即返回初始状态；后续进度经 web_update 事件推送。 */

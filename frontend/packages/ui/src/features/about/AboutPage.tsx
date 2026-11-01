@@ -2,6 +2,7 @@ import { CopyOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 import { App as AntApp, Button, Descriptions, Space, Tag, Typography } from 'antd'
 
+import { isAgentVersionBehind } from '../../api/agentClient'
 import { useApi } from '../../api/provider'
 import { CopyableText } from '../../components/CopyableText'
 import { PageShell } from '../../components/PageShell'
@@ -42,9 +43,11 @@ const PROJECT_URL = 'https://github.com/junqirao/vault'
 
 export interface AboutPageProps {
   /**
-   * 客户端版本（构建期注入，真源是 apps/client 的 package.json）。
+   * 客户端版本：**正在运行的客户端本体**（安装目录里那一份）的版本。
    *
    * 由宿主传入而不是在 ui 包里读：ui 包不知道宿主用什么机制注入版本，也不该去猜。
+   * ⚠️ 不能传"渲染层 bundle 的构建版本"——渲染层可以被热更到比本体更新的版本，
+   * 那样关于页会把界面版本当成本体版本，显示成"客户端已更新、只有本地服务还是旧的"。
    */
   clientVersion: string
 }
@@ -84,9 +87,33 @@ export function AboutPage({ clientVersion }: AboutPageProps): JSX.Element {
     queryFn: () => api.systemInfo()
   })
 
-  const agentVersionText = agent.health?.agent_version || '-'
+  /*
+   * 本地服务版本优先取**主进程的权威判定**（agentVersion），而不是健康接口里自报的那份：
+   * 主进程的 expected/mismatch 与"客户端本体版本"同源，展示值与「版本不一致」标签因此
+   * 永远自洽。健康快照可能比主进程的版本补全更早（或更晚），两边混用会出现
+   * "显示 0.1.229 却不提示不一致"这种自相矛盾的界面。
+   */
+  const agentVersionText = agentVersion.agent || agent.health?.agent_version || '-'
+  /*
+   * 主进程还没补全版本信息（agentVersion.expected 为空）时，用本体版本兜底自行比对：
+   * 健康接口已经报到 0.1.229、而本体是 0.1.230 的那一刻，不能因为主进程的异步补全
+   * 还没落位就不提示。
+   *
+   * 只比较"代理更旧"这个方向：代理自更新可以先于客户端本体完成，此时代理比客户端新
+   * 是正常过渡态（本体随后会带着同版本代理重启），报错只会制造噪音。
+   */
+  const expectedAgentVersion = agentVersion.expected || clientVersion
+  const agentMismatch =
+    agentVersion.mismatch ||
+    (agentVersionText !== '-' && isAgentVersionBehind(agentVersionText, expectedAgentVersion))
   const serverVersion = infoQuery.data?.server_version || '-'
   const platform = agent.health?.platform || '-'
+  /*
+   * 界面资源版本：渲染层热更可以把界面换到比本体更新的版本（不重启本体）。
+   * 只有它确实与本体版本不同时才展示——否则会让人误以为"客户端还有另一套版本号"。
+   */
+  const uiVersion = agent.webUpdate?.active_version?.trim() || ''
+  const showUiVersion = uiVersion !== '' && uiVersion !== clientVersion
 
   /**
    * 「复制诊断信息」的内容：一行一项，用语与界面标签一致（用户对着界面念得出来）。
@@ -96,6 +123,7 @@ export function AboutPage({ clientVersion }: AboutPageProps): JSX.Element {
   const diagnostics = [
     t('about.diagnosticsTitle'),
     `${t('about.clientVersion')}: ${clientVersion}`,
+    ...(showUiVersion ? [`${t('about.uiVersion')}: ${uiVersion}`] : []),
     `${t('about.localServiceVersion')}: ${agentVersionText}`,
     `${t('about.serverVersion')}: ${serverVersion}`,
     `${t('about.platform')}: ${platform}`,
@@ -162,12 +190,17 @@ export function AboutPage({ clientVersion }: AboutPageProps): JSX.Element {
 
         <Descriptions size="small" column={1} bordered>
           <Descriptions.Item label={t('about.clientVersion')}>{clientVersion}</Descriptions.Item>
+          {/* 本体还没换成新版本、界面资源已被热更时，把这两个版本分开列出来：
+              否则用户只会看到"界面是新的、本地服务是旧的"，误以为自动更新只做了一半。 */}
+          {showUiVersion ? (
+            <Descriptions.Item label={t('about.uiVersion')}>{uiVersion}</Descriptions.Item>
+          ) : null}
           <Descriptions.Item label={t('about.localServiceVersion')}>
             <Space size={spacing.xs}>
               <span>{agentVersionText}</span>
               {/* 本地服务比客户端旧（自动更新没走完/装的是旧包）：这里就得说出来，
                   否则"版本对不对"要靠用户自己去比两个数字。 */}
-              {agentVersion.mismatch ? <Tag color={palette.warning}>{t('agent.versionMismatch')}</Tag> : null}
+              {agentMismatch ? <Tag color={palette.warning}>{t('agent.versionMismatch')}</Tag> : null}
             </Space>
           </Descriptions.Item>
           <Descriptions.Item label={t('about.serverVersion')}>

@@ -7,7 +7,15 @@ import { CopyableText } from '../../components/CopyableText'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
-import { agentApi, identityMatchesServer, relaunchClient, selectDirectory, serverKeyOf, supportsDirectoryPicker } from '../../api/agentClient'
+import {
+  agentApi,
+  getAgentVersionInfo,
+  identityMatchesServer,
+  relaunchClient,
+  selectDirectory,
+  serverKeyOf,
+  supportsDirectoryPicker
+} from '../../api/agentClient'
 import type { AgentConfig, AgentIdentity, AgentMediaType, UpdateInfo } from '../../api/agentTypes'
 import { ApiError } from '../../api/errors'
 import { useAgent } from '../../hooks/useAgent'
@@ -299,7 +307,8 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     setError(null)
     setNotice(null)
     try {
-      await agentApi.applyUpdate()
+      // 带上本体版本：清单若同时带客户端本体，代理会拒绝单独跑在本体前面（见接口说明）。
+      await agentApi.applyUpdate(getAgentVersionInfo().expected)
       setNotice(t('settings.update.started'))
     } catch (err) {
       setError(err)

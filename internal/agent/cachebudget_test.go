@@ -142,8 +142,8 @@ func TestQuotaForSplitsAcrossEnabledCacheRepos(t *testing.T) {
 		CacheL1Bytes: 8 * gib,
 		CacheL2Bytes: 80 * gib,
 		RepoMounts: map[string]RepoMountPref{
-			"big":   {CacheEnabled: true},
-			"small": {CacheEnabled: true},
+			"big":   {CacheEnabled: true, AutoMount: true},
+			"small": {CacheEnabled: true, AutoMount: true},
 			// 没开缓存的库既不参与分摊，也不该影响别人的份额。
 			// cacheEnabledSet=true 表示这是显式关闭；未表态的条目按默认开启。
 			"off": {cacheEnabledSet: true},
@@ -195,13 +195,16 @@ func TestQuotaForSplitsAcrossEnabledCacheRepos(t *testing.T) {
 	}
 }
 
-// TestCachePoolIncludesActiveAndDefaultRepos 锁定默认开启后的分摊集合：
-// 未表态/未保存过偏好的库与当前已有缓存目标的库都必须参与，显式关闭的库不参与。
-func TestCachePoolIncludesActiveAndDefaultRepos(t *testing.T) {
+// TestCachePoolIncludesActiveAndAutoMountRepos 锁定分摊集合：
+// 当前已有缓存目标的库（active）、本次要挂的库、以及**会随启动自动挂载**的库参与；
+// 显式关闭的库、以及配置了缓存但不会自动挂载、当前也没挂的库不参与——它们没有在用
+// L1，按份数预留只会把已挂库的预算分走。
+func TestCachePoolIncludesActiveAndAutoMountRepos(t *testing.T) {
 	cfg := Config{RepoMounts: map[string]RepoMountPref{
-		"explicit-on":  {CacheEnabled: true, cacheEnabledSet: true},
-		"explicit-off": {CacheEnabled: false, cacheEnabledSet: true},
-		"old-config":   {}, // 旧配置没写 cache_enabled → 默认开启
+		"explicit-on":     {CacheEnabled: true, AutoMount: true, cacheEnabledSet: true},
+		"explicit-off":    {CacheEnabled: false, cacheEnabledSet: true},
+		"configured-idle": {CacheEnabled: true}, // 配置了缓存，但不会自动挂载，当前也没挂
+		"old-config":      {},                   // 旧配置没写 cache_enabled → 默认开启
 	}}
 	got := cachePoolRepos(cfg, "mounting", []string{"active", "old-config"})
 	want := []string{"active", "explicit-on", "mounting", "old-config"}
@@ -233,7 +236,7 @@ func TestStatusReportsRecommendation(t *testing.T) {
 	cfg := &ConfigStore{cfg: Config{
 		CacheL1Bytes: 8 * gib,
 		CacheL2Bytes: 80 * gib,
-		RepoMounts:   map[string]RepoMountPref{"r": {CacheEnabled: true}},
+		RepoMounts:   map[string]RepoMountPref{"r": {CacheEnabled: true, AutoMount: true}},
 	}}
 	m := newCacheManager(cfg, nil)
 	if st := m.Status(); st.KnownRepos != 0 || st.Recommend.L1Bytes != 0 {
@@ -264,7 +267,7 @@ func TestQuotaLedgerKeepsTotalWithinBudget(t *testing.T) {
 	m := newCacheManager(store, testLogger())
 	enable := func(id string) {
 		t.Helper()
-		if _, err := store.SetRepoMountPref(id, RepoMountPref{CacheEnabled: true}); err != nil {
+		if _, err := store.SetRepoMountPref(id, RepoMountPref{CacheEnabled: true, AutoMount: true}); err != nil {
 			t.Fatalf("启用 %s 的缓存失败：%v", id, err)
 		}
 	}
@@ -278,12 +281,15 @@ func TestQuotaLedgerKeepsTotalWithinBudget(t *testing.T) {
 	m.markCacheTarget("alloc-a", "a")
 	m.commitQuota("a", aL1, aL2)
 
-	// B 加入后集合是 {a,b}：B 的 L1 理论份额是 2 GiB，但账本已被 A 占满 → 0（降级为直连）。
-	// L2 是每库上限，不受账本影响，B 依然拿满 40 GiB。
+	// B 加入后集合是 {a,b}：B 的 L1 理论份额是 2 GiB。账本已被 A 占满（A 当时按
+	// 单库集合拿走了全部预算），但这里**不能**把 B 压到下限以下：那会让 B 回退直连
+	// （见 clampQuota 的注释）。B 仍然拿到理论份额，超出预算的部分由日志记录、并随
+	// A 重新挂载收敛。
+	// L2 是每库上限，不参与分摊，B 依然拿满 40 GiB。
 	enable("b")
 	bL1, bL2 := m.quotaFor(cacheTargetRequest{AllocationID: "alloc-b", RepoID: "b", RepoSizeBytes: 1000 * gib})
-	if bL1 != 0 {
-		t.Fatalf("L1 预算已被 A 占满时 B 不该再分到 %d", bL1)
+	if bL1 != l1/2 {
+		t.Fatalf("L1 预算被 A 占满时 B 仍应拿到理论份额 %d，实际 %d（压到下限以下会回退直连）", l1/2, bL1)
 	}
 	if bL2 != l2 {
 		t.Fatalf("L2 是每库上限，B 应分到 %d，实际 %d", l2, bL2)
@@ -295,6 +301,54 @@ func TestQuotaLedgerKeepsTotalWithinBudget(t *testing.T) {
 	bL1, _ = m.quotaFor(cacheTargetRequest{AllocationID: "alloc-b", RepoID: "b", RepoSizeBytes: 1000 * gib})
 	if bL1 != l1/2 {
 		t.Fatalf("A 注销后 B 应分到 %d，实际 %d", l1/2, bL1)
+	}
+}
+
+// TestQuotaForNeverStarvesLaterRepos 锁定真实现场：L1=512 MiB、7 个库依次挂载时，
+// 先挂载的库按较小的分摊集合拿走了大份额；后挂载的库不能因此被夹到下限以下。
+//
+// 旧行为（clampQuota 把 remaining 直接当份额）会让第 2 个库开始拿到 0~41 MiB，
+// EnsureTarget 报"L1 配额低于下限"，mount.go 回退直连——真机日志里 7 个库有 6 个
+// 走了直连，读性能从缓存链路掉到几十分之一。
+func TestQuotaForNeverStarvesLaterRepos(t *testing.T) {
+	const (
+		mib = int64(1) << 20
+		gib = int64(1) << 30
+	)
+	store := newCacheTestStore(t)
+	budget := 512 * mib
+	if _, err := store.Patch(ConfigPatch{CacheL1Bytes: &budget}); err != nil {
+		t.Fatalf("Patch 缓存上限失败：%v", err)
+	}
+	m := newCacheManager(store, testLogger())
+
+	// 容量各不相同，和现场一致；都远大于 L1，所以不会被容量封顶。
+	repos := []struct {
+		id   string
+		size int64
+	}{
+		{"a", 900 * gib},
+		{"b", 700 * gib},
+		{"c", 420 * gib},
+		{"d", 260 * gib},
+		{"e", 120 * gib},
+		{"f", 80 * gib},
+		{"g", 40 * gib},
+	}
+	for _, r := range repos {
+		// 只在该库真正挂载前才写进配置：这才会复现"分摊集合逐个变大"的现场。
+		if _, err := store.SetRepoMountPref(r.id, RepoMountPref{CacheEnabled: true, AutoMount: true}); err != nil {
+			t.Fatalf("启用 %s 的缓存失败：%v", r.id, err)
+		}
+		q, _ := m.quotaFor(cacheTargetRequest{
+			AllocationID: "alloc-" + r.id, RepoID: r.id, RepoSizeBytes: r.size,
+		})
+		if q < cacheMinL1Bytes {
+			t.Fatalf("%s 分到的 L1 配额 %d 字节低于下限 %d：会回退直连",
+				r.id, q, cacheMinL1Bytes)
+		}
+		m.markCacheTarget("alloc-"+r.id, r.id)
+		m.commitQuota(r.id, q, 0)
 	}
 }
 

@@ -13,7 +13,7 @@
 ![Server](https://img.shields.io/badge/server-Windows%20%7C%20Linux-4B5563)
 ![Client](https://img.shields.io/badge/client-Windows-0078D4?logo=windows&logoColor=white)
 
-[快速开始](#快速开始) · [核心能力](#核心能力) · [iSCSI 旁路加速](#iscsi-旁路加速) · [架构](#架构) · [文档](#文档)
+[性能](#性能) · [基准](#基准) · [快速开始](#快速开始) · [核心能力](#核心能力) · [iSCSI 旁路加速](#iscsi-旁路加速) · [架构](#架构) · [文档](#文档)
 
 </div>
 
@@ -25,6 +25,77 @@ Vault 把虚拟磁盘、iSCSI 目标、用户授权、租约、配额和客户�
 - 想集中管理磁盘、iSCSI、账号和挂载，而不是分别操作 VHDX、Windows iSCSI Target、CHAP 和客户端脚本。
 - 服务端只有 HDD，iSCSI 的随机读又慢又受网络影响，希望热数据读起来像本地盘。
 
+## 性能
+
+在 10 GiB 的 Vault 测试库上运行 CrystalDiskMark 9.0.3，从左到右依次为：**无缓存**（iSCSI 直连）、**有缓存**、**本地 SSD 盘（缓存盘）**，作为参照。测试大小 1 GiB，3 轮，单位 MB/s。
+
+![CrystalDiskMark 对比：无缓存、有缓存、本地 SSD](docs/img/performance.png)
+
+| 测试项 | 无缓存 | 有缓存 | 本地 SSD（缓存盘） |
+| --- | ---: | ---: | ---: |
+| SEQ1M Q8T1 读 | 251.08 | **2627.13** | 3058.90 |
+| SEQ1M Q1T1 读 | 238.18 | **2443.11** | 1831.42 |
+| RND4K Q32T1 读 | 2.12 | **183.79** | 662.84 |
+| RND4K Q1T1 读 | 1.39 | **113.41** | 35.70 |
+| SEQ1M Q8T1 写 | 242.84 | 233.25 | 3524.92 |
+| SEQ1M Q1T1 写 | 113.25 | 110.94 | 2863.12 |
+| RND4K Q32T1 写 | 4.74 | 4.61 | 662.76 |
+| RND4K Q1T1 写 | 6.17 | 6.70 | 84.75 |
+
+- 顺序读约为直连的 10 倍，达到本地 SSD 的 86%。
+- 4K 随机读提升约 80-90 倍；其中 `Q1T1` 的缓存结果甚至快于本地 SSD，因为它由 L1 内存直接返回。
+- 写入与无缓存时基本持平：写命令不经过缓存，始终直达后端。
+- 本次测试客户端记录的**读命中率为 99.8%**。首次读、冷数据和一次性大顺序扫描不会被加速。
+
+命中后如何完全绕过网络，见 [iSCSI 旁路加速](#iscsi-旁路加速)。
+
+## 基准
+
+实际发布的 v2 代理和读缓存都带可复现的 Go benchmark，不接真实后端也能对比改动。完整方法和 1 ms / loopback 两组原始输出见 [docs/benchmark.md](docs/benchmark.md)。
+
+参考环境：Windows 11、Ryzen 9 9900X、Go 1.27.1，进程内假后端 + loopback。下面是单次 `-count=1` 的原始输出；数字会飘几百分点，回归对比请用 `-count=5` + `benchstat`。
+
+缓存路径：
+
+```text
+goos: windows
+goarch: amd64
+pkg: vault/internal/iscsicache/cache
+cpu: AMD Ryzen 9 9900X 12-Core Processor
+BenchmarkReadCachedL1/4KiB-24 	31011678	        37.55 ns/op	109081.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkReadCachedL1/64KiB-24         	 2176653	       549.8 ns/op	119207.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkReadCachedL1/1MiB-24          	   84010	     14315 ns/op	73247.66 MB/s	       0 B/op	       0 allocs/op
+BenchmarkReadCachedBoth-24             	   29432	     40736 ns/op	25740.47 MB/s	   11979 B/op	      53 allocs/op
+BenchmarkStats-24                      	  603427	      2051 ns/op	       0 B/op	       0 allocs/op
+BenchmarkInstall-24                    	  353917	      3390 ns/op	19331.06 MB/s	   65584 B/op	       2 allocs/op
+PASS
+ok  	vault/internal/iscsicache/cache	25.428s
+```
+
+代理，HDD 形态（假后端加 10 ms 服务时间）：
+
+```text
+goos: windows
+goarch: amd64
+pkg: vault/internal/iscsiproxy
+cpu: AMD Ryzen 9 9900X 12-Core Processor
+BenchmarkProxyReadHDD/direct/4KiB-24         	     100	  10485547 ns/op	   0.39 MB/s	         1.000 backend-reads/op	    4525 B/op	      11 allocs/op
+BenchmarkProxyReadHDD/proxy-passthrough/4KiB-24         	     100	  10480889 ns/op	   0.39 MB/s	         1.000 backend-reads/op	    7232 B/op	      11 allocs/op
+BenchmarkProxyReadHDD/proxy-hot/4KiB-24                 	   49376	     24293 ns/op	 168.61 MB/s	         0 backend-reads/op	     486 B/op	       8 allocs/op
+BenchmarkProxyReadHDD/direct/64KiB-24                   	     100	  10425120 ns/op	   6.29 MB/s	         1.000 backend-reads/op	   66110 B/op	      11 allocs/op
+BenchmarkProxyReadHDD/proxy-passthrough/64KiB-24        	     100	  10534212 ns/op	   6.22 MB/s	         1.000 backend-reads/op	   69631 B/op	      14 allocs/op
+BenchmarkProxyReadHDD/proxy-hot/64KiB-24                	   30282	     38465 ns/op	1703.78 MB/s	         0 backend-reads/op	     767 B/op	      13 allocs/op
+BenchmarkProxyReadHDD/direct/1MiB-24                    	     100	  10788780 ns/op	  97.19 MB/s	         1.000 backend-reads/op	 1051425 B/op	      15 allocs/op
+BenchmarkProxyReadHDD/proxy-passthrough/1MiB-24         	      87	  11939868 ns/op	  87.82 MB/s	         1.000 backend-reads/op	 1066138 B/op	      17 allocs/op
+BenchmarkProxyReadHDD/proxy-hot/1MiB-24                 	    3812	    339005 ns/op	3093.10 MB/s	         0 backend-reads/op	   19687 B/op	     133 allocs/op
+PASS
+ok  	vault/internal/iscsiproxy	11.909s
+```
+
+怎么读：L1 命中是几十纳秒且零分配，1 MiB L1 命中约 14 µs；代理命中 4 KiB 约 24 µs、1 MiB 约 0.34 ms，后端读数为 **0**。HDD 形态下 4K/64K 未命中与直连持平，1 MiB 未命中约为直连的 90%，差的是固定本地拷贝。`BenchmarkReadCachedBoth` 那一行是内存假 L2 的提升开销，真实 SSD 的读延迟要另外加。
+
+这些是包级下限，不是端到端承诺；真实挂载盘的结果见 [性能](#性能)。
+
 ## 核心能力
 
 - **共享存储库**：一份母盘作为基线，每个用户分配一块差异盘。软件只装一次，每人只写自己的改动。
@@ -33,6 +104,22 @@ Vault 把虚拟磁盘、iSCSI 目标、用户授权、租约、配额和客户�
 - **HDD iSCSI 旁路加速**：未命中时保持接近直连的速度，命中后直接读本机内存或 SSD，不再走网络和 HDD。
 - **服务端 SSD 缓存**：Linux 上可以把 SSD 作为 LVM thin pool 的 `dm-cache`，在块层加速 HDD。
 - **可控的在线状态**：以客户端租约心跳为准，支持撤销租约和强制下线；证书登录、审计和自动更新一并提供。
+
+## 界面
+
+客户端就是完整的产品：普通用户看到自己的存储库和挂载，超级管理员在同一个应用里多一个服务端管理台。
+
+**我的存储库** — 近 5 分钟的读写 IOPS、吞吐、L1/L2 缓存占用和命中率，以及配额和存储库分组。
+
+![带实时性能曲线的我的存储库](docs/img/ui-1.png)
+
+**存储库详情** — 相对母盘的使用量、模式、母盘版本与状态、差异盘、成员，以及维护操作。
+
+![存储库详情](docs/img/ui-2.png)
+
+**管理台** — 存储卷、容量、介质类型、磁盘数量和启用状态；用户、存储库、租约、任务和审计都在同一个管理台里。
+
+![管理台存储列表](docs/img/ui-3.png)
 
 ## iSCSI 旁路加速
 
@@ -324,6 +411,7 @@ python release.py --with-linux           # 额外收集 Linux 服务端 tar.gz
 | --- | --- |
 | [产品设计](docs/design.md) | 目标、角色、存储库与客户端设计 |
 | [实施文档](docs/implementation.md) | 架构、数据模型、平台实现与边界 |
+| [Benchmark](docs/benchmark.md) | 代理与缓存的基准方法、命令与参考结果 |
 | [客户端代理 API](docs/agent-api.md) | 本地挂载、缓存、状态与事件接口 |
 | [iSCSI 缓存设计](docs/iscsi-cache/iscsi_cache_v2_design.md) | 旁路代理、序号修正、故障降级 |
 | [L2 区域归位布局](docs/iscsi-cache/l2_region_layout_design.md) | 把 L2 命中变成顺序读 |

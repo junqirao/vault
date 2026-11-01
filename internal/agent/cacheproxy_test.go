@@ -36,7 +36,7 @@ func TestCacheQuotaSplitsClientBudget(t *testing.T) {
 
 	enable := func(repoID string) {
 		t.Helper()
-		if _, err := store.SetRepoMountPref(repoID, RepoMountPref{CacheEnabled: true}); err != nil {
+		if _, err := store.SetRepoMountPref(repoID, RepoMountPref{CacheEnabled: true, AutoMount: true}); err != nil {
 			t.Fatalf("启用 %s 的缓存失败：%v", repoID, err)
 		}
 	}

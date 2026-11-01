@@ -764,6 +764,19 @@ async function createWindow(): Promise<void> {
       nodeIntegration: false,
       contextIsolation: true,
       sandbox: true,
+      /*
+       * 把**正在运行的客户端本体版本**交给渲染层（见 preload.ts 的 appVersion）。
+       *
+       * 渲染层自己打包时也会带一份 __APP_VERSION__，但那是"构建这份界面时的版本"：
+       * 渲染层资源热更（client_web）可以在**不重启本体**的前提下把界面换成更新的版本
+       * （见 resolveWebappEntry），于是界面里的 __APP_VERSION__ 会比安装目录里的
+       * Vault.exe / Vault-Agent.exe 高一个版本。关于页再用它当"内部版本"，就会显示成
+       * "客户端已更新、只有本地服务还是旧的"——真实工单即由此而来。
+       *
+       * additionalArguments 会原样进入 preload 的 process.argv，随窗口创建固定下来；
+       * 版本号在进程生命周期内不会变，不需要额外 IPC。
+       */
+      additionalArguments: [`--vault-app-version=${encodeURIComponent(bundledVersion || app.getVersion())}`],
       // 窗口可能长时间藏在托盘里：不能让 Chromium 把隐藏窗口的定时器节流掉，
       // 否则渲染层的会话保活 / 挂载状态刷新会变成"一分钟才动一次"。
       backgroundThrottling: false

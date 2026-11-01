@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,15 +26,21 @@ type invBackend struct {
 
 	mu    sync.Mutex
 	reads []uint64
+	total atomic.Int64
+	keep  bool
+	// lat is an artificial service time added to every READ. The benchmarks use
+	// it to stand in for a remote target's round trip; correctness tests leave it
+	// zero.
+	lat time.Duration
 }
 
-func newInvBackend(t *testing.T) *invBackend {
+func newInvBackend(t testing.TB) *invBackend {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("后端监听失败：%v", err)
 	}
-	b := &invBackend{ln: ln}
+	b := &invBackend{ln: ln, keep: true}
 	t.Cleanup(func() { _ = ln.Close() })
 	go b.serve()
 	return b
@@ -80,6 +87,9 @@ func (b *invBackend) handle(bc net.Conn) {
 			resp = invDataIn(itt, iscsi.BuildReadCapacity10(1023, invBlockSize))
 		case iscsi.SCSIRead10:
 			lba := uint32(binary.BigEndian.Uint32(cdb[2:6]))
+			if b.lat > 0 {
+				time.Sleep(b.lat)
+			}
 			b.record(lba)
 			if lba == invFailLBA {
 				// 失败读：后端用 SCSI Response 收尾，不会有 Data-In。
@@ -97,6 +107,10 @@ func (b *invBackend) handle(bc net.Conn) {
 }
 
 func (b *invBackend) record(lba uint32) {
+	b.total.Add(1)
+	if !b.keep {
+		return
+	}
 	b.mu.Lock()
 	b.reads = append(b.reads, uint64(lba))
 	b.mu.Unlock()
@@ -115,9 +129,7 @@ func (b *invBackend) readCount(lba uint64) int {
 }
 
 func (b *invBackend) totalReads() int {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return len(b.reads)
+	return int(b.total.Load())
 }
 
 func invDataIn(itt uint32, payload []byte) *iscsi.PDU {
@@ -139,7 +151,7 @@ func invSCSIResponseStatus(itt uint32, status uint8) *iscsi.PDU {
 }
 
 // invSend 发一条 SCSI 命令（F 位带上，命令在一个 PDU 内结束）。
-func invSend(t *testing.T, w io.Writer, itt uint32, cdb ...byte) {
+func invSend(t testing.TB, w io.Writer, itt uint32, cdb ...byte) {
 	t.Helper()
 	var h iscsi.BHS
 	h[0] = iscsi.OpSCSICommand | 0x80
@@ -150,7 +162,7 @@ func invSend(t *testing.T, w io.Writer, itt uint32, cdb ...byte) {
 	}
 }
 
-func invWait(t *testing.T, what string, ok func() bool) {
+func invWait(t testing.TB, what string, ok func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -162,7 +174,7 @@ func invWait(t *testing.T, what string, ok func() bool) {
 	t.Fatalf("等待超时：%s", what)
 }
 
-func invStartPortal(t *testing.T, be *invBackend, snapshot string) *Portal {
+func invStartPortal(t testing.TB, be *invBackend, snapshot string) *Portal {
 	t.Helper()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	p, err := NewPortal(PortalConfig{Logger: log})
@@ -183,7 +195,7 @@ func invStartPortal(t *testing.T, be *invBackend, snapshot string) *Portal {
 	return p
 }
 
-func invDial(t *testing.T, p *Portal) net.Conn {
+func invDial(t testing.TB, p *Portal) net.Conn {
 	t.Helper()
 	host, port, ok := p.TargetAddr("k")
 	if !ok {
@@ -197,7 +209,7 @@ func invDial(t *testing.T, p *Portal) net.Conn {
 }
 
 // invSniff 走完身份嗅探，等缓存真的绑定上几何。
-func invSniff(t *testing.T, p *Portal, ic net.Conn) {
+func invSniff(t testing.TB, p *Portal, ic net.Conn) {
 	t.Helper()
 	invSend(t, ic, 1, iscsi.SCSIInquiry, 0x01, 0x80, 0x00, 0xff, 0x00)
 	invSend(t, ic, 2, iscsi.SCSIInquiry, 0x01, 0x83, 0x00, 0xff, 0x00)

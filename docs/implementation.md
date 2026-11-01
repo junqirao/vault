@@ -3146,6 +3146,26 @@ Vault-Server sign release -artifact agent=... -artifact client_web=dist.zip
 代理提供 `GET /agent/update/web` 查询状态、SSE `web_update` 事件推送进度，
 页面刷新后据此恢复展示（见 docs/agent-api.md「客户端资源热更」）。
 
+> **版本展示口径（真实工单："自动更新完了之后，本地服务版本还是低了一个版本"）**：
+> 渲染层热更可以在**不重启本体**的前提下把界面换成比本体更新的版本，于是同一台机器上
+> 会同时存在两个版本号：
+> - **本体版本**（安装目录里的 `Vault.exe` / `Vault-Agent.exe`，即 `app.getVersion()`）；
+> - **界面资源版本**（`<webapp>/current.json` 指向的热更层）。
+>
+> 关于页的「内部版本」必须展示**本体版本**（由主进程经 `webPreferences.additionalArguments`
+> 注入，见 `electron/preload.ts`），绝不能用渲染层 bundle 里的 `__APP_VERSION__`：那是
+> "构建这份界面时的版本"，界面被热更后会比本体高一个版本，看起来就像"客户端更新了、
+> 只有本地服务没更新"，而实际上更新的是界面资源、本体与本地服务都还是旧的。两者确实
+> 不同时，关于页会额外列出「界面资源版本」，让"界面是新的、本体还没换"这件事可解释。
+>
+> 代理与客户端本体是两条更新通道，**完成时间可以不同**，因此：
+> - 版本不一致只按"**代理落后于本体**"判定（`/agent/health` 的 `version_mismatch` 只在
+>   代理更旧时为 true）；"代理比本体新"是正常过渡态，不能告警。
+> - 更新清单同时带 `client`（本体）产物时，代理**不得**单独自更新到高于运行中本体的
+>   版本（`POST /agent/update/apply` 带 `current_version` 后返回 `update.client_pending`）。
+>   本次发布整体交给本体通道：本体程序目录里就带着同版本的 `Vault-Agent.exe`，切换后
+>   两者天然一致。自动更新流程还会跳过 `client_web` 热更，避免界面先跑到本体前面。
+
 **生效时机（三段）**
 
 1. **启动时选层**：热更层版本必须**严格高于**内置层才会被采用。内置层版本取打包目录里的

@@ -26,7 +26,7 @@ import {
 } from '@vault/ui'
 
 import { AppLayout } from '../layouts/AppLayout'
-// 客户端版本由宿主注入（真源是 apps/client/package.json，构建期 define 进 CLIENT_VERSION）。
+// 客户端版本由宿主注入：运行时取主进程提供的**本体**版本，缺失时回退构建期常量（见 config.ts）。
 import { CLIENT_VERSION } from '../config'
 import { useAppStore } from '../store/appStore'
 

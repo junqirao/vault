@@ -139,13 +139,17 @@ AgentIdentity = {
 ## 状态查询
 
 ```
-GET /agent/health
+GET /agent/health[?expected_version=<客户端本体版本>]
   ↑ {ok:true, agent_version, platform, admin:true|false,
      host:HostState,
      servers:[AgentServerState...],   # 全部已登记服务端（多服务端：逐台一份，主服务端在前）
      primary_key,                     # 主服务端的 server_key
-     server:AgentServerState}         # 主服务端那一台（单服务端时代的兼容字段；未登记时为空值）
+     server:AgentServerState,         # 主服务端那一台（单服务端时代的兼容字段；未登记时为空值）
+     expected_version?,               # 回显查询参数
+     version_mismatch?}               # 代理是否**落后**于 expected_version
 # health 里的每台**不含** user / session：健康检查没必要顺带吐出会话令牌。
+# version_mismatch 只在"代理更旧"时为 true：代理自更新可能先于客户端本体完成，
+# "代理比客户端新"是正常过渡态，不应告警。
 
 GET /agent/state
   ↑ {
@@ -977,10 +981,17 @@ POST /agent/server/test
 
 ```
 POST /agent/update/check   ↑ {available:bool, version, notes, size_bytes, source:"<服务端名>",
-                              reason?, server_code?, server_reason?, server_args?}
-POST /agent/update/apply   ↑ {started:true}
+                              reason?, server_code?, server_reason?, server_args?,
+                              client_available?}
+POST /agent/update/apply   ↓ {current_version?}     # 运行中的客户端本体版本（可选）
+                           ↑ {started:true}
   # 有活跃挂载时返回 409 + {code:"agent.busy_mounts", args:{count}}，由前端提示"请先卸载"
+  # 清单同时带 client（客户端本体）产物、且目标版本高于 current_version 时，返回
+  # 409 + {code:"update.client_pending"}：本地服务应随本体一起替换，不能单独跑到本体前面。
 ```
+
+`client_available=true` 表示本次发布同时带客户端本体产物：自动更新应交给本体通道
+（程序目录里自带同版本的 `Vault-Agent.exe`），不要再单独给代理做自更新。
 
 `check` 为"无可用更新"时返回软失败（HTTP 200，`available:false`），并通过以下字段说明原因：
 

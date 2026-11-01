@@ -13,7 +13,7 @@ A self-hosted virtual disk and iSCSI storage platform: shared parent disks with 
 ![Server](https://img.shields.io/badge/server-Windows%20%7C%20Linux-4B5563)
 ![Client](https://img.shields.io/badge/client-Windows-0078D4?logo=windows&logoColor=white)
 
-[Quick start](#quick-start) · [Core features](#core-features) · [iSCSI bypass acceleration](#iscsi-bypass-acceleration) · [Architecture](#architecture) · [Documentation](#documentation)
+[Performance](#performance) · [Benchmark](#benchmark) · [Quick start](#quick-start) · [Core features](#core-features) · [iSCSI bypass acceleration](#iscsi-bypass-acceleration) · [Architecture](#architecture) · [Documentation](#documentation)
 
 </div>
 
@@ -25,6 +25,77 @@ It fits scenarios like:
 - You want to manage disks, iSCSI, accounts, and mounts in one place instead of juggling VHDX files, Windows iSCSI Target, CHAP, and client scripts separately.
 - The server only has HDDs, iSCSI random reads are slow and network-sensitive, and you want hot data to read like a local disk.
 
+## Performance
+
+CrystalDiskMark 9.0.3 on 10 GiB Vault test repositories, left to right: **no cache** (direct iSCSI), **cache enabled**, and a **local SSD volume (the cache disk)** for reference. Test size 1 GiB, 3 passes, MB/s.
+
+![CrystalDiskMark comparison: no cache, cache enabled, local SSD](docs/img/performance.png)
+
+| Test | No cache | With cache | Local SSD (cache disk) |
+| --- | ---: | ---: | ---: |
+| SEQ1M Q8T1 read | 251.08 | **2627.13** | 3058.90 |
+| SEQ1M Q1T1 read | 238.18 | **2443.11** | 1831.42 |
+| RND4K Q32T1 read | 2.12 | **183.79** | 662.84 |
+| RND4K Q1T1 read | 1.39 | **113.41** | 35.70 |
+| SEQ1M Q8T1 write | 242.84 | 233.25 | 3524.92 |
+| SEQ1M Q1T1 write | 113.25 | 110.94 | 2863.12 |
+| RND4K Q32T1 write | 4.74 | 4.61 | 662.76 |
+| RND4K Q1T1 write | 6.17 | 6.70 | 84.75 |
+
+- Sequential read reaches about 10x direct iSCSI and 86% of the local SSD.
+- 4K random read improves by roughly 80-90x. The cached `Q1T1` result is even faster than the local SSD because L1 serves it from memory.
+- Writes stay in the same range as the no-cache run: writes are never cached, they always go to the backend.
+- The client reported a **99.8% read hit rate** during this run. First reads, cold data, and one-off large sequential scans are not accelerated.
+
+See [iSCSI bypass acceleration](#iscsi-bypass-acceleration) for how a hit avoids the network entirely.
+
+## Benchmark
+
+The shipped v2 proxy and the read cache have in-process Go benchmarks, so a change can be compared without a real target. Full methodology and the 1 ms / loopback runs are in [docs/benchmark.md](docs/benchmark.md).
+
+Reference run: Windows 11, Ryzen 9 9900X, Go 1.27.1, in-memory backend on loopback. The blocks below are the raw output of one `-count=1` run; numbers move a few percent between runs, so use `-count=5` and `benchstat` for regressions.
+
+Cache path:
+
+```text
+goos: windows
+goarch: amd64
+pkg: vault/internal/iscsicache/cache
+cpu: AMD Ryzen 9 9900X 12-Core Processor
+BenchmarkReadCachedL1/4KiB-24 	31011678	        37.55 ns/op	109081.40 MB/s	       0 B/op	       0 allocs/op
+BenchmarkReadCachedL1/64KiB-24         	 2176653	       549.8 ns/op	119207.36 MB/s	       0 B/op	       0 allocs/op
+BenchmarkReadCachedL1/1MiB-24          	   84010	     14315 ns/op	73247.66 MB/s	       0 B/op	       0 allocs/op
+BenchmarkReadCachedBoth-24             	   29432	     40736 ns/op	25740.47 MB/s	   11979 B/op	      53 allocs/op
+BenchmarkStats-24                      	  603427	      2051 ns/op	       0 B/op	       0 allocs/op
+BenchmarkInstall-24                    	  353917	      3390 ns/op	19331.06 MB/s	   65584 B/op	       2 allocs/op
+PASS
+ok  	vault/internal/iscsicache/cache	25.428s
+```
+
+Proxy, HDD-like backend (synthetic 10 ms service time):
+
+```text
+goos: windows
+goarch: amd64
+pkg: vault/internal/iscsiproxy
+cpu: AMD Ryzen 9 9900X 12-Core Processor
+BenchmarkProxyReadHDD/direct/4KiB-24         	     100	  10485547 ns/op	   0.39 MB/s	         1.000 backend-reads/op	    4525 B/op	      11 allocs/op
+BenchmarkProxyReadHDD/proxy-passthrough/4KiB-24         	     100	  10480889 ns/op	   0.39 MB/s	         1.000 backend-reads/op	    7232 B/op	      11 allocs/op
+BenchmarkProxyReadHDD/proxy-hot/4KiB-24                 	   49376	     24293 ns/op	 168.61 MB/s	         0 backend-reads/op	     486 B/op	       8 allocs/op
+BenchmarkProxyReadHDD/direct/64KiB-24                   	     100	  10425120 ns/op	   6.29 MB/s	         1.000 backend-reads/op	   66110 B/op	      11 allocs/op
+BenchmarkProxyReadHDD/proxy-passthrough/64KiB-24        	     100	  10534212 ns/op	   6.22 MB/s	         1.000 backend-reads/op	   69631 B/op	      14 allocs/op
+BenchmarkProxyReadHDD/proxy-hot/64KiB-24                	   30282	     38465 ns/op	1703.78 MB/s	         0 backend-reads/op	     767 B/op	      13 allocs/op
+BenchmarkProxyReadHDD/direct/1MiB-24                    	     100	  10788780 ns/op	  97.19 MB/s	         1.000 backend-reads/op	 1051425 B/op	      15 allocs/op
+BenchmarkProxyReadHDD/proxy-passthrough/1MiB-24         	      87	  11939868 ns/op	  87.82 MB/s	         1.000 backend-reads/op	 1066138 B/op	      17 allocs/op
+BenchmarkProxyReadHDD/proxy-hot/1MiB-24                 	    3812	    339005 ns/op	3093.10 MB/s	         0 backend-reads/op	   19687 B/op	     133 allocs/op
+PASS
+ok  	vault/internal/iscsiproxy	11.909s
+```
+
+How to read: an L1 hit is tens of nanoseconds and allocation-free; a 1 MiB L1 hit is about 14 µs. A proxy hit is about 24 µs at 4 KiB and 0.34 ms at 1 MiB, with **zero backend reads**. On an HDD-like backend, 4K/64K misses are at direct speed; a 1 MiB miss is about 90% of direct because of a fixed local copy. The `BenchmarkReadCachedBoth` line is promotion overhead with an in-memory L2; a real SSD adds its own read latency.
+
+These are package-level floors, not end-to-end promises. See [Performance](#performance) for a real mounted disk.
+
 ## Core features
 
 - **Shared repositories**: one parent disk as the baseline, with a differencing disk per user. Install the software once and each user only writes their own changes.
@@ -33,6 +104,22 @@ It fits scenarios like:
 - **HDD iSCSI bypass acceleration**: misses stay close to direct-connect speed, while hits read from local memory or SSD without touching the network or HDD.
 - **Server-side SSD cache**: on Linux, an SSD can serve as the `dm-cache` for an LVM thin pool, accelerating the HDD at the block layer.
 - **Controllable online state**: client lease heartbeats are authoritative; leases can be revoked and sessions forced offline. Certificate login, audit, and automatic updates are included.
+
+## Interface
+
+The client is the whole product: regular users see their repositories and mounts, while super admins get the same app plus a server console.
+
+**My repositories** — live read/write IOPS and throughput, L1/L2 cache usage and hit rate for the last five minutes, quotas, and repository groups.
+
+![My repositories with live performance charts](docs/img/ui-1.png)
+
+**Repository detail** — usage against the parent disk, mode, parent version and condition, differencing disks, members, and maintenance operations.
+
+![Repository detail](docs/img/ui-2.png)
+
+**Admin console** — storage volumes, capacity, media type, disk count, and enabled state; users, repositories, leases, jobs, and audit live in the same console.
+
+![Admin console storage list](docs/img/ui-3.png)
 
 ## iSCSI bypass acceleration
 
@@ -325,6 +412,7 @@ For a real release, signing keys must already exist (`keys/update-private.pem` +
 | --- | --- |
 | [Product design](docs/design.md) | Goals, roles, repositories, and client design |
 | [Implementation](docs/implementation.md) | Architecture, data model, platform implementation, and boundaries |
+| [Benchmark](docs/benchmark.md) | Proxy and cache benchmark methodology, commands, and reference numbers |
 | [Client agent API](docs/agent-api.md) | Local mounting, cache, state, and event APIs |
 | [iSCSI cache design](docs/iscsi-cache/iscsi_cache_v2_design.md) | Bypass proxy, sequence correction, failure fallback |
 | [L2 region layout](docs/iscsi-cache/l2_region_layout_design.md) | Turning L2 hits into sequential reads |

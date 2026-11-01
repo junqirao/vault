@@ -40,6 +40,7 @@ export {
   getAgentVersionInfo,
   identityMatchesServer,
   isAgentUnavailableError,
+  isAgentVersionBehind,
   onAgentEndpointChanged,
   parseAgentEvent,
   relaunchClient,

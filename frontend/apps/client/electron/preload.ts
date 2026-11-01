@@ -24,11 +24,33 @@ interface VaultAgentInfo {
   version?: string | null
   /** 客户端期望的代理版本。 */
   expectedVersion?: string
-  /** 代理版本与客户端期望是否不一致（陈旧代理）。 */
+  /** 代理版本是否**落后**于客户端期望（陈旧代理；代理更新不置位）。 */
   versionMismatch?: boolean
 }
 
+/**
+ * 正在运行的客户端**本体**版本（主进程通过 webPreferences.additionalArguments 注入）。
+ *
+ * 不能用渲染层打包时的 __APP_VERSION__：渲染层可以被热更到比本体更新的版本
+ * （见 main.ts 的 additionalArguments 说明），那会把"界面版本"误当成"客户端版本"。
+ * 参数缺失时返回空串，由渲染层的构建期常量兜底。
+ */
+function appVersionFromArgv(): string {
+  const prefix = '--vault-app-version='
+  const arg = process.argv.find((item) => item.startsWith(prefix))
+  if (!arg) return ''
+  try {
+    return decodeURIComponent(arg.slice(prefix.length)).trim()
+  } catch {
+    return ''
+  }
+}
+
+const appVersion = appVersionFromArgv()
+
 const api = {
+  /** 客户端本体版本（安装目录里正在运行的那一份）；浏览器 dev 下为空。 */
+  appVersion,
   getConfig: (): Promise<unknown> => ipcRenderer.invoke('vault:get-config'),
   setConfig: (value: unknown): Promise<boolean> => ipcRenderer.invoke('vault:set-config', value),
   getConfigPath: (): Promise<string> => ipcRenderer.invoke('vault:config-path'),
