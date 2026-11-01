@@ -250,6 +250,8 @@ func run() (code int) {
 	}
 
 	if viaAPI && !ag.UpdateStarted() {
+		// 先停后台循环（自动挂载/心跳/会话续期）：否则卸载的同时还可能再挂上新的盘。
+		ag.BeginShutdown()
 		unmountCtx, cancelUnmount := context.WithTimeout(context.Background(), unmountTimeout)
 		ag.UnmountAll(unmountCtx)
 		cancelUnmount()

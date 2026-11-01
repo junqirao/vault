@@ -514,25 +514,48 @@ const targetRepairCooldown = 30 * time.Minute
 // 为什么不在对账里同步做：重下发是多次 PowerShell（几十秒），会被 60s 对账预算中途掐断；
 // 而**杀掉正在执行的 iSCSI cmdlet 会把 WinTarget 的 WMI 提供程序留在坏状态**，之后所有
 // 目标操作都会挂死（真实事故：母盘发布 / 退出维护任务一直卡着）。走 worker 则没有对账预算，
-// 脚本能完整跑完，且按目标锁与挂载路径串行。
+// 脚本能完整跑完，且按目标锁与挂载路径串行（锁由 runRepairTarget 自己获取，见下面的 ⚠️）。
 //
-// 先查状态再入队：同一目标的修复刚失败过就跳过（冷却期），避免持续故障时刷任务。
+// 先查状态再入队：同一目标的修复还在排队/执行时不再叠加；刚失败过则进入冷却期，
+// 避免持续故障时刷任务（也避免卡住的修复把 worker 全占满）。
 // 幂等键按 5 分钟分桶，同一轮对账内不重复入队。
 func (s *IscsiService) enqueueTargetRepair(ctx context.Context, t *domain.IscsiTarget, reason string) {
 	if s.Jobs == nil || t == nil || t.ID == "" {
 		return
 	}
+	// 背盘还没建好（creating）或已彻底失败（error）时，修复任务必然失败：前者等下一轮对账，
+	// 后者需要人工处理 —— 每轮入队只会把任务中心刷成一串永远失败的 repair_target。
+	// 磁盘记录已不存在同理（目标指向一块被删掉的盘），不能靠"重建目标"自愈。
+	if t.DiskID != nil {
+		disk, err := s.Store.GetDisk(ctx, *t.DiskID)
+		if err != nil || disk.State == domain.DiskStateCreating || disk.State == domain.DiskStateError {
+			return
+		}
+	}
 	if last, err := s.Store.GetLatestJobByRef(ctx, t.ID); err == nil && last != nil &&
-		last.Type == domain.JobRepairTarget && last.State == domain.JobStateFailed &&
-		last.FinishedAt > 0 && time.Since(time.UnixMilli(last.FinishedAt)) < targetRepairCooldown {
-		s.Log.Warn("该目标的修复任务刚失败过，进入冷却期，暂不重复入队",
-			"target", t.TargetName, "finished_at", last.FinishedAt)
-		return
+		last.Type == domain.JobRepairTarget {
+		switch last.State {
+		case domain.JobStatePending, domain.JobStateRunning:
+			// 上一轮修复还没跑完（平台脚本可能很慢）就不再叠加：5 分钟分桶的幂等键拦不住
+			// "跨桶仍在执行"，继续入队只会把 worker 全占住，其它任务一起排不上。
+			// 任务被取消后这里自然恢复入队。
+			return
+		case domain.JobStateFailed:
+			if last.FinishedAt > 0 && time.Since(time.UnixMilli(last.FinishedAt)) < targetRepairCooldown {
+				s.Log.Warn("该目标的修复任务刚失败过，进入冷却期，暂不重复入队",
+					"target", t.TargetName, "finished_at", last.FinishedAt)
+				return
+			}
+		}
 	}
 	bucket := strconv.FormatInt(time.Now().Unix()/300, 10)
 	payload := repairTargetPayload{TargetID: t.ID, Reason: reason}
+	// ⚠️ LockKey 必须留空：runRepairTarget 内部会 Acquire 目标锁（与挂载/发布路径互斥），
+	// 而 worker 的 LockKey 用的是**同一个 Keyed 实例**、同一把非可重入锁 ——
+	// worker 先持锁、处理函数再抢同一把锁会**永久自锁**：任务一直显示"执行中"，
+	// 目标却永远修不好（现场反馈："repair_target 这个任务要非常久，然后一直不成功"）。
 	if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobRepairTarget, t.ID,
-		"repair_target:"+t.ID+":"+bucket, lock.TargetKey(t.TargetName), payload); err != nil {
+		"repair_target:"+t.ID+":"+bucket, "", payload); err != nil {
 		s.Log.Warn("入队 iSCSI 目标修复任务失败", "target", t.TargetName, "error", err)
 		return
 	}
@@ -542,6 +565,9 @@ func (s *IscsiService) enqueueTargetRepair(ctx context.Context, t *domain.IscsiT
 // runRepairTarget 是 JobRepairTarget 的实现：按 DB 期望值**强制**重新下发一个目标。
 //
 // 幂等：目标已被删除（库里没记录）时直接空跑；重复下发同一份期望状态是 upsert，安全。
+//
+// 锁归属：目标锁**只在这里获取**。入队时 LockKey 必须留空 —— worker 与这里用的是同一个
+// Keyed 实例、同一把非可重入锁，两边各持一次会永久自锁（见 enqueueTargetRepair）。
 func (s *IscsiService) runRepairTarget(ctx context.Context, j *domain.Job, _ job.Reporter) error {
 	var p repairTargetPayload
 	if err := decodePayload(j.Payload, &p); err != nil {
@@ -558,11 +584,10 @@ func (s *IscsiService) runRepairTarget(ctx context.Context, j *domain.Job, _ job
 	defer unlock()
 	// 拿到锁后重读下发记账：别的路径可能刚下发过同一份期望状态。
 	s.refreshAppliedFromStore(ctx, t)
-	// 先清旧命名目标（一次平台枚举），再强制下发完整期望状态（必须强制：记账指纹可能还留着，
-	// 走会跳过的 pushTarget 会把"重建"变成空操作）。
-	if live, lErr := s.Iscsi.ListTargets(ctx); lErr == nil {
-		s.migrateLegacyTargetNameFrom(ctx, t.TargetName, t.IQN(s.iqnPrefix()), live)
-	}
+	// 旧命名迁移只做一次（同一 IQN 进程内只枚举一次平台目标）：修复本身在 Windows 上已经
+	// 要几十秒，不该每次修复都再白付一次 ListTargets（实测约 10 秒）。失败不记账，下次重试。
+	s.migrateLegacyTargetName(ctx, t.TargetName, t.IQN(s.iqnPrefix()))
+	// 必须强制下发：记账指纹可能还留着，走会跳过的 pushTarget 会把"重建"变成空操作。
 	if err := s.forcePushTarget(ctx, t, t.DesiredEnabled); err != nil {
 		return err
 	}
@@ -695,12 +720,17 @@ func (s *IscsiService) EnsurePoolTarget(ctx context.Context, repo *domain.Reposi
 
 // EnsureDiskTarget 提前为一块盘建好并启用 user 目标：资源先就位，再分配给用户。
 //
-// 覆盖原先两条"只能等用户挂载时现场下发"的路径：
-//   - 非池化共享库的差异盘：分配时才派生（JobCreateDiff），在派生完成后顺手把目标建好；
+// 覆盖两条路径：
+//   - 池化库的池位差异盘：建库预创建与释放回池后的重建，派生完成顺手把目标建好；
 //   - 独享库的盘：建库时就有（分配只是把它指给用户），在盘建好后就把目标建好。
 //
-// 收益：用户点挂载只剩"连接"——Publish 命中目标指纹后整段跳过（省掉一次约 35 秒的
-// 全量下发），挂载不再卡在服务端现场建目标上。
+// ⚠️ **非池化共享库的差异盘不在这里预建**：那条派生任务持有 lock.RepoKey，若再等目标锁 +
+// 全量下发（Windows 约 35 秒），库锁会被占很久，后续分配/挂载全排队（现场表现：盘文件都
+// 建好了，界面还停在"正在分配"）。这类库的目标由首次挂载的 Publish 现场下发，与建库表单
+// "不勾预创建 → 挂载时现场下发目标"的说明一致（见 DiskService.runCreateDiff）。
+//
+// 收益：已经预建目标的库，用户点挂载只剩"连接"——Publish 命中目标指纹后整段跳过
+// （省掉一次约 35 秒的全量下发），挂载不再卡在服务端现场建目标上。
 //
 // 与 EnsurePoolTarget 的唯一区别是**不碰 AllocationID**：本方法可能在分配之后才被调用
 // （任务重试、补建），把已经认领的绑定抹掉会让后续按 allocation 查目标（Unpublish、

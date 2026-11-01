@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 
 import {
   CLIENT_API_VERSION,
-  agentApi,
   isApiError,
   type BootstrapStatus,
   type ClientCheckResponse,
@@ -27,8 +26,6 @@ export type StartupPhase =
 export interface StartupFlow {
   phase: StartupPhase
   checking: boolean
-  /** 自动挂载进度（由本地代理执行，前端只展示；无自动挂载时为 null）。 */
-  autoMount: AutoMountProgress | null
   /** 重新执行检查（重试 / 保存地址后）。 */
   recheck: () => void
   setPhase: (phase: StartupPhase) => void
@@ -36,12 +33,6 @@ export interface StartupFlow {
   selectServer: (key: string) => void
   /** 光标处于不兼容提示页时，允许"仍然继续（只读查看）"。 */
   continueAfterCompat: (check: ClientCheckResponse) => void
-}
-
-/** 自动挂载进度摘要。 */
-export interface AutoMountProgress {
-  total: number
-  pending: number
 }
 
 function isOfflineError(error: unknown): boolean {
@@ -52,36 +43,9 @@ function isOfflineError(error: unknown): boolean {
 export function useStartupFlow(api: VaultApi): StartupFlow {
   const [phase, setPhase] = useState<StartupPhase>({ kind: 'loading' })
   const [checking, setChecking] = useState(false)
-  const [autoMount, setAutoMount] = useState<AutoMountProgress | null>(null)
   const activeKey = useAppStore((state) => state.activeKey)
   const hydrated = useAppStore((state) => state.hydrated)
   const runTokenRef = useRef(0)
-
-  // 进入主界面后展示自动挂载进度：挂载由代理执行，前端只读取一次状态。
-  useEffect(() => {
-    if (phase.kind !== 'ready') {
-      setAutoMount(null)
-      return
-    }
-    let cancelled = false
-    agentApi
-      .state()
-      .then((state) => {
-        if (cancelled) return
-        const total = state.mounts.length
-        if (state.auto_mount && total > 0) {
-          setAutoMount({ total, pending: state.mounts.filter((mount) => mount.state === 'mounting').length })
-        } else {
-          setAutoMount(null)
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setAutoMount(null)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [phase.kind])
 
   const run = useCallback(
     async (forceContinue: boolean): Promise<void> => {
@@ -200,7 +164,7 @@ export function useStartupFlow(api: VaultApi): StartupFlow {
     useAppStore.getState().setActive(key)
   }, [])
 
-  return { phase, checking, autoMount, recheck, setPhase, selectServer, continueAfterCompat }
+  return { phase, checking, recheck, setPhase, selectServer, continueAfterCompat }
 }
 
 function errorMessage(error: unknown): string {

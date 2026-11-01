@@ -1249,7 +1249,6 @@
   "agent.mount.dialog.dirRequired": "A target directory is required in directory mode",
 
   "agent.session.pushFailed": "Failed to push the session to the local service; mounting may be limited",
-  "agent.autoMount.progress": "Auto-mounting ({pending}/{total})",
   "agent.autoMount.done": "Auto mount finished",
 
   "agent.event.mounted": "Mounted \"{name}\"",

@@ -54,8 +54,6 @@ export interface AppLayoutProps {
   language: Language
   onLanguageChange: (language: Language) => void
   onManageServers: () => void
-  /** 自动挂载进度（由本地代理执行，前端只展示）。 */
-  autoMount?: { total: number; pending: number } | null
 }
 
 /**
@@ -68,7 +66,7 @@ export interface AppLayoutProps {
 const SERVER_SWITCH_RELOAD_DELAY_MS = 300
 
 /** 主界面布局：按 mode 渲染应用端或管理端两套菜单，顶栏元素两模式一致。 */
-export function AppLayout({ mode, language, onLanguageChange, onManageServers, autoMount }: AppLayoutProps): JSX.Element {
+export function AppLayout({ mode, language, onLanguageChange, onManageServers }: AppLayoutProps): JSX.Element {
   const { t } = useI18n()
   const navigate = useNavigate()
   // 代理事件的全局通知出口：整个应用只注册一次（放外壳里）。
@@ -525,14 +523,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers, a
                   style={{ margin: `${spacing.md}px ${spacing.md}px 0` }}
                   message={t('agent.host.title')}
                   description={t(hostDescKey, { error: hostWarning.error ?? '' })}
-                />
-              ) : null}
-              {autoMount ? (
-                <Alert
-                  type="info"
-                  showIcon
-                  style={{ margin: `${spacing.md}px ${spacing.md}px 0` }}
-                  message={t('agent.autoMount.progress', { pending: autoMount.pending, total: autoMount.total })}
                 />
               ) : null}
               <Outlet />

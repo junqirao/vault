@@ -92,6 +92,12 @@ type MountRequest struct {
 	ServerURL string `json:"server_url"`
 	// ServerName 是可选的服务端展示名（仅用于把归属带回去，挂载记录里的名称以状态为准）。
 	ServerName string `json:"server_name,omitempty"`
+	// autoRestore 表示这次调用来自**自动挂载/启动恢复**（不是用户点挂载）。
+	//
+	// 自动恢复必须幂等：一块已经好好挂着的盘，不能因为"缓存上次回退成了直连"就被拆掉重挂 ——
+	// 那会让每次会话建立（重连、证书重登录）都产生一轮"已卸载 + 已挂载"，用户看到的就是
+	// 自动挂载在反复挂载/卸载。用户手动挂载/重挂仍按最新配置收敛（见 mount 的幂等分支）。
+	autoRestore bool
 }
 
 // mountEngine 实现挂载/卸载状态机（含幂等与串行化）。
@@ -104,6 +110,22 @@ type mountEngine struct {
 	// `<挂载根>\<库名>`：晚到的那个要么撞 dir_not_empty 报错，要么两块卷抢同一个挂载点。
 	// 见 mountAt 里的占位说明。
 	mountDirMu sync.Mutex
+
+	// mountDiskMu 串行化"定位新上线的 iSCSI 磁盘 → 记下磁盘号"这一步。
+	//
+	// 并发的挂载（分组挂载 / 自动挂载并发上限 2）会在 FindIscsiDisk 里按容量挑候选盘，
+	// 并用**已占用磁盘号**排除已挂的盘。如果两次挂载在对方把磁盘号写回记录之前各自枚举，
+	// 就会挑中**同一块**候选盘（多块同容量盘时尤其常见，脚本对这种情形只能返回编号最小的
+	// 候选）：后一个操作在错的盘上/直接失败 —— 现场表现就是"并发挂载必有一块失败"。
+	// 磁盘号一旦持久化进挂载记录，后续 FindIscsiDisk 就能正确排除它。
+	mountDiskMu sync.Mutex
+
+	// mountLetterMu 串行化"分配盘符"。
+	//
+	// 盘符模式下脚本用 `Add-PartitionAccessPath -AssignDriveLetter` 让 Windows 自己挑一个
+	// 空闲盘符：两次并发调用可能同时挑中同一个，后写入的一方直接失败（"指定的访问路径已
+	// 在使用"）。目录模式有 mountDirMu，盘符模式同样需要串行化（见 mountAt）。
+	mountLetterMu sync.Mutex
 
 	// teardownMu / teardowns 跟踪"记录已删、但后台还在收尾"的目标 IQN。
 	//
@@ -163,11 +185,37 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	if existing, _, ok := e.a.store.GetMount(allocationID); ok && existing.State == MountStateMounted {
 		active, verified := e.a.probeMountSession(ctx, allocationID)
 		if mounted := mountIdempotent(existing, active, verified); mounted {
+			// 把磁盘号补进运行时表：FindIscsiDisk 用 UsedDiskNumbers（只读运行时）排除已挂
+			// 磁盘；进程重启后运行时表是空的，已挂着的盘如果不出现在排除列表里，下一次挂载
+			// （多块同容量盘时）可能又挑中它 —— 这是"并发/连续挂载偶发失败"的另一半原因。
+			if existing.DiskNumber > 0 {
+				e.a.store.UpdateMount(allocationID, func(_ *MountState, r *mountRuntime) {
+					if !r.DiskKnown {
+						r.DiskNumber = existing.DiskNumber
+						r.DiskKnown = true
+					}
+				})
+			}
 			if e.mountCacheSatisfied(req, existing) && e.mountModeSatisfied(req, existing) {
 				if latest, _, ok := e.a.store.GetMount(allocationID); ok {
 					return &latest, nil
 				}
 				return &existing, nil
+			}
+			// 自动恢复（非用户点挂载）：如果只是**运行时回退**（配置没变、只是上次没走成缓存），
+			// 保持现有挂载，不要拆。
+			//
+			// 为什么：自动恢复在每次会话建立（重连、证书重登录）时都会跑。把"缓存暂时不可用、
+			// 已回退直连"当作需要重挂，会让一块正常挂着的盘每次会话事件都经历一轮
+			// 卸载 → 重挂（界面反复弹"已卸载/已挂载"）。用户手动挂载/重挂仍按最新配置收敛。
+			if req.autoRestore && e.mountModeSatisfied(req, existing) {
+				pref, _ := e.mountPrefFor(req, nil)
+				if existing.DirectMode == pref.DirectMode &&
+					existing.CacheEnabled == pref.cacheEnabledOrDefault() {
+					e.a.logger.Info("自动恢复：缓存只是回退直连，保持现有挂载（不重挂）",
+						"allocation_id", allocationID)
+					return &existing, nil
+				}
 			}
 			// 代理/缓存/直连/形态设置与既有记录不一致（用户刚在设置里改了）：**先卸载再按新设置挂载**。
 			//
@@ -472,8 +520,12 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	if err := e.a.vol.UpdateHostStorageCache(ctx); err != nil {
 		e.a.logger.Warn("刷新存储缓存失败（继续尝试定位磁盘）", "allocation_id", allocationID, "error", err)
 	}
+	// "挑盘 + 记盘号"必须原子：并发挂载若在对方写回磁盘号之前各自枚举，会挑中同一块候选盘
+	// （见 mountDiskMu 的说明）。
+	e.mountDiskMu.Lock()
 	diskNumber, err := e.a.vol.FindIscsiDisk(ctx, spec.DiskSizeBytes, e.a.store.UsedDiskNumbers(allocationID))
 	if err != nil {
+		e.mountDiskMu.Unlock()
 		return fail("find_disk", err)
 	}
 	e.a.store.UpdateMount(allocationID, func(m *MountState, r *mountRuntime) {
@@ -481,6 +533,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		r.DiskNumber = diskNumber
 		r.DiskKnown = true
 	})
+	e.mountDiskMu.Unlock()
 
 	e.setPhase(allocationID, MountPhaseOnline)
 	if err := e.a.vol.SetOffline(ctx, diskNumber, false); err != nil {
@@ -837,7 +890,47 @@ func (e *mountEngine) unmountLocked(ctx context.Context, allocationID string) (*
 	}
 
 	// ① 移除挂载点（盘符或目录）。必须在磁盘下线之前做：盘一旦 Offline，盘符就没了。
-	if path := strings.TrimSpace(ms.MountPath); path != "" {
+	//
+	// ⚠️ 动手之前先核对"这块盘现在到底还在不在这个挂载点上"。
+	//
+	// 记录里的 DiskNumber / MountPath 是**上次挂载时**的现场：客户端重启后 Windows 会
+	// 重新枚举 iSCSI 磁盘，盘号可能已经分给另一块盘（例如另一个库 B），盘符也会被系统
+	// 回收后再分配给别的卷。若直接按旧记录 `Set-Disk -Offline` 或按旧盘符
+	// `Remove-PartitionAccessPath`，卸载 A 就会把 B 一起卸掉（真实反馈："点卸载存储库 A
+	// 把 B 也给卸载了"）。
+	//
+	// 校验：按记录里的盘号问它**当前**的挂载点，与记录一致才允许按旧盘号操作；不一致 /
+	// 查不出来 → 不再相信旧盘号，只断开本分配的 iSCSI 会话（会话一断，Windows 会连同
+	// 该盘自己的盘符一起回收，无需也不允许碰别的盘）。
+	path := strings.TrimSpace(ms.MountPath)
+	mountVerified := false
+	if path != "" {
+		diskNumber, diskKnown := teardownDiskNumber(ms, rt)
+		if diskKnown {
+			current, cErr := e.a.vol.CurrentMountPath(ctx, diskNumber)
+			switch {
+			case cErr == nil && sameMountPath(current, path):
+				mountVerified = true
+			case cErr == nil:
+				e.a.logger.Warn("卸载：记录的挂载点已不属于该磁盘，按“已卸载”处理（不动其它盘）",
+					"allocation_id", allocationID, "recorded", path,
+					"current", strings.TrimSpace(current), "disk_number", diskNumber)
+			case rt.DiskKnown:
+				// 进程内刚挂上的盘：盘号可信，查询失败只是探测问题，按旧行为继续。
+				mountVerified = true
+			default:
+				e.a.logger.Warn("卸载：核对磁盘与挂载点失败，跳过挂载点移除与磁盘下线（只断会话）",
+					"allocation_id", allocationID, "disk_number", diskNumber, "error", cErr)
+			}
+		}
+	}
+	if !mountVerified {
+		// 盘号不可信：清掉它，finishUnmount 就不会拿旧盘号去 Set-Disk -Offline。
+		rt.DiskNumber = 0
+		rt.DiskKnown = false
+		ms.DiskNumber = 0
+	}
+	if path != "" && mountVerified {
 		if err := e.a.vol.Unmount(ctx, path); err != nil {
 			// 幂等兜底，两种"挂载点确实不在了"都必须视为已移除 —— 否则会为了一个不存在的
 			// 挂载点中断整次卸载，把后面的断开会话、回写释放、删记录一起拖没：
@@ -1221,6 +1314,20 @@ func mountLetterGone(path string) bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
+// sameMountPath 比较两个挂载点是否指向同一个位置（Windows 语义：大小写与末尾分隔符不敏感）。
+//
+// 卸载前用它核对"记录里的挂载点现在是否仍属于这块盘"：盘号/盘符被系统复用后，按旧记录
+// 直接移除会把另一块盘的挂载点摘掉（见 unmountLocked 的说明）。
+func sameMountPath(a, b string) bool {
+	normalize := func(s string) string {
+		s = strings.TrimSpace(s)
+		s = strings.TrimRight(s, `\/`)
+		return strings.ToLower(s)
+	}
+	left, right := normalize(a), normalize(b)
+	return left != "" && left == right
+}
+
 // unmountFailureState 返回卸载阶段失败后，那条记录应该处于什么状态。
 //
 //   - 什么都没拆掉（teardown=false）→ 回滚到卸载前的状态：磁盘确实还挂着，状态如实；
@@ -1357,17 +1464,14 @@ func (e *mountEngine) serverMetaOf(key string) (url, name string) {
 	return "", ""
 }
 
-// restore 恢复本地记录中的挂载：先清理残留状态，再走完整挂载流程。
+// restore 恢复本地记录中的挂载：走与用户挂载同一套幂等流程。
 //
-// 说明：服务端 MountSpec 不含「本机应挂载哪些分配」的清单，因此自动挂载只能依据
-// 本地状态文件中记录的分配逐个恢复（见 docs/agent-api.md 的 auto_mount 语义）。
+// ⚠️ 这里**不能**先无条件卸载已有记录。自动挂载/启动恢复会在**每次**会话建立时执行
+// （客户端重连、证书重登录都会触发），而一块正常挂着的盘在 mount() 里本来就命中幂等分支；
+// 先卸载会把每一次会话事件都变成"卸载 + 重挂"——用户看到的就是自动挂载反复"已挂载/已卸载"。
+// 记录对应的会话若真的没了，mount() 的幂等判据（实测会话）会判失败并照常重连，不需要先拆。
 func (e *mountEngine) restore(ctx context.Context, req MountRequest) (*MountState, error) {
-	if ms, _, ok := e.a.store.GetMount(req.AllocationID); ok && ms.State == MountStateMounted {
-		// 上次运行残留的 mounted 状态：真实会话可能已不存在，先尽力清理再重挂。
-		if err := e.unmount(ctx, req.AllocationID); err != nil {
-			e.a.logger.Warn("清理残留挂载状态失败（继续重挂）", "allocation_id", req.AllocationID, "error", err)
-		}
-	}
+	req.autoRestore = true
 	// 自动挂载：失败保留记录（见 mount 的 keepRecordOnFailure 说明）。
 	return e.mount(ctx, req, true)
 }
@@ -1380,7 +1484,11 @@ func (e *mountEngine) restore(ctx context.Context, req MountRequest) (*MountStat
 //   - 目录模式：目录名就是**存储库名称**（见 resolveMountDir 与 mountDirLeaf）。
 func (e *mountEngine) mountAt(ctx context.Context, diskNumber int, mode string, req MountRequest, spec *MountSpec, serverKey string) (string, error) {
 	if mode != mountModeDirectory {
+		// 串行化盘符分配：`Add-PartitionAccessPath -AssignDriveLetter` 由系统挑空闲盘符，
+		// 并发调用可能同时挑中同一个，后写入的一方失败（见 mountLetterMu 的说明）。
+		e.mountLetterMu.Lock()
 		letter, err := e.a.vol.MountToDriveLetter(ctx, diskNumber)
+		e.mountLetterMu.Unlock()
 		if err != nil {
 			return "", err
 		}

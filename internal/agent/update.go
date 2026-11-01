@@ -973,10 +973,15 @@ func ReconcileUpdate(updateDir, currentVersion string, logger *slog.Logger) (Rec
 		return ReconcileResult{}, nil
 	}
 
-	// 更新成功：当前版本已等于目标版本。
-	if sameVersion(currentVersion, pending.ToVersion) {
-		logger.Info("自更新成功，清理待确认记录与备份",
-			"from", pending.FromVersion, "to", pending.ToVersion)
+	// 更新成功：当前版本已经**不低于**目标版本。
+	//
+	// ⚠️ 不能只认"完全相等"：客户端本体更新自带的新代理往往版本更高（或同一版本号带
+	// 不同的构建元数据），而 pending 里的目标版本是旧一次自更新的目标。只认相等时，
+	// 每次启动都会把"已是最新"误判成"更新没生效"，累计 3 次后还会拿旧备份回滚 ——
+	// 现场表现正是"自动更新完成之后，本地服务版本还是旧的"。
+	if sameVersion(currentVersion, pending.ToVersion) || versionAtLeast(currentVersion, pending.ToVersion) {
+		logger.Info("自更新已生效（当前版本不低于目标版本），清理待确认记录与备份",
+			"from", pending.FromVersion, "to", pending.ToVersion, "actual", currentVersion)
 		_ = os.Remove(pendingPath)
 		_ = os.Remove(pending.BackupPath)
 		return ReconcileResult{}, nil
@@ -1058,6 +1063,21 @@ func sameVersion(a, b string) bool {
 		return strings.TrimSpace(a) == strings.TrimSpace(b)
 	}
 	return semver.Compare(va, vb) == 0
+}
+
+// versionAtLeast 判断 current 是否**不低于** target（语义比较）。
+//
+// 用于自更新对账：当前版本已经比 pending 里的目标更新时，这次更新显然已经生效（或已被
+// 客户端本体更新带来的新代理取代），必须清理 pending —— 否则会被误判成"更新失败"，
+// 累计到阈值还会回滚到旧备份（见 ReconcileUpdate）。任一侧无法解析时返回 false，
+// 退回"只有完全相同才算成功"的老规则，绝不把无法比较的版本判成成功。
+func versionAtLeast(current, target string) bool {
+	cur, errCur := semver.Parse(current)
+	tgt, errTgt := semver.Parse(target)
+	if errCur != nil || errTgt != nil {
+		return false
+	}
+	return semver.Compare(cur, tgt) >= 0
 }
 
 // ---- 自更新下载进度 ----

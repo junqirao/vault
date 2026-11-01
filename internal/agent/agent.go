@@ -423,6 +423,15 @@ func (a *Agent) Stop(ctx context.Context) error {
 	server := a.server
 	a.mu.Unlock()
 
+	// 先断开本地事件流（全局流 + 性能页流）：SSE 是长连接，不主动关掉的话下面的
+	// server.Shutdown 会一直等它们变成空闲，白等一个停机超时（退出/自更新都会被拖慢）。
+	if a.hub != nil {
+		a.hub.Close()
+	}
+	if perf := a.cache.PerformanceHub(); perf != nil {
+		perf.Close()
+	}
+
 	if server != nil {
 		if err := server.Shutdown(ctx); err != nil {
 			a.logger.Warn("本地 HTTP 优雅停机未在超时内完成", "error", err)
@@ -455,13 +464,64 @@ func (a *Agent) ActiveMountCount() int {
 	return count
 }
 
-// UnmountAll 逐个卸载全部挂载（用于退出流程）；单个失败只记录日志。
+// BeginShutdown 停止后台循环（心跳 / 会话续期 / 自动连接 / 会话实测 / 自动挂载），
+// 但不动本地 HTTP 与已有挂载。
+//
+// 退出流程必须先在"不再产生新挂载"的状态下卸载：正在跑的自动挂载会继续把并发队列里
+// 排着的库挂上来，清完一轮又被挂回去 —— 用户看到的就是"退了还有盘在"。
+// 卸载完成后由 Stop 做最终的停机（见 cmd/vault-agent/main.go）。
+func (a *Agent) BeginShutdown() {
+	a.mu.Lock()
+	cancel := a.cancel
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// unmountAllConcurrency 是退出时并行卸载的上限。
+//
+// 与自动挂载同一量级：每条卸载都会起 PowerShell（移除挂载点约 1s），串行会让"退出时
+// 清理挂载"的时间与库数量线性增长；同时起太多 PowerShell 又会拖慢整机。
+const unmountAllConcurrency = 2
+
+// UnmountAll 卸载全部挂载（用于退出流程）；单个失败只记录日志。
+//
+// 两条与"关闭速度"有关的处理：
+//   - **先取消进行中的挂载**：unmount 要拿同一把 allocation 锁，等一次几十秒的挂载跑完
+//     会把退出流程整个拖住；取消后挂载流程自己清理现场并删记录，这里不再重复卸载。
+//   - **并发卸载**：每块盘的挂载点移除是独立的 PowerShell 调用，串行会让多库用户的
+//     退出等待成倍变长。
 func (a *Agent) UnmountAll(ctx context.Context) {
+	// 第一遍：取消进行中的挂载（见上面的说明）。取消会杀掉正在跑的 PowerShell，挂载流程
+	// 随即按失败清理并删记录 —— 不等它跑完，也不在这里替它卸载。
 	for _, ms := range a.store.ListMounts() {
-		if err := a.engine.unmount(ctx, ms.AllocationID); err != nil {
-			a.logger.Warn("退出时卸载失败", "allocation_id", ms.AllocationID, "error", err)
+		if ms.State == MountStateMounting {
+			a.CancelMount(ms.AllocationID)
 		}
 	}
+
+	// 第二遍重新取列表：取消期间可能有挂载刚好完成（状态变成 mounted），它必须被卸载；
+	// 而仍在 mounting 的交给上面的取消流程收尾，这里跳过（避免同一把锁上干等）。
+	mounts := a.store.ListMounts()
+	sem := make(chan struct{}, unmountAllConcurrency)
+	var wg sync.WaitGroup
+	for _, ms := range mounts {
+		item := ms
+		if item.State == MountStateMounting {
+			continue
+		}
+		wg.Add(1)
+		safeGo(a.logger, "unmount_all", func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if err := a.engine.unmount(ctx, item.AllocationID); err != nil {
+				a.logger.Warn("退出时卸载失败", "allocation_id", item.AllocationID, "error", err)
+			}
+		})
+	}
+	wg.Wait()
 }
 
 // setSession 保存**某台**服务端的会话，并触发该台的信息刷新、事件订阅与自动挂载。

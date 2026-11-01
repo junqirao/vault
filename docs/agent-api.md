@@ -1057,6 +1057,8 @@ Electron 主进程应读取 `%ProgramData%\Vault\webapp\current.json`，以其�
 
 ```
 POST /agent/shutdown       ↑ {ok:true}   # 托盘"退出"使用；代理会先卸载全部挂载再退出
+# 响应会先返回，卸载在响应之后进行；客户端会等代理进程退出（有上限），超时也照常退出，
+# 由代理在后台把剩余收尾做完（见 docs/implementation.md 7.1.2）。
 ```
 
 ## 错误约定

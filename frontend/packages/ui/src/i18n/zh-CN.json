@@ -1307,7 +1307,6 @@
   "agent.mount.dialog.dirRequired": "目录模式下必须填写目标目录",
 
   "agent.session.pushFailed": "登录会话同步到本地服务失败，挂载功能可能受限",
-  "agent.autoMount.progress": "正在自动挂载（{pending}/{total}）",
   "agent.autoMount.done": "自动挂载已完成",
 
   "agent.event.mounted": "已挂载「{name}」",

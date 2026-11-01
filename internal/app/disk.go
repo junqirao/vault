@@ -382,7 +382,40 @@ func (s *DiskService) runCreateVHDX(ctx context.Context, j *domain.Job, rep job.
 	if err != nil {
 		return err
 	}
-	return s.buildVHDXFromSource(ctx, disk, p.SourceDir, rep)
+	if err := s.buildVHDXFromSource(ctx, disk, p.SourceDir, rep); err != nil {
+		return err
+	}
+	s.finishParentOnlyPrepare(ctx, disk)
+	return nil
+}
+
+// finishParentOnlyPrepare 给"非预创建共享库"的母盘建盘任务收尾：库从 creating 转 active。
+//
+// 为什么非预创建也要等母盘：库若在母盘文件出现之前就 active，客户端可以在那一刻分配/挂载，
+// 差异盘派生会以"父文件不存在"直接失败（不是共享冲突，不走退避），盘被永久标成 error。
+// 见 RepoService.Create 与 Allocate 的说明。
+//
+// 预创建（池位）路径不经过这里：那个任务由 JobPrepareRepo 在"母盘 + 池位 + 目标"全部
+// 就绪后自己 FinishRepoPrepare，提前置 active 会让用户看到"能挂但池位还在建"的假象。
+func (s *DiskService) finishParentOnlyPrepare(ctx context.Context, disk *domain.Disk) {
+	if disk == nil || disk.Kind != domain.DiskKindParent || s.Repos == nil {
+		return
+	}
+	repo, err := s.Store.GetRepository(ctx, disk.RepoID)
+	if err != nil || repo.State != domain.RepoStateCreating {
+		return
+	}
+	// 只收尾"停在母盘阶段"的非预创建库：预创建库的母盘阶段进度也长这样，但它的任务
+	// 不是 JobCreateVHDX（见上面），不会走到这里。这里再加一层 phase 判断是为了防未来
+	// 有人把 JobPrepareRepo 的母盘拆成独立任务时误置 active。
+	if repo.Meta.Prepare == nil || repo.Meta.Prepare.Phase != domain.RepoPhaseParent {
+		return
+	}
+	if err := s.Repos.FinishRepoPrepare(ctx, repo.ID); err != nil {
+		s.Log.Warn("母盘建好后更新存储库状态失败", "repo_id", repo.ID, "error", err)
+		return
+	}
+	s.Log.Info("母盘已就绪，存储库转为可用", "repo_id", repo.ID, "disk_id", disk.ID)
 }
 
 // buildVHDXFromSource 是建盘核心流水线：创建动态盘 → 挂载 → 格式化 → 拷入目录 →
@@ -498,9 +531,14 @@ func isDiskBuilt(state domain.DiskState) bool {
 
 // prePublishTarget 为"会直接交给用户"的盘提前建好并启用 iSCSI 目标（服务端"预先创建"）。
 //
-// 覆盖两条原先只能等用户挂载时现场下发的路径：
+// 覆盖两条路径：
 //   - 独享库的 standalone 盘：建库时就有，用户拿到的就是它；
-//   - 非池化共享库的差异盘：分配时才派生（JobCreateDiff），派生完成即预建。
+//   - 池化库的池位差异盘（建库预创建 / 释放回池后的重建）。
+//
+// **非池化共享库的差异盘刻意不走这里**：它的目标由挂载路径（Publish）现场下发。
+// 那条派生任务持有 lock.RepoKey，若在这里再等目标锁 + 全量下发（Windows 约 35 秒），
+// 库锁会被占很久，后续分配/挂载全排队（真实反馈：盘都建好了界面还停在"正在分配"）。
+// 这也与建库表单的说明一致：不勾"预创建 iSCSI 和 target" → 挂载时现场下发。
 //
 // 共享库的母盘（parent）刻意跳过：共享库交给用户的是差异盘，母盘只作为派生来源，
 // 提前发布它等于在平台上多开一条能读到基线数据的通路，没有必要。
@@ -551,10 +589,8 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 		return err
 	}
 	if isDiskBuilt(disk.State) && s.Disk != nil && s.Disk.Exists(disk.VHDXPath) {
-		// 盘已派生好（published 是 ready 的超集）：不重复派生，但补一次预创建 ——
-		// 预创建只告警不失败，上一次尝试可能就是"盘建成了、目标没下发成功"，
-		// 任务重试只能从这里进入，直接 return 会让预创建永远没有第二次机会。
-		s.prePublishTarget(ctx, disk)
+		// 盘已派生好：不重复派生。目标不在这里补建 —— 非池化库的目标由挂载路径（Publish）
+		// 现场下发，见本函数末尾的说明。
 		return nil
 	}
 	if s.Disk == nil {
@@ -580,9 +616,16 @@ func (s *DiskService) runCreateDiff(ctx context.Context, j *domain.Job, rep job.
 	if err := s.ensureDiffDisk(ctx, disk, parent, repo, rep); err != nil {
 		return err
 	}
-	// 派生完成立刻把 iSCSI 目标建好启用（服务端"预先创建"）：用户拿着这次分配点挂载
-	// 时，Publish 命中指纹即整段跳过，不必再等一次约 35 秒的现场下发。
-	s.prePublishTarget(ctx, disk)
+	// 只有**池化库**才在派生完成后顺手把目标建好启用：池位的语义就是"分配即用"。
+	//
+	// 非池化库（没勾"预创建 iSCSI 和 target"）刻意不在这里下发：这条路径跑在
+	// `lock.RepoKey` 里，而一次全量下发在 Windows 上约 35 秒；若目标锁又被别的任务占着，
+	// 建盘任务会一直不放库锁 —— 后续所有"分配/挂载"都卡在等锁上（现场表现：盘文件都已经
+	// 建好了，界面还一直停在"正在分配"）。这类库的目标留给挂载路径（Publish）现场下发，
+	// 与界面上的说明一致："不勾选 → 分配时才派生差异盘、挂载时现场下发目标"。
+	if repo.Meta.Pool {
+		s.prePublishTarget(ctx, disk)
+	}
 	return nil
 }
 

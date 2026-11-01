@@ -66,6 +66,25 @@ func (h *EventHub) Unsubscribe(id int) {
 	}
 }
 
+// Close 关闭全部订阅通道（代理退出时用）。
+//
+// 为什么需要：本地事件流（SSE）是长连接，http.Server.Shutdown 会一直等它们变成空闲
+// 才返回。代理退出时事件已经没人关心，主动断开能让 Stop 立刻完成，而不是白等一个
+// shutdown 超时（见 handleShutdown）。
+//
+// 与 Unsubscribe 的配合：Close 把订阅表整体换空后再关通道，之后到来的 Unsubscribe
+// 找不到条目（不会重复 close 导致 panic）；Publish 全程持锁，不会撞上"向已关闭通道
+// 发送"。
+func (h *EventHub) Close() {
+	h.mu.Lock()
+	subs := h.subs
+	h.subs = make(map[int]chan Event)
+	h.mu.Unlock()
+	for _, ch := range subs {
+		close(ch)
+	}
+}
+
 // Publish 广播事件。
 //
 // 绝不阻塞发布方：订阅者槽位满时优先丢弃「最旧的一条」再写入最新（进度类事件保留最新值

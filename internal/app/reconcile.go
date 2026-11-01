@@ -84,6 +84,18 @@ func (a *App) runReconcile(parent context.Context, budget time.Duration) error {
 		log.Info("已重置运行中任务", "count", n)
 	}
 
+	// 1b) 清理重复排队的目标修复任务。
+	//
+	// 对账每 5 分钟为"平台侧目标缺失/启用不符"入队一条 repair_target。一旦 worker 被卡住
+	// （例如处理函数重复获取同一把非可重入锁而自锁），任务只进不出：几小时就能攒出数万条，
+	// 恢复后逐条跑又要几十秒一条，任务中心完全不可用。这些任务幂等，同一目标留一条就够。
+	if n, err := a.Store.DeleteDuplicatePendingJobs(ctx, domain.JobRepairTarget); err != nil {
+		log.Warn("清理重复的目标修复任务失败", "error", err)
+	} else if n > 0 {
+		report("job.duplicate_repair_removed", "", fmt.Sprintf("已清理 %d 条重复的目标修复任务", n), true)
+		log.Info("已清理重复的目标修复任务", "count", n)
+	}
+
 	// 2) iSCSI 目标期望状态收敛（含启用状态回写）。
 	if err := a.iscsi.ReconcileTargets(ctx); err != nil {
 		log.Error("收敛 iSCSI 目标失败", "error", err)

@@ -650,9 +650,10 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
   const unmountAll = useCallback(async (): Promise<void> => {
     if (groupOps.get(groupKey)?.busy) return
     const mounted = agent.state?.mounts ?? []
-    const targets = repos
-      .map((repo) => mountOfRepo(mounted, repo))
-      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    // 严格按**库 ID**挑目标，不用名称兜底：旧记录缺 repo_id 时按库名匹配，在两个服务端
+    // 有同名库的情况下会把另一台的挂载也列进来 —— 一点"卸载分组"，那边跟着掉线。
+    const ids = new Set(repos.map((repo) => repo.id))
+    const targets = mounted.filter((item) => item.repo_id !== '' && ids.has(item.repo_id))
     if (targets.length === 0) return
     setGroupOp(groupKey, { busy: true, kind: 'unmount', progress: { done: 0, total: targets.length } })
     let ok = 0
@@ -1269,15 +1270,11 @@ export function RepoList({
             {t('repo.group.title')}
           </Typography.Title>
         </div>
+        {/* 一行一个分组：组卡片信息按整行宽度排布，组再多也不会挤成两列
+            （真实反馈："存储库分组一行一个，不要一行多个"）。 */}
         <Row gutter={[spacing.md, spacing.md]}>
           {groups.map((bucket) => (
-            <Col
-              key={bucket.key || '__ungrouped__'}
-              xs={24}
-              sm={24}
-              xl={groups.length === 1 ? 24 : 12}
-              xxl={groups.length === 1 ? 24 : 12}
-            >
+            <Col key={bucket.key || '__ungrouped__'} span={24}>
               <RepoGroupCard
                 bucket={bucket}
                 currentUserId={userId}

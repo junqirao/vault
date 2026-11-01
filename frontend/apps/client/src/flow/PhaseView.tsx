@@ -224,7 +224,6 @@ export function PhaseView({
       language={language}
       onLanguageChange={onLanguageChange}
       onManageServers={() => setConfiguring(true)}
-      autoMount={flow.autoMount}
     />
   )
 }

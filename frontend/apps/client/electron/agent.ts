@@ -97,6 +97,25 @@ const AGENT_SLOW_RESTART_MS = 30000
 /** 每次轮询"陈旧进程是否已退出"的间隔。 */
 const STALE_KILL_POLL_MS = 150
 
+/**
+ * 自更新请求的有效窗口（毫秒）：超过它就不再把"这次退出"当自更新来处理，
+ * 避免一个陈旧标记把普通崩溃重启也拖慢。
+ */
+const SELF_UPDATE_HANDOFF_WINDOW_MS = 5 * 60 * 1000
+/**
+ * 等替换器完成替换的上限与轮询间隔。
+ *
+ * 替换器要在代理退出后用 staged 覆盖正式 exe（20~100MB 的复制 + rename 可能要几秒）。
+ * 这里最多等 30 秒；超时也照常拉起（更新可能失败，不能让客户端永远不启动代理）。
+ */
+const UPDATE_HANDOFF_MAX_MS = 30 * 1000
+const UPDATE_HANDOFF_POLL_MS = 200
+
+/** 自更新的启动对账文件（与 internal/agent 的 updateDirName + pendingFileName 一致）。 */
+function updatePendingFile(): string {
+  return path.join(agentDataDir(), 'update', 'pending.json')
+}
+
 const execFileAsync = promisify(execFile)
 
 async function fileExists(file: string): Promise<boolean> {
@@ -260,6 +279,13 @@ export class AgentManager {
   private readonly listeners = new Set<(info: AgentInfo) => void>()
   private restartTimes: number[] = []
   private stopping = false
+  /**
+   * 是否已经请代理"卸载全部挂载后退出"（见 shutdownAndWait）。
+   *
+   * 用途：应用退出时 will-quit 里的 stop() 默认会强杀子进程 —— 而代理此时可能正在
+   * 后台卸载挂载，强杀等于把清理砍在半路。走过优雅退出的流程就不再补刀，让它自己收尾。
+   */
+  private gracefulShutdown = false
   private readyTimer: ReturnType<typeof setTimeout> | null = null
   /** 代理退出后的延迟重启定时器（见 AGENT_RESTART_DELAY_MS）。 */
   private restartTimer: ReturnType<typeof setTimeout> | null = null
@@ -293,25 +319,74 @@ export class AgentManager {
     void this.spawnOnce()
   }
 
-  /** 请求代理自行卸载全部挂载后退出（用于托盘"退出"，超时即放弃）。 */
-  async shutdown(timeoutMs = 3000): Promise<void> {
+  /**
+   * 请求代理自行卸载全部挂载后退出（用于托盘"退出"，超时即放弃）。
+   *
+   * 返回请求是否送达：`/agent/shutdown` 会立即回 200，真正的卸载在代理主程序里随后
+   * 进行（见 cmd/vault-agent/main.go）。需要"等它卸完"的调用方应改用 shutdownAndWait。
+   */
+  async shutdown(timeoutMs = 3000): Promise<boolean> {
     const { available, baseUrl, token } = this.info
-    if (!available || !baseUrl || !token) return
-    await new Promise<void>((resolve) => {
+    if (!available || !baseUrl || !token) return false
+    return new Promise<boolean>((resolve) => {
       const request = http.request(
         `${baseUrl}/agent/shutdown`,
         { method: 'POST', headers: { 'X-Vault-Agent-Token': token } },
         (response) => {
           response.resume()
-          response.on('end', () => resolve())
+          response.on('end', () => resolve((response.statusCode ?? 500) < 400))
         }
       )
-      request.on('error', () => resolve())
+      request.on('error', () => resolve(false))
       request.setTimeout(timeoutMs, () => {
         request.destroy()
-        resolve()
+        resolve(false)
       })
       request.end()
+    })
+  }
+
+  /**
+   * 请代理卸载全部挂载后退出，并**最多等它这么久**（毫秒）。
+   *
+   * 为什么必须等：应用退出时 will-quit 会 stop() 掉子进程，而卸载是代理在
+   * `/agent/shutdown` 返回之后才做的（最多 2 分钟，见 main.go 的 unmountTimeout）。
+   * 发完请求立刻退出/强杀，等于"退出时清理挂载"只清到第一块盘 —— 这才是以前看起来
+   * "退出没清理挂载"的根因。
+   *
+   * 返回是否在时限内等到代理退出。false 表示它还在后台收尾：调用方不要强杀
+   * （stop() 会跳过强杀），让它卸完自己退出；代理侧还有 2 分钟的总上限兜底。
+   */
+  async shutdownAndWait(timeoutMs: number): Promise<boolean> {
+    // 先关掉"退出后自动重启"：这次退出是计划内的，handleExit 不应再拉起一个新代理。
+    this.stopping = true
+    this.clearReadyTimer()
+    if (!this.info.available) return this.child === null
+    const delivered = await this.shutdown()
+    if (!delivered) {
+      // 请求没送达：代理可能已经退出，也可能已经不可达。这里不阻塞退出流程。
+      return this.child === null
+    }
+    this.gracefulShutdown = true
+    return this.waitForChildExit(timeoutMs)
+  }
+
+  /** 等代理进程退出（exit 事件会把 child 置空）直到超时；超时返回 false。 */
+  private waitForChildExit(timeoutMs: number): Promise<boolean> {
+    if (this.child === null) return Promise.resolve(true)
+    return new Promise<boolean>((resolve) => {
+      const deadline = Date.now() + timeoutMs
+      const timer = setInterval(() => {
+        if (this.child === null) {
+          clearInterval(timer)
+          resolve(true)
+          return
+        }
+        if (Date.now() >= deadline) {
+          clearInterval(timer)
+          resolve(false)
+        }
+      }, 100)
     })
   }
 
@@ -513,7 +588,10 @@ export class AgentManager {
       clearTimeout(this.restartTimer)
       this.restartTimer = null
     }
-    this.child?.kill()
+    // 已经请代理"卸载挂载后退出"（见 shutdownAndWait）就不再强杀：它正处在后台卸载阶段，
+    // 这一刀会把清理连同 iSCSI 断开一起砍断。让它自己收尾退出（有 2 分钟上限兜底）；
+    // 下次启动时 reapStaleAgent 也会回收任何残留代理，不会一直占着互斥体。
+    if (!this.gracefulShutdown) this.child?.kill()
     this.child = null
     this.publish({ available: false, baseUrl: null, token: null, error: 'stopped' })
   }
@@ -664,6 +742,10 @@ export class AgentManager {
       return
     }
 
+    // 自更新替换正在进行时先等它完成（见 waitForUpdateHandoff）：抢先启动旧 exe 会把
+    // 正式文件占住，替换器的 rename 失败并回滚 —— 本地服务版本就一直是旧的。
+    await this.waitForUpdateHandoff(exe)
+
     // 启动前清理陈旧代理（见 reapStaleAgent 的说明）。
     const cleanupError = await this.reapStaleAgent(exe)
     if (cleanupError) {
@@ -763,5 +845,55 @@ export class AgentManager {
       if (this.stopping) return
       void this.spawnOnce()
     }, AGENT_RESTART_DELAY_MS)
+  }
+
+  /**
+   * 若存在"指向这个 exe"的新鲜自更新对账文件，先等替换器把正式 exe 覆盖完再继续。
+   *
+   * 为什么必须等：替换器是在代理退出**之后**才用 staged 覆盖正式 exe 的（复制 + rename，
+   * 大文件要好几秒）。如果客户端按常规 2.5 秒立刻拉起，会先启动**旧** exe 并把目标文件
+   * 占住，替换器的 rename 持续失败、最终回滚 —— 现场表现就是"自动更新完成之后，本地
+   * 服务版本还是旧的"。
+   *
+   * pending.json 由**新代理**启动时的对账删除（internal/agent.ReconcileUpdate），
+   * 因此它消失 = 新 exe 已就位且新版本已经跑起来；随后 reapStaleAgent 会回收更新器拉起的
+   * 那个实例（它没有本进程的端口/令牌，无法直接接管），再由本进程重新拉起。
+   *
+   * 只对"目标路径就是本次要启动的 exe"且文件较新的 pending 生效：
+   *   - 客户端本体更新换目录后，旧 pending 指向旧目录的 exe，不该拖慢新目录的启动；
+   *   - 很久以前的失败 pending 也不该让每次崩溃重启都白等。
+   */
+  private async waitForUpdateHandoff(exe: string): Promise<void> {
+    const pending = updatePendingFile()
+    const deadline = Date.now() + UPDATE_HANDOFF_MAX_MS
+    for (;;) {
+      if (!(await this.pendingTargetsExe(pending, exe))) return
+      if (Date.now() >= deadline) return
+      await new Promise<void>((resolve) => setTimeout(resolve, UPDATE_HANDOFF_POLL_MS))
+    }
+  }
+
+  /** pending.json 是否存在、足够新、且目标就是 exe。 */
+  private async pendingTargetsExe(pending: string, exe: string): Promise<boolean> {
+    let raw: string
+    let mtimeMs: number
+    try {
+      const stat = await fs.stat(pending)
+      mtimeMs = stat.mtimeMs
+      raw = await fs.readFile(pending, 'utf8')
+    } catch {
+      return false
+    }
+    if (Date.now() - mtimeMs > SELF_UPDATE_HANDOFF_WINDOW_MS) return false
+    let target = ''
+    try {
+      const parsed = JSON.parse(raw) as { target_path?: unknown }
+      if (typeof parsed.target_path === 'string') target = parsed.target_path
+    } catch {
+      // 解析失败：保守等待（替换器可能正在写这个文件）。
+      return true
+    }
+    if (target === '' || exe === '') return true
+    return path.resolve(target).toLowerCase() === path.resolve(exe).toLowerCase()
   }
 }

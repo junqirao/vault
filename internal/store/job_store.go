@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/jmoiron/sqlx"
+
 	"vault/internal/apperr"
 	"vault/internal/domain"
 )
@@ -213,6 +215,76 @@ func (s *Store) ResetRunningJobs(ctx context.Context) (int64, error) {
 		return 0, fmt.Errorf("store: 重置运行中任务失败: %w", err)
 	}
 	return res.RowsAffected()
+}
+
+// DeleteDuplicatePendingJobs 删除同一 type 下**同一关联对象重复排队**的任务，每个对象只保留
+// 最早的一条（未开始的那些直接删除，不留在任务中心）。
+//
+// 为什么要这条规则：repair_target 这类"对账收敛"任务由周期对账入队，幂等且重复排队没有任何
+// 价值。一旦 worker 被卡住（例如处理函数重复获取同一把非可重入锁而自锁），任务只进不出 ——
+// 每 5 分钟一条，几小时就能攒出数万条；恢复后逐条执行每条又要几十秒，任务中心完全不可用
+// （现场截图：同一个目标几万条"排队中"）。
+//
+// 只删 pending：running 可能真的在执行；进程崩溃遗留的 running 会先被 ResetRunningJobs 转回
+// pending，下一次调用本方法时再清。ref_id 为空的任务不参与去重（它们不是"同一个对象"）。
+// 返回删除条数。
+func (s *Store) DeleteDuplicatePendingJobs(ctx context.Context, jobType domain.JobType) (int64, error) {
+	type pendingRow struct {
+		ID    string `db:"id"`
+		RefID string `db:"ref_id"`
+	}
+	var rows []pendingRow
+	err := s.q.SelectContext(ctx, &rows, s.q.Rebind(
+		`SELECT id, ref_id FROM jobs WHERE type = ? AND state = ? ORDER BY created_at ASC, id ASC`),
+		string(jobType), string(domain.JobStatePending))
+	if err != nil {
+		return 0, fmt.Errorf("store: 查询重复排队任务失败: %w", err)
+	}
+
+	seen := make(map[string]struct{}, len(rows))
+	duplicates := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.RefID == "" {
+			continue
+		}
+		if _, ok := seen[row.RefID]; ok {
+			duplicates = append(duplicates, row.ID)
+			continue
+		}
+		seen[row.RefID] = struct{}{}
+	}
+	if len(duplicates) == 0 {
+		return 0, nil
+	}
+
+	// 分批删除：SQLite 的变量上限是 999（MySQL 也有限制），一次塞几万条会直接报错。
+	const chunkSize = 500
+	var deleted int64
+	err = s.Tx(ctx, func(tx *Store) error {
+		for start := 0; start < len(duplicates); start += chunkSize {
+			end := start + chunkSize
+			if end > len(duplicates) {
+				end = len(duplicates)
+			}
+			query, args, qErr := sqlx.In(
+				`DELETE FROM jobs WHERE state = ? AND id IN (?)`,
+				string(domain.JobStatePending), duplicates[start:end])
+			if qErr != nil {
+				return qErr
+			}
+			res, execErr := tx.q.ExecContext(ctx, tx.q.Rebind(query), args...)
+			if execErr != nil {
+				return execErr
+			}
+			n, _ := res.RowsAffected()
+			deleted += n
+		}
+		return nil
+	})
+	if err != nil {
+		return deleted, fmt.Errorf("store: 删除重复排队任务失败: %w", err)
+	}
+	return deleted, nil
 }
 
 // ResetJobToPending 把失败的任务退回待执行，用于重试（保留 attempt 计数）。

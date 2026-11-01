@@ -1307,7 +1307,6 @@
   "agent.mount.dialog.dirRequired": "ディレクトリモードでは対象ディレクトリの入力が必須です",
 
   "agent.session.pushFailed": "ログインセッションをローカルサービスに同期できませんでした。マウント機能が制限される可能性があります",
-  "agent.autoMount.progress": "自動マウント中（{pending}/{total}）",
   "agent.autoMount.done": "自動マウントが完了しました",
 
   "agent.event.mounted": "「{name}」をマウントしました",

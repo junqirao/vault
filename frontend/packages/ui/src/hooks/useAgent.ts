@@ -749,23 +749,44 @@ function start(): void {
 }
 
 /**
+ * 同一条事件提示的最短重复间隔（毫秒）。
+ *
+ * 自动恢复在会话重建时会再跑一轮；即便挂载本身是幂等的，也可能短时间内再次推送
+ * "已挂载/已卸载"。同一句话每 10 秒最多弹一次，避免一屏全是同一提示。
+ */
+const EVENT_NOTIFY_DEDUPE_MS = 10 * 1000
+
+/**
  * 注册代理事件的**全局通知出口**（整个应用只调用一次，放应用外壳里）。
  *
  * 为什么不放进 useAgent()：通知是全局唯一的，而 useAgent 会被多个组件调用——
  * 每个组件注册一个出口，同一条事件就会弹出 N 条重复提示（真实反馈）。
+ *
+ * 位置固定**右下角**：挂载/卸载是后台事件，顶部居中会挡住内容、成串弹出时尤其烦人
+ * （真实反馈："一下弹出来一大堆"）。同一文案去重，避免同一块盘反复挂/卸时刷屏。
  */
 export function useAgentEventNotifier(): void {
-  const { message } = App.useApp()
+  const { notification } = App.useApp()
 
   useEffect(() => {
+    const recent = new Map<string, number>()
     const notifier = (text: string): void => {
-      message.info(text)
+      const now = Date.now()
+      if (now - (recent.get(text) ?? 0) < EVENT_NOTIFY_DEDUPE_MS) return
+      recent.set(text, now)
+      // 表不需要无限增长：顺手清掉已经过了去重窗口的条目。
+      if (recent.size > 64) {
+        for (const [key, at] of recent) {
+          if (now - at >= EVENT_NOTIFY_DEDUPE_MS) recent.delete(key)
+        }
+      }
+      notification.info({ message: text, key: text, placement: 'bottomRight', duration: 4 })
     }
     notifiers.add(notifier)
     return () => {
       notifiers.delete(notifier)
     }
-  }, [message])
+  }, [notification])
 }
 
 /**

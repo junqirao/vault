@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"vault/internal/apperr"
 	"vault/internal/platform/winps"
@@ -65,32 +66,59 @@ func (m *Manager) FindIscsiDisk(ctx context.Context, sizeBytes int64, usedDiskNu
 	return result.Number, nil
 }
 
+// 分配盘符的重试参数。
+//
+// `Add-PartitionAccessPath -AssignDriveLetter` 由 Windows 自己挑一个空闲盘符：并发挂载时
+// 两次调用可能在同一瞬间挑中同一个，后写入的一方失败（"指定的访问路径已在用"）。代理侧已用
+// mountLetterMu 串行化；这里再兜一层**进程外**占用（资源管理器/其它程序恰好占了刚挑中的
+// 盘符）—— 重试时系统会重新挑一个，几百毫秒足够让上一次落定。
+const (
+	mountDriveAttempts   = 3
+	mountDriveRetryDelay = 250 * time.Millisecond
+)
+
 // MountToDriveLetter 为磁盘分配盘符，返回盘符（如 "E:"）。
 //
-// 若磁盘已有盘符则直接复用（幂等）。
+// 若磁盘已有盘符则直接复用（幂等）。分配失败时最多尝试 3 次（见上面的常量说明）。
 func (m *Manager) MountToDriveLetter(ctx context.Context, diskNumber int) (string, error) {
 	if diskNumber < 0 {
 		return "", apperr.InvalidParam("disk_number")
 	}
 	params := []winps.Param{winps.String("DiskNumber", strconv.Itoa(diskNumber))}
-	var result struct {
-		DriveLetter string `json:"drive_letter"`
-		Action      string `json:"action"`
-	}
-	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeMountDrive, params, &result); err != nil {
-		if mapped := mappedReasonError(err, map[string]*apperr.Error{
+	var lastErr error
+	for attempt := 1; attempt <= mountDriveAttempts; attempt++ {
+		var result struct {
+			DriveLetter string `json:"drive_letter"`
+			Action      string `json:"action"`
+		}
+		runErr := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeMountDrive, params, &result)
+		if runErr == nil {
+			if letter := strings.TrimSpace(result.DriveLetter); letter != "" {
+				m.logger.Info("已分配盘符",
+					"disk_number", diskNumber, "drive_letter", letter, "action", result.Action)
+				return letter, nil
+			}
+			// 脚本声称成功但没给出盘符：按失败重试（系统可能刚好把盘符又收回去了）。
+			runErr = apperr.New(CodeMountFailed, http.StatusInternalServerError).
+				WithArg("disk_number", diskNumber)
+		}
+		if mapped := mappedReasonError(runErr, map[string]*apperr.Error{
 			"no_partition": ErrNoPartition(),
 		}); mapped != nil {
 			return "", mapped
 		}
-		return "", err
+		lastErr = runErr
+		if attempt < mountDriveAttempts {
+			m.logger.Warn("分配盘符失败，稍后重试（常见原因：并发分配或外部程序刚占用了同一盘符）",
+				"disk_number", diskNumber, "attempt", attempt, "error", runErr)
+			select {
+			case <-ctx.Done():
+				return "", runErr
+			case <-time.After(mountDriveRetryDelay):
+			}
+		}
 	}
-	if strings.TrimSpace(result.DriveLetter) == "" {
-		return "", apperr.New(CodeMountFailed, http.StatusInternalServerError).
-			WithArg("disk_number", diskNumber)
-	}
-	m.logger.Info("已分配盘符", "disk_number", diskNumber, "drive_letter", result.DriveLetter, "action", result.Action)
-	return result.DriveLetter, nil
+	return "", lastErr
 }
 
 // SetLabel 设置磁盘所在卷的卷标（如把"存储库名称"写到盘符上）。

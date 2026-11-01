@@ -34,6 +34,40 @@ func (s *RepoService) MarkPrepareFailedByJob(ctx context.Context, payload string
 	return s.MarkRepoPrepareFailed(ctx, p.RepoID, cause)
 }
 
+// MarkPrepareFailedByDisk 是"非预创建共享库"的失败回滚入口：母盘建盘任务彻底失败时，
+// 把库从 creating 回滚为 error。
+//
+// 非预创建共享库也要先等母盘建好才可用（见 RepoService.Create），但它的任务类型是
+// JobCreateVHDX（ref_id = 母盘 ID），不是 JobPrepareRepo。只把母盘置 error 的话，
+// 库会永远停在 creating —— 前端一直"创建中"，既分配不了也挂载不了。
+//
+// 只处理：母盘 + 库仍在 creating + 进度快照停在 parent 阶段（预创建任务的母盘阶段也
+// 可能经过这里，但它的任务类型是 JobPrepareRepo，由 MarkPrepareFailedByJob 负责）。
+func (s *RepoService) MarkPrepareFailedByDisk(ctx context.Context, diskID string, cause error) error {
+	disk, err := s.Store.GetDisk(ctx, diskID)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if disk.Kind != domain.DiskKindParent {
+		return nil
+	}
+	repo, err := s.Store.GetRepository(ctx, disk.RepoID)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if repo.State != domain.RepoStateCreating || repo.Meta.Prepare == nil ||
+		repo.Meta.Prepare.Phase != domain.RepoPhaseParent {
+		return nil
+	}
+	return s.MarkRepoPrepareFailed(ctx, repo.ID, cause)
+}
+
 // runPrepareRepo 是 JobPrepareRepo 的实现：
 // 母盘 → 共享数量个池位盘 → 同数量的 iSCSI 目标。
 //

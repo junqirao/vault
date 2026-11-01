@@ -29,14 +29,11 @@ import { AppLayout } from '../layouts/AppLayout'
 // 客户端版本由宿主注入（真源是 apps/client/package.json，构建期 define 进 CLIENT_VERSION）。
 import { CLIENT_VERSION } from '../config'
 import { useAppStore } from '../store/appStore'
-import type { AutoMountProgress } from '../flow/useStartupFlow'
 
 export interface AppRoutesProps {
   language: Language
   onLanguageChange: (language: Language) => void
   onManageServers: () => void
-  /** 自动挂载进度（由本地代理执行，前端只展示）。 */
-  autoMount: AutoMountProgress | null
 }
 
 /** 阻止非超级管理员访问管理模块（整棵 /admin/* 子树统一包裹）。 */
@@ -120,7 +117,7 @@ function NotFoundRoute(): JSX.Element {
 }
 
 /** 路由表：应用端与管理端各自独立的外壳与菜单，互不混用。 */
-export function AppRoutes({ language, onLanguageChange, onManageServers, autoMount }: AppRoutesProps): JSX.Element {
+export function AppRoutes({ language, onLanguageChange, onManageServers }: AppRoutesProps): JSX.Element {
   const navigate = useNavigate()
   const { isSuperAdmin } = useAuth()
 
@@ -134,7 +131,6 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
             language={language}
             onLanguageChange={onLanguageChange}
             onManageServers={onManageServers}
-            autoMount={autoMount}
           />
         }
       >
@@ -193,7 +189,6 @@ export function AppRoutes({ language, onLanguageChange, onManageServers, autoMou
               language={language}
               onLanguageChange={onLanguageChange}
               onManageServers={onManageServers}
-              autoMount={autoMount}
             />
           </RequireSuperAdmin>
         }

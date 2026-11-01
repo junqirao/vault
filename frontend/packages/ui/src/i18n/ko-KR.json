@@ -1307,7 +1307,6 @@
   "agent.mount.dialog.dirRequired": "디렉터리 모드에서는 대상 디렉터리를 입력해야 합니다",
 
   "agent.session.pushFailed": "로그인 세션을 로컬 서비스에 동기화하지 못했습니다. 마운트 기능이 제한될 수 있습니다",
-  "agent.autoMount.progress": "자동 마운트 중입니다({pending}/{total})",
   "agent.autoMount.done": "자동 마운트가 완료되었습니다",
 
   "agent.event.mounted": "「{name}」을(를) 마운트했습니다",

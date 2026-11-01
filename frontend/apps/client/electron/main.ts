@@ -50,6 +50,21 @@ let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let quitting = false
 /**
+ * 是否已进入"正常退出"流程（见 quitGracefully）。
+ *
+ * 比 quitting 更早置位：从用户点退出/关闭的那一刻起，窗口就不该再被托盘点击、
+ * 第二个实例或 activate 事件叫回来。
+ */
+let quittingStarted = false
+/**
+ * 退出时最多等代理卸载挂载多久（毫秒）。
+ *
+ * 窗口在退出流程的第一步就隐藏了，这个等待不拖慢用户感知的关闭速度；给够时间只是
+ * 为了让"退出时清理挂载"真正跑完（代理卸载是逐条 PowerShell，多库时会花几秒）。
+ * 超时也照常退出，代理在后台继续收尾（见 AgentManager.shutdownAndWait）。
+ */
+const QUIT_UNMOUNT_WAIT_MS = 8000
+/**
  * "启动即隐藏"的环境变量。
  *
  * 只在**本体更新**这条路上用：切换器（Vault-Updator.exe / 代理侧切换器）拉起新版本时
@@ -479,10 +494,13 @@ function registerIpc(): void {
     const parsed = parseAgentRequest(options)
     if (!parsed) return { status: 0, error: 'network', message: 'invalid_request' }
     const isUpdateApply = parsed.path.startsWith('/agent/update/apply')
-    if (isUpdateApply) updateAppliedAt = Date.now()
     const result = await agent.request(parsed)
     // 没受理成功就不算更新（例如没有可用产物）：别让下一次无关的代理重启误触发刷新。
-    if (isUpdateApply && (result.status < 200 || result.status >= 300)) updateAppliedAt = 0
+    if (isUpdateApply && (result.status < 200 || result.status >= 300)) {
+      updateAppliedAt = 0
+    } else if (isUpdateApply) {
+      updateAppliedAt = Date.now()
+    }
     // 开机自启开关存在代理配置里，系统自启项由主进程维护：配置一写入就立刻对齐，
     // 用户拨完开关不必等下次启动才生效。
     if (parsed.method === 'PATCH' && parsed.path === '/agent/config' && result.status === 200) {
@@ -572,9 +590,7 @@ function registerIpc(): void {
     return true
   })
   ipcMain.handle('vault:quit', async () => {
-    await agent.shutdown()
-    quitting = true
-    app.quit()
+    await quitGracefully()
   })
   // 立即重启客户端，让已激活的渲染层热更资源生效（见 resolveWebappEntry）。
   ipcMain.handle('vault:relaunch', async () => {
@@ -641,6 +657,44 @@ function broadcastAgentInfo(): void {
   }
 }
 
+/**
+ * 正常退出的唯一入口：窗口立刻消失 → 请代理卸载全部挂载 → 退出应用。
+ *
+ * 为什么不能直接 app.quit()：will-quit 会把代理子进程 stop() 掉，而代理的卸载是在
+ * `/agent/shutdown` 返回之后才在后台进行的（见 cmd/vault-agent/main.go）——不等它，
+ * "退出时清理挂载"就被砍在半路（大多数情况下连第一块盘都清不完）。
+ *
+ * 关闭速度：窗口在第一步就隐藏，用户感知的"关掉了"只取决于这一步；卸载在后台跑，
+ * 最多等 QUIT_UNMOUNT_WAIT_MS，等不到就照常退出，由代理自己把剩下的收尾做完。
+ */
+async function quitGracefully(): Promise<void> {
+  if (quittingStarted) return
+  quittingStarted = true
+  // 退出期间不再检查本体更新：更新切换器是直接 app.exit 的，会把这里的卸载等待一刀切断。
+  clientUpdateWatch?.stop()
+  clientUpdateWatch = null
+  try {
+    // 先隐藏：用户看不到窗口被拆掉，也就没有"退出得慢"的观感。
+    mainWindow?.hide()
+  } catch {
+    // 窗口可能已销毁：退出流程不能因此中断。
+  }
+  try {
+    // 托盘图标也一并收掉：进程还要在后台停留最多 QUIT_UNMOUNT_WAIT_MS 用于卸载挂载，
+    // 图标留着会让用户以为"点了退出却没退"。
+    tray?.destroy()
+  } catch {
+    // 无托盘环境（见 createTray）：忽略。
+  }
+  tray = null
+  quitting = true
+  try {
+    await agent.shutdownAndWait(QUIT_UNMOUNT_WAIT_MS)
+  } finally {
+    app.quit()
+  }
+}
+
 /** 关闭窗口：仍有活跃挂载时先确认；选择"仅关闭窗口"则最小化到托盘。 */
 async function handleCloseRequest(window: BrowserWindow): Promise<void> {
   const count = await agent.activeMountCount()
@@ -658,9 +712,7 @@ async function handleCloseRequest(window: BrowserWindow): Promise<void> {
     noLink: true
   })
   if (response === 0) {
-    await agent.shutdown()
-    quitting = true
-    app.quit()
+    await quitGracefully()
     return
   }
   if (response === 1) window.hide()
@@ -955,10 +1007,7 @@ function createTray(): void {
         {
           label: '退出',
           click: () => {
-            void agent.shutdown().finally(() => {
-              quitting = true
-              app.quit()
-            })
+            void quitGracefully()
           }
         }
       ])
@@ -976,6 +1025,8 @@ function createTray(): void {
 }
 
 function showWindow(): void {
+  // 已经进入退出流程：窗口正在/已经被收起，托盘点击与第二个实例都不该再把它叫出来。
+  if (quittingStarted) return
   // 用户主动要窗口：此后的重建（关闭 → 托盘 → 再打开）都照常显示。
   startHidden = false
   if (!mainWindow) {
@@ -1216,6 +1267,15 @@ function startPrimaryInstance(): void {
   // 关闭窗口时保留托盘（真正退出走托盘菜单或系统退出）。
   app.on('window-all-closed', () => {
     if (process.platform !== 'darwin' && quitting) app.quit()
+  })
+
+  // 拦截**所有正常退出**（托盘退出 / 关闭对话框 / 系统注销 / 代码里的 app.quit）：
+  // 第一次先拦下来做挂载清理，清理完 quitGracefully 里的 app.quit 再进来时才放行。
+  // app.exit()（本体更新切换器）刻意不经过这里：那条路不卸载挂载，由重启后的自动挂载恢复。
+  app.on('before-quit', (event) => {
+    if (quittingStarted) return
+    event.preventDefault()
+    void quitGracefully()
   })
 
   // 应用退出时停止守护，避免代理成为孤儿进程。

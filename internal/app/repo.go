@@ -246,12 +246,20 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		// 预创建（池化）：填了共享数量就必须先把池建好，再让库进入可用状态。
 		// 否则用户要么分配到"还没建的池位"，要么挂载时又退回等建盘的老路径 ——
 		// 那正是共享数量想消除的东西。
+		//
+		// ⚠️ 不预创建（Preallocate=false）的共享库**也必须**先处于 creating：
+		// 母盘是异步建出来的，而库若立刻 active，用户可以在母盘文件出现之前分配/挂载，
+		// 差异盘派生会当场以"父文件不存在"失败（不是共享冲突，不走退避），三次重试在
+		// 几十毫秒内跑完后盘被永久标成 error —— 现场表现就是"没勾预创建 → 无法挂载"。
+		// 这里只把"等母盘"这一步放进 creating；池位（差异盘 + 目标）仍然由是否勾选决定。
 		state := domain.RepoStateActive
 		meta := domain.RepoMeta{Group: strings.TrimSpace(in.Group)}
-		if preparing {
+		if in.Mode == domain.RepoModeShared {
 			state = domain.RepoStateCreating
-			meta.Pool = true
 			meta.Prepare = &domain.RepoPrepare{Phase: domain.RepoPhaseParent, Total: 1}
+		}
+		if preparing {
+			meta.Pool = true
 		}
 
 		r := &domain.Repository{
@@ -790,7 +798,11 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 				return nil
 			}
 			oldDisk, diskErr := tx.GetDisk(ctx, existing[i].DiskID)
-			if diskErr != nil || oldDisk.ParentVersion != repo.ParentVersion {
+			if diskErr != nil || oldDisk.ParentVersion != repo.ParentVersion ||
+				// 建盘彻底失败（error）的差异盘**不能复用**：父文件可能根本不存在，复用只会让
+				// 每次挂载都报 disk.create_failed，而界面上又没有"删掉这条分配"的入口 ——
+				// 用户从此既挂不上也卸不掉。当作旧盘作废、下面重建一块新的。
+				oldDisk.State == domain.DiskStateError {
 				// 版本对不上（或盘记录已读不到）：作废旧分配，下面重建。
 				staleAllocID = existing[i].ID
 				staleDiskID = existing[i].DiskID
@@ -852,6 +864,22 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 		parent, err := tx.GetDisk(ctx, *repo.ParentDiskID)
 		if err != nil {
 			return err
+		}
+
+		// 母盘必须已经建好才谈得上派生差异盘。
+		//
+		// 非预创建库现在也会先停在 creating 等母盘（见 Create），这里再兜一层：历史数据、
+		// 任务重试、进程重启都可能出现"库已 active 而母盘还在 creating"。抢在母盘文件出现
+		// 之前派生会直接失败并把差异盘永久标成 error（用户从此挂不上也卸不掉）。
+		switch parent.State {
+		case domain.DiskStateReady, domain.DiskStatePublished:
+			// 正常：可以派生。
+		case domain.DiskStateError:
+			return apperr.DiskCreateFailed().WithArg("disk_id", parent.ID)
+		default:
+			return apperr.DiskNotReady().
+				WithArg("disk_id", parent.ID).
+				WithArg("state", string(parent.State))
 		}
 
 		// 池化库的常态路径：取一块**建库时就派生好、并已发布**的空闲池位盘。
@@ -1373,7 +1401,8 @@ type parentTeardownPayload struct {
 // enqueueParentTeardown 把母盘临时目标的**尽力清理**排进任务队列（不阻塞状态迁移）。
 //
 // 先查状态再操作：没有临时目标记录就直接返回（平台上本来就没有可清理的对象，不必入队）。
-// 锁键用目标键：与挂载路径（RequestMount → Publish）串行化，避免清理与下发在同一目标上并发。
+// 与挂载路径（RequestMount → Publish）的串行化由 runParentTeardown → TeardownTarget 自己
+// 获取的目标锁保证（见下面 LockKey 留空的说明）。
 // 幂等键带随机串：失败后"再点一次"要用新任务（固定键会在 MySQL 上直接返回旧的失败任务）。
 func (s *RepoService) enqueueParentTeardown(ctx context.Context, repo *domain.Repository, action ParentAction, operatorID string) {
 	name := tempTargetName(repo.ID)
@@ -1382,9 +1411,11 @@ func (s *RepoService) enqueueParentTeardown(ctx context.Context, repo *domain.Re
 		return
 	}
 	payload := parentTeardownPayload{RepoID: repo.ID, OperatorID: operatorID}
+	// LockKey 留空：runParentTeardown → TeardownTarget 自己会拿目标锁（同一个 Keyed 实例）。
+	// worker 先持同一把非可重入锁会永久自锁 —— 退出维护的任务会一直"执行中"。
 	j, _, err := s.Jobs.EnqueueWith(ctx, domain.JobParentTeardown, repo.ID,
 		"parent_teardown:"+repo.ID+":"+uuid.NewString(),
-		lock.TargetKey(name), payload)
+		"", payload)
 	if err != nil {
 		// 入队失败不影响"已退出维护"：平台残留由对账的孤儿目标清理接手。
 		s.Log.Warn("入队母盘目标清理任务失败（不影响退出）", "repo_id", repo.ID, "error", err)
@@ -1610,8 +1641,10 @@ func (s *RepoService) publishParentTarget(ctx context.Context, repo *domain.Repo
 		}
 		if enqueue {
 			payload := publishPayload{AllocationID: allocID}
+			// LockKey 留空：Publish 自己会拿目标锁；worker 的 LockKey 是同一把非可重入锁，
+			// 先持锁再让处理函数抢同一把会永久自锁（任务一直"执行中"）。
 			if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPublish, allocID,
-				"publish:"+allocID, lock.TargetKey(name), payload); err != nil {
+				"publish:"+allocID, "", payload); err != nil {
 				return err
 			}
 		}
@@ -1646,7 +1679,8 @@ func (s *RepoService) publishParentTarget(ctx context.Context, repo *domain.Repo
 
 	if enqueue {
 		payload := publishPayload{AllocationID: alloc.ID}
-		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPublish, alloc.ID, "publish:"+alloc.ID, lock.TargetKey(name), payload); err != nil {
+		// 同上面的复用分支：Publish 内部自己拿目标锁，worker 不能再持一次。
+		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobPublish, alloc.ID, "publish:"+alloc.ID, "", payload); err != nil {
 			return err
 		}
 	}

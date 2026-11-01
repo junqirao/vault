@@ -586,6 +586,17 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	})
 
 	// ---- 11) 任务 worker ----
+	//
+	// 启动 worker 之前先清一次"重复排队的目标修复任务"：历史上 worker 被卡住时，对账每
+	// 5 分钟为同一个目标入队一条 repair_target，峰值可达数万条（任务中心全是"排队中"）。
+	// 它们幂等、重复排队没有任何价值 —— 直接删除，只保留每个目标最早的一条。
+	// 进程崩溃遗留的 running 任务此时还没被重置；启动对账会先 ResetRunningJobs，再执行同一条
+	// 清理逻辑（见 App.runReconcile），把它们一起收掉。
+	if n, err := st.DeleteDuplicatePendingJobs(context.Background(), domain.JobRepairTarget); err != nil {
+		log.Warn("清理重复的目标修复任务失败", "error", err)
+	} else if n > 0 {
+		log.Info("已清理重复的目标修复任务", "count", n)
+	}
 	workerCtx, cancelWorker := context.WithCancel(context.Background())
 	defer cancelWorker()
 	safeGo(log, "job_worker", func() { jobs.Start(workerCtx) })
@@ -704,6 +715,13 @@ func runServe(configPath *string, migrateOnly *bool) int {
 		}
 		if err := application.Disks().MarkCreateFailed(ctx, j.RefID, cause); err != nil {
 			log.Warn("回滚磁盘状态失败", "job_id", j.ID, "ref_id", j.RefID, "error", err)
+		}
+		// 非预创建共享库：母盘由 JobCreateVHDX 异步建，库在 creating 等它（见 RepoService.Create）。
+		// 任务彻底失败时库也要一起回滚为 error，否则前端永远显示"创建中"、既分配不了也挂载不了。
+		if j.Type == domain.JobCreateVHDX || j.Type == domain.JobCreateVHDXFromDir {
+			if err := application.Repos().MarkPrepareFailedByDisk(ctx, j.RefID, cause); err != nil {
+				log.Warn("回滚存储库状态失败", "job_id", j.ID, "error", err)
+			}
 		}
 		// 建库预创建（JobPrepareRepo）失败时，除了上面把母盘回滚为 error，
 		// 还必须把**存储库**从 creating 回滚为 error：库停在 creating 的表现是

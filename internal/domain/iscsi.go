@@ -106,6 +106,12 @@ type Job struct {
 	// LastError 最近一次失败原因。
 	LastError string `db:"last_error" json:"last_error"`
 	// LockKey 用于资源互斥：同一 LockKey 的任务串行执行。
+	//
+	// ⚠️ 绝不能与 handler **内部自己获取**的锁用同一个 key（lock.Keyed 不可重入）：
+	// worker 先拿到锁，handler 再 Acquire 同一把锁会永久自锁 —— 任务一直停在"执行中"，
+	// 永远不成功（真实反馈："repair_target 这个任务要非常久，然后一直不成功"）。
+	// handler 自己已经按资源加锁的任务（Publish / TeardownTarget / runRepairTarget），
+	// 入队时 LockKey 必须留空。
 	LockKey    string `db:"lock_key" json:"lock_key"`
 	CreatedAt  int64  `db:"created_at" json:"created_at"`
 	StartedAt  int64  `db:"started_at" json:"started_at"`
