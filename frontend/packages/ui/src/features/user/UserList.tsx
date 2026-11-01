@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { App, Button, Input, Space } from 'antd'
+import { App, Button, Input, Space, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -8,14 +8,17 @@ import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
+import { SectionCard } from '../../components/SectionCard'
 import { useApi } from '../../api/provider'
 import type { IssuedCertificateDTO, UserDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
+import { fontSize, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime } from '../../utils/format'
 import { roleLabel } from '../../utils/labels'
 import { IssuedCertificateModal } from './IssuedCertificateModal'
 import { UserCertificates } from './UserCertificates'
 import { UserForm } from './UserForm'
+import { UserLeasesModal } from './UserLeasesModal'
 
 /** 用户管理（管理员）：列表 / 新建 / 编辑 / 删除 / 证书。 */
 export function UserList(): JSX.Element {
@@ -29,6 +32,7 @@ export function UserList(): JSX.Element {
   const [editing, setEditing] = useState<UserDTO | null>(null)
   const [pendingDelete, setPendingDelete] = useState<UserDTO | null>(null)
   const [certUser, setCertUser] = useState<UserDTO | null>(null)
+  const [leaseUser, setLeaseUser] = useState<UserDTO | null>(null)
   const [issuedCert, setIssuedCert] = useState<IssuedCertificateDTO | null>(null)
 
   const usersQuery = useQuery({
@@ -77,7 +81,7 @@ export function UserList(): JSX.Element {
       {
         title: t('common.actions'),
         key: 'actions',
-        width: 400,
+        width: 480,
         render: (_value, user) => (
           <Space size={0} wrap>
             <Button
@@ -93,6 +97,9 @@ export function UserList(): JSX.Element {
             <Button type="link" size="small" onClick={() => setCertUser(user)}>
               {t('user.certificates.title')}
             </Button>
+            <Button type="link" size="small" onClick={() => setLeaseUser(user)}>
+              {t('user.leases.action')}
+            </Button>
             <Button type="link" size="small" danger onClick={() => setPendingDelete(user)}>
               {t('common.delete')}
             </Button>
@@ -106,14 +113,9 @@ export function UserList(): JSX.Element {
   return (
     <PageShell
       title={t('page.users.title')}
+      subtitle={t('page.users.subtitle')}
       extra={
         <>
-          <Input.Search
-            allowClear
-            placeholder={t('user.filter.keyword')}
-            style={{ width: 220 }}
-            onChange={(event) => setKeyword(event.target.value)}
-          />
           <Button onClick={() => void usersQuery.refetch()}>{t('common.refresh')}</Button>
           <Button
             type="primary"
@@ -129,14 +131,35 @@ export function UserList(): JSX.Element {
     >
       {error ? <ErrorNotice error={error} /> : null}
       {usersQuery.error ? <ErrorNotice error={usersQuery.error} /> : null}
-      <DataTable<UserDTO>
-        columns={columns}
-        rows={usersQuery.data?.items ?? []}
-        rowKey={(user) => user.id}
-        loading={usersQuery.isLoading}
-        empty={<EmptyState title={t('user.empty')} />}
-        scroll={{ x: 1100 }}
-      />
+      <SectionCard title={t('common.filters')}>
+        <Space wrap size={spacing.sm}>
+          <Input.Search
+            allowClear
+            value={keyword}
+            placeholder={t('user.filter.keyword')}
+            style={{ width: 260 }}
+            onChange={(event) => setKeyword(event.target.value)}
+          />
+          <Button onClick={() => setKeyword('')}>{t('common.reset')}</Button>
+        </Space>
+      </SectionCard>
+      <SectionCard
+        title={t('user.list.title')}
+        extra={
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+            {t('common.total', { total: usersQuery.data?.items.length ?? 0 })}
+          </Typography.Text>
+        }
+      >
+        <DataTable<UserDTO>
+          columns={columns}
+          rows={usersQuery.data?.items ?? []}
+          rowKey={(user) => user.id}
+          loading={usersQuery.isLoading}
+          empty={<EmptyState title={t('user.empty')} />}
+          scroll={{ x: 1100 }}
+        />
+      </SectionCard>
 
       <UserForm
         open={formOpen}
@@ -155,6 +178,7 @@ export function UserList(): JSX.Element {
       />
 
       <UserCertificates open={certUser !== null} userId={certUser?.id} onClose={() => setCertUser(null)} />
+      <UserLeasesModal user={leaseUser} onClose={() => setLeaseUser(null)} />
       <IssuedCertificateModal
         open={issuedCert !== null}
         certificate={issuedCert}

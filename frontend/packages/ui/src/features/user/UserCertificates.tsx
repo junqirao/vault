@@ -103,7 +103,6 @@ export function UserCertificates({ open, userId, onClose }: UserCertificatesProp
         rowKey={(certificate) => certificate.id}
         loading={certificatesQuery.isLoading}
         empty={<EmptyState title={t('user.cert.empty')} />}
-        pagination={false}
         scroll={{ x: 700 }}
       />
       <ConfirmDialog

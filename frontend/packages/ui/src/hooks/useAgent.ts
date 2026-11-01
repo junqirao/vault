@@ -3,7 +3,6 @@ import { App } from 'antd'
 
 import {
   agentApi,
-  applyWebLayer,
   getAgentVersionInfo,
   isAgentUnavailableError,
   onAgentEndpointChanged,
@@ -604,17 +603,9 @@ function applyEvent(event: AgentEvent): void {
       return
     }
     case 'web_update': {
+      // 只保留状态快照，供排障/旧接口展示；**不再自动切换渲染层**。
+      // 版本更新统一走启动期整包替换，界面不会在运行中被单独换掉。
       setSnapshot({ webUpdate: event.web_update })
-      // 静默热更：代理刚激活新的渲染层资源 → 立刻切换，无需用户手动点"立即重启"。
-      // 主进程按"解析出的入口文件是否等于已加载文件"去重（同文件返回 applied=false），
-      // 因此这里可以放心重复调用，不会造成重载循环。
-      if (event.web_update.state === 'activated') {
-        void applyWebLayer().then((result) => {
-          if (result.applied) {
-            console.info(`[vault] 已自动应用热更渲染层：${result.version ?? ''}`)
-          }
-        })
-      }
       return
     }
     case 'download': {

@@ -254,9 +254,14 @@ func (s *RepoService) Create(ctx context.Context, in CreateRepoInput) (*domain.R
 		// 这里只把"等母盘"这一步放进 creating；池位（差异盘 + 目标）仍然由是否勾选决定。
 		state := domain.RepoStateActive
 		meta := domain.RepoMeta{Group: strings.TrimSpace(in.Group)}
-		if in.Mode == domain.RepoModeShared {
+		// 共享库必须等母盘建好才可用；**从服务端目录导入的独享库也一样** ——
+		// 盘还在拷数据时把它标成 active，客户端会立刻尝试挂载一块尚未建好的盘。
+		// 两者都停在 creating，并由建盘任务收尾转 active（见 DiskService.finishDiskPrepare）。
+		if in.Mode == domain.RepoModeShared || srcDir != "" {
 			state = domain.RepoStateCreating
-			meta.Prepare = &domain.RepoPrepare{Phase: domain.RepoPhaseParent, Total: 1}
+			meta.Prepare = &domain.RepoPrepare{
+				Phase: domain.RepoPhaseParent, Total: 1, BytesTotal: dirBytes,
+			}
 		}
 		if preparing {
 			meta.Pool = true
@@ -1096,7 +1101,8 @@ func (s *RepoService) setRepoPrepare(ctx context.Context, repoID string, p *doma
 		cp := *p
 		repo.Meta.Prepare = &cp
 	}
-	if err := s.Store.UpdateRepository(ctx, repo); err != nil {
+	// 只写 meta：进度每 2 秒更新一次，不能让它把 updated_at 也带着跳（见 SetRepositoryMeta）。
+	if err := s.Store.SetRepositoryMeta(ctx, repoID, repo.Meta); err != nil {
 		s.Log.Warn("写入建库进度失败", "repo_id", repoID, "error", err)
 		return
 	}
@@ -1106,6 +1112,35 @@ func (s *RepoService) setRepoPrepare(ctx context.Context, repoID string, p *doma
 		"state":   string(repo.State),
 		"prepare": repo.Meta.Prepare,
 	})
+}
+
+// setRepoPrepareCopy 把"源目录拷入母盘"的字节进度合并进建库快照。
+//
+// 与 setRepoPrepare 分开是因为这里的字段是**增量**的：阶段与 Done/Total 由建库任务
+// 自己维护，拷贝回调只负责字节、速率与剩余时间。覆盖整个快照会把阶段计数抹掉。
+//
+// 只在库仍处于 creating 且快照停在 parent 阶段时写：拷贝可能跑很久，期间用户可能
+// 删除库、任务被重试到别的阶段，迟到的进度不该再改动任何东西。
+func (s *RepoService) setRepoPrepareCopy(ctx context.Context, repoID string, copied, total, speed, eta int64) {
+	if repoID == "" {
+		return
+	}
+	repo, err := s.Store.GetRepository(ctx, repoID)
+	if err != nil || repo.State != domain.RepoStateCreating {
+		return
+	}
+	p := repo.Meta.Prepare
+	if p == nil {
+		p = &domain.RepoPrepare{Phase: domain.RepoPhaseParent, Total: 1}
+	}
+	if p.Phase != domain.RepoPhaseParent {
+		return
+	}
+	p.BytesDone = copied
+	p.BytesTotal = total
+	p.SpeedBytesPerSec = speed
+	p.EtaSeconds = eta
+	s.setRepoPrepare(ctx, repoID, p)
 }
 
 // FinishRepoPrepare 把预创建完成的存储库置为 active，并清掉进度快照。

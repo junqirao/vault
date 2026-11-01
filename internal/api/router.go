@@ -220,6 +220,8 @@ func (r *Router) routes() {
 		g.Delete("/v1/uploads/{id}", r.handleAbortUpload)
 
 		// 磁盘
+		// 全量列表只给管理端解析任务/审计对象用；普通用户仍走 /v1/repos/{id}/disks。
+		g.With(r.requireSuperAdminMW).Get("/v1/disks", r.handleListAllDisks)
 		g.Get("/v1/disks/{id}", r.handleGetDisk)
 		g.Delete("/v1/disks/{id}", r.handleDeleteDisk)
 		g.Post("/v1/disks/{id}/compact", r.handleCompactDisk)

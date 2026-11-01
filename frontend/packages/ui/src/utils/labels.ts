@@ -48,6 +48,12 @@ export function auditResultLabel(value: string): string {
   return label('audit', value)
 }
 
+/** 审计动作 → 本地化文案（`audit.action.<action>`，未知动作回退原始值）。 */
+export function auditActionLabel(value: string): string {
+  const key = `audit.action.${value}`
+  return hasKey(key) ? t(key) : value
+}
+
 export function roleLabel(value: string): string {
   const key = `role.${value}`
   return hasKey(key) ? t(key) : value

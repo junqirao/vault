@@ -193,6 +193,19 @@ type RepoPrepare struct {
 	Done int `json:"done"`
 	// Total 当前阶段需要完成的总数（如共 5 块差异盘）。
 	Total int `json:"total"`
+	// BytesDone / BytesTotal 当前阶段是"把源目录拷入母盘"时的字节进度。
+	//
+	// 为什么单独存字节：母盘阶段可能是一份 100GB 的目录，只报"0/1"会让进度条
+	// 几小时纹丝不动。字节进度让界面能像本机上传那样显示"已写入 / 总量"、
+	// 速度与预计剩余。非拷贝阶段为 0（界面退回按 Done/Total 展示）。
+	BytesDone  int64 `json:"bytes_done,omitempty"`
+	BytesTotal int64 `json:"bytes_total,omitempty"`
+	// SpeedBytesPerSec / EtaSeconds 拷贝阶段的平滑速率与预计剩余秒数。
+	//
+	// 由服务端按采样窗口计算（见 DiskService.copyMeter）：前端只需展示，避免
+	// 每个客户端各自用事件间隔估算出不同的数字。0 表示尚不可估算。
+	SpeedBytesPerSec int64 `json:"speed_bytes_per_sec,omitempty"`
+	EtaSeconds       int64 `json:"eta_seconds,omitempty"`
 	// Error 预创建失败的**错误码**（如 "disk.create_failed"）；非空表示该库已进入 error，
 	// 需要人工处理后重试。
 	//

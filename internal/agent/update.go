@@ -584,6 +584,18 @@ func (a *Agent) applyUpdate(ctx context.Context, clientVersion string) error {
 		return apperr.New(CodeUpdateNotAvailable, http.StatusConflict).WithArg("reason", reason)
 	}
 
+	// ③.4 版本更新只接受**整包**（kind=client）。
+	//
+	// 代理自更新会把本地服务单独升到比 Vault.exe 更高的版本；发布内容里如果只有 agent
+	// （没有 client），界面/本地服务就会立刻出现版本错位，而客户端本体又永远追不上。
+	// 这类发布不能被"手动点更新"装成一半：直接拒绝，交给启动期更新器等待完整客户端包。
+	if cand.manifest.FindArtifactKind(updatepkg.KindClient) == nil {
+		a.logger.Warn("更新清单不包含客户端本体产物，拒绝单独自更新本地服务",
+			"target", cand.manifest.Version)
+		return apperr.New(CodeUpdateNotAvailable, http.StatusConflict).
+			WithArg("reason", "client_package_required")
+	}
+
 	// ③.5 不要单独把代理升到比运行中客户端本体更高的版本。
 	//
 	// 本次发布若同时带客户端本体产物，本体更新通道会连代理一起替换（程序目录里就带着
@@ -716,13 +728,24 @@ type artifactProgress interface {
 
 // downloadArtifact 下载产物到 partPath，边下边算 sha256，失败按指数退避重试。
 func (a *Agent) downloadArtifact(ctx context.Context, client *serverClient, art *updatepkg.Artifact, partPath string, prog artifactProgress) error {
+	return downloadArtifact(ctx, a.logger, client, art, partPath, prog)
+}
+
+// downloadArtifact 是 downloadArtifact 方法的无状态实现。
+//
+// 独立成包级函数的原因：启动期更新器（Vault-Updator，见 bootstrap.go）不会构造完整
+// Agent，但必须复用**同一套**下载/续传/摘要校验逻辑。两条路径共用一份实现，避免
+// "一边修了、另一边没修"。
+func downloadArtifact(ctx context.Context, logger *slog.Logger, client *serverClient, art *updatepkg.Artifact, partPath string, prog artifactProgress) error {
 	path := "/v1/system/update/artifacts/" + url.PathEscape(art.Filename)
 	var lastErr error
 	for attempt := 1; attempt <= downloadAttempts; attempt++ {
 		if attempt > 1 {
 			delay := time.Duration(1<<(attempt-2)) * time.Second // 1s → 2s
-			a.logger.Warn("下载更新失败，准备重试",
-				"attempt", attempt, "max", downloadAttempts, "delay", delay.String(), "error", lastErr)
+			if logger != nil {
+				logger.Warn("下载更新失败，准备重试",
+					"attempt", attempt, "max", downloadAttempts, "delay", delay.String(), "error", lastErr)
+			}
 			select {
 			case <-ctx.Done():
 				return apperr.New(CodeUpdateFailed, http.StatusInternalServerError).
@@ -730,7 +753,7 @@ func (a *Agent) downloadArtifact(ctx context.Context, client *serverClient, art 
 			case <-time.After(delay):
 			}
 		}
-		if err := a.downloadOnce(ctx, client, path, art, partPath, prog); err != nil {
+		if err := downloadOnce(ctx, logger, client, path, art, partPath, prog); err != nil {
 			lastErr = err
 			continue
 		}
@@ -741,6 +764,11 @@ func (a *Agent) downloadArtifact(ctx context.Context, client *serverClient, art 
 
 // downloadOnce 执行一次（可能带断点续传的）下载并校验摘要。
 func (a *Agent) downloadOnce(ctx context.Context, client *serverClient, path string, art *updatepkg.Artifact, partPath string, prog artifactProgress) error {
+	return downloadOnce(ctx, a.logger, client, path, art, partPath, prog)
+}
+
+// downloadOnce 是 downloadOnce 方法的无状态实现（供 Agent 与启动期更新器共用）。
+func downloadOnce(ctx context.Context, logger *slog.Logger, client *serverClient, path string, art *updatepkg.Artifact, partPath string, prog artifactProgress) error {
 	// 续传：把已落地的前缀重新读入哈希状态（每个字节只哈希一次）。
 	offset, digest, err := resumeState(partPath)
 	if err != nil {
@@ -758,7 +786,9 @@ func (a *Agent) downloadOnce(ctx context.Context, client *serverClient, path str
 	case http.StatusOK:
 		if offset > 0 {
 			// 服务端无视 Range 返回了完整内容：丢弃前缀，从头开始（哈希状态一并重置）。
-			a.logger.Info("服务端不支持断点续传，改为从头下载", "filename", art.Filename)
+			if logger != nil {
+				logger.Info("服务端不支持断点续传，改为从头下载", "filename", art.Filename)
+			}
 			offset, digest = 0, sha256.New()
 		}
 	case http.StatusPartialContent:
@@ -819,7 +849,9 @@ func (a *Agent) downloadOnce(ctx context.Context, client *serverClient, path str
 	if prog != nil {
 		prog.reset(art.Size, total) // 收尾：把进度推到 100%
 	}
-	a.logger.Info("更新产物下载并校验完成", "filename", art.Filename, "size", total, "sha256", got)
+	if logger != nil {
+		logger.Info("更新产物下载并校验完成", "filename", art.Filename, "size", total, "sha256", got)
+	}
 	return nil
 }
 

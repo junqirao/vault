@@ -26,6 +26,7 @@ import {
   type RepoMountController
 } from './RepoMount'
 import { diffUsageAsVolume, RepoUsageTooltip, useRepoDiffUsage } from './RepoUsageTip'
+import { preparePercent, prepareValue } from './repoPrepareView'
 import { isPlaceholderRepoId, repoStateValue, uploadPercent } from './uploadView'
 
 export interface RepoCardProps {
@@ -249,11 +250,19 @@ function RepoUsage({
   // 但是硬是展示的母盘的用量"）：本机挂载着的那个卷是整块盘（母盘的内容也看得见），它的
   // "已用"是 23 GB 这种全盘数据量，跟差异盘自己吃掉的 36 MB 完全是两回事。
   // 所以共享库不看本机实测，只用服务端的 `physical_bytes`（见 useRepoDiffUsage）。
-  // hook 必须在下面的 early return 之前调用；moving / 上传中不查（那一格画的是别的东西）。
+  // hook 必须在下面的 early return 之前调用；moving / 上传中 / 建库中不查（那一格画的是别的东西）。
   const isShared = repo.mode === 'shared'
-  const diff = useRepoDiffUsage(repo, repo.state !== 'moving' && !upload, currentUserId)
+  const diff = useRepoDiffUsage(
+    repo,
+    repo.state !== 'moving' && repo.state !== 'creating' && !upload,
+    currentUserId
+  )
   if (repo.state === 'moving' && repo.move) return <RepoMoveProgress repo={repo} style={style} />
   if (upload) return <RepoProgress upload={upload} style={style} />
+  // 从服务端目录导入 / 预创建池位：**复用「已用」这一格**报进度，不再另起一条进度条。
+  // 与本机上传同一个位置、同一个形状，行高与别的库一致；母盘拷贝阶段还能给出
+  // "已写入 / 总量"，不再只显示"0/1"。
+  if (repo.state === 'creating' && repo.prepare) return <RepoPrepareMeter repo={repo} style={style} />
   // 共享库没有差异盘数据时**不**回退本机实测（那会瞬间闪出 23 GB 的错误数字），
   // 保持空值让这一格转圈，等差异盘数据到位。独享库不受影响，仍用本机实测。
   const effectiveUsage = isShared ? diffUsageAsVolume(diff.usage) : usage
@@ -672,13 +681,35 @@ function RepoShortcutButton({
 }
 
 /**
- * 建库进度：把服务端"预创建"的三个阶段摊给用户看（建母盘 → 派生差异盘 → 建 iSCSI 目标）。
+ * 建库进度（**复用「已用」那一格**）：从服务端目录导入、或建库时预创建池位。
  *
- * 建库是个几十秒到几分钟的异步过程，只显示"建库中"三个字，用户无法区分"在建"和"卡住了"。
+ * 与本机上传走同一块 RepoMeter：位置、宽度、条的粗细、百分数画法全部共用 ——
+ * 列表里这一行不会因为"多了一条进度条"而高出一截（真实反馈同 RepoMeter 的说明）。
  *
- * 两种库都会走到这里：
- * - state=creating：别人在界面上新建的库（建库任务自己在推进）；
- * - state=importing：本机上传出来的库，收尾时服务端同样在派生池位、下发目标。
+ * 母盘拷贝阶段（prepare 里有 bytes_total）报「已写入 / 总量」，其余阶段报
+ * 「已完成 / 总数」。前者让 100GB 的导入看起来在动，后者说明"池位建到第几个"。
+ * 速度 / 剩余时间不上卡片：它们每两秒变一次，完整进度在详情页横幅里。
+ */
+function RepoPrepareMeter({ repo, style }: { repo: RepoDTO; style?: CSSProperties }): JSX.Element | null {
+  const { t } = useI18n()
+  const prepare = repo.prepare
+  if (!prepare) return null
+  return (
+    <RepoMeter
+      label={t(`repo.prepare.${prepare.phase}`)}
+      value={prepareValue(prepare)}
+      percent={preparePercent(prepare)}
+      color={palette.accent}
+      style={style}
+    />
+  )
+}
+
+/**
+ * 上传收尾（state=importing）的建库进度：字节早已 100%，这一条说明"池位建到第几个"。
+ *
+ * 只处理 importing：从服务端目录导入 / 普通建库（state=creating）已经改由「已用」
+ * 那一格报进度（见 RepoPrepareMeter），不再另起一条。
  *
  * **上传的字节阶段不走这里**：那一刻卡片上要的是上传进度，它报在「已用」那一格里
  * （见 RepoUsage 的 upload 分支 / RepoProgress）。一行里只留一条进度，不叠两条。
@@ -687,7 +718,7 @@ function RepoPrepareProgress({ repo }: { repo: RepoDTO }): JSX.Element | null {
   const { t } = useI18n()
   const prepare = repo.prepare
   if (!prepare) return null
-  if (repo.state !== 'creating' && repo.state !== 'importing') return null
+  if (repo.state !== 'importing') return null
   const percent = prepare.total > 0 ? Math.min(100, Math.round((prepare.done / prepare.total) * 100)) : 0
 
   return (

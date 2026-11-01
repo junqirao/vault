@@ -76,6 +76,18 @@ export interface RepoPrepareDTO {
   done: number
   /** 当前阶段需要完成的总数。 */
   total: number
+  /**
+   * 母盘拷入阶段的字节进度（从服务端目录导入时才有意义）。
+   *
+   * 只报 `done/total` 的话，一份 100GB 的目录会让进度条几小时不动；字节进度
+   * 让卡片能复用「已用」那一格显示"已写入 / 总量"，详情页还能给出速度与剩余时间。
+   */
+  bytes_done?: number
+  bytes_total?: number
+  /** 服务端平滑后的拷贝速率（字节/秒）；0/缺失 = 尚不可估算。 */
+  speed_bytes_per_sec?: number
+  /** 预计剩余秒数；0/缺失 = 不可估算或已拷完（界面显示 "--"）。 */
+  eta_seconds?: number
   /** 失败时是**错误码**（如 disk.create_failed），非空表示该库已进入 error。 */
   error?: string
 }

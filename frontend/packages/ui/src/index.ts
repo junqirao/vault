@@ -138,6 +138,7 @@ export {
 export { RepoDetail, type RepoDetailProps } from './features/repo/RepoDetail'
 export { UploadTaskPage, type UploadTaskPageProps } from './features/repo/UploadTaskPage'
 export { LogViewer } from './features/logs/LogViewer'
+export { ServerLogsPage } from './features/logs/ServerLogsPage'
 export { UserList } from './features/user/UserList'
 export { UserForm, type UserFormProps } from './features/user/UserForm'
 export {

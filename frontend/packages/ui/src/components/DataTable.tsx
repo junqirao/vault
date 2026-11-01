@@ -41,7 +41,14 @@ export function DataTable<T extends object>({
       expandable={expandable}
       pagination={
         pagination === undefined
-          ? { pageSize: 20, hideOnSinglePage: true, showSizeChanger: false }
+          ? {
+              // 列表默认每页 10 条，并允许用户切换每页条数（10/20/50/100）。
+              // 不隐藏单页分页器：条数选择入口必须在任何数据量下都存在。
+              pageSize: 10,
+              pageSizeOptions: [10, 20, 50, 100],
+              showSizeChanger: true,
+              hideOnSinglePage: false
+            }
           : pagination
       }
       locale={{ emptyText: empty }}

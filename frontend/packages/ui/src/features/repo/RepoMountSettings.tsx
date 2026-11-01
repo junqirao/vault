@@ -706,12 +706,24 @@ export function RepoMountSettingsModal({ repo, open, onClose }: RepoMountSetting
  * 弹窗是"不改库、只改本机怎么挂"的快捷入口，详情页 tab 是同一件事的完整页，
  * 两者不引入第二套语义。
  */
-export function RepoMountSettingsPanel({ repo }: { repo: RepoDTO }): JSX.Element {
+export function RepoMountSettingsPanel({
+  repo,
+  description
+}: {
+  repo: RepoDTO
+  /** 设置页顶部的模块说明（与弹窗入口不同：详情页用文字交代这一块管什么）。 */
+  description?: string
+}): JSX.Element {
   const { t } = useI18n()
   const state = useRepoMountSettings(repo.id, repo.name, repo.group)
 
   return (
     <SectionCard title={t('repo.settings.title')}>
+      {description ? (
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          {description}
+        </Typography.Paragraph>
+      ) : null}
       <RepoMountFields state={state} />
       <Button
         type="primary"

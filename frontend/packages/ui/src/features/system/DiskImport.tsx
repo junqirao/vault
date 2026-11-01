@@ -449,7 +449,7 @@ export function DiskImport({ onBack }: DiskImportProps): JSX.Element {
         loading={scanQuery.isLoading}
         size="small"
         scroll={{ x: 1400 }}
-        pagination={{ pageSize: 20, hideOnSinglePage: true, showSizeChanger: false }}
+        pagination={{ pageSize: 10, pageSizeOptions: [10, 20, 50, 100], showSizeChanger: true, hideOnSinglePage: false }}
         locale={{ emptyText: <EmptyState title={t('diskImport.empty')} description={t('diskImport.emptyDesc')} /> }}
         rowSelection={{
           selectedRowKeys: selected,

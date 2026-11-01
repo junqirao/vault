@@ -146,11 +146,11 @@ function expectedAgentVersion(): string {
 }
 
 /** 运行一段 PowerShell 并返回 stdout（隐藏窗口，避免黑框）。 */
-export async function runPowerShell(script: string): Promise<string> {
+export async function runPowerShell(script: string, timeoutMs = 5000): Promise<string> {
   const { stdout } = await execFileAsync(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
-    { windowsHide: true, timeout: 5000, maxBuffer: 1 << 20 }
+    { windowsHide: true, timeout: timeoutMs, maxBuffer: 1 << 20 }
   )
   return stdout
 }

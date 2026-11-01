@@ -133,6 +133,34 @@ function localizeLogMessage(entry: LogEntry, t: (key: string, args?: Record<stri
   return t(key, logMessageParams(entry))
 }
 
+/**
+ * 取出日志里的 cause 字段。
+ *
+ * apperr 以 slog group 形式记录 `error: { code, cause }`，JSON 落盘后 cause 在 `json.error.cause`；
+ * 也兼容直接写在顶层的 `cause`（少数非 apperr 调用点）。
+ */
+function causeOf(entry: LogEntry): string | null {
+  const json = entry.json
+  if (!json) return null
+  const nested = json.error
+  if (typeof nested === 'object' && nested !== null && !Array.isArray(nested)) {
+    const cause = (nested as Record<string, unknown>).cause
+    if (typeof cause === 'string' && cause.trim() !== '') return cause.trim()
+  }
+  const direct = json.cause
+  if (typeof direct === 'string' && direct.trim() !== '') return direct.trim()
+  return null
+}
+
+/**
+ * 本地化 cause：它通常是 apperr 的稳定错误码（Error() 返回 Code），可按 `err.<code>` 翻译；
+ * 任意的底层英文报错没有对应词条，原样展示 —— 绝不能把裸 key 或"err.xxx"显示出来。
+ */
+function localizeLogCause(cause: string, t: (key: string, args?: Record<string, unknown>) => string): string {
+  const key = `err.${cause}`
+  return hasKey(key) ? t(key) : cause
+}
+
 /** 字段值 → 单行摘要（字符串原样，对象/数组用紧凑 JSON）。 */
 function summarize(value: unknown): string {
   if (typeof value === 'string') return value
@@ -170,6 +198,11 @@ export interface LogViewerProps {
    * 代理日志只会显示自己这台客户端的记录，与服务端发生了什么毫无关系。
    */
   source?: LogSourceKind
+  /**
+   * 嵌入在别的页面（如合并后的「服务日志」Tabs）里时只渲染模块卡片，
+   * 不再套一层 PageShell：否则会出现两个页面标题与双重留白。
+   */
+  embedded?: boolean
 }
 
 /**
@@ -184,7 +217,7 @@ export interface LogViewerProps {
  * - 解析成表格（时间 / 级别 / 消息 / 字段），字段多时可以展开看完整 JSON；
  * - 支持时间范围、级别、关键字过滤与分页，避免日志一多就没法看。
  */
-export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
+export function LogViewer({ source = 'agent', embedded = false }: LogViewerProps): JSX.Element {
   const api = useApi()
   const { t, language } = useI18n()
   const fromServer = source === 'server'
@@ -224,7 +257,20 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
   const entries = useMemo(() => parseEntries(data?.text ?? ''), [data?.text])
   // 语言切换要立刻重译（t 依赖模块级当前语言，不把 language 放进依赖不会重算）。
   const displayEntries = useMemo(
-    () => entries.map((entry) => ({ ...entry, display: localizeLogMessage(entry, t) })),
+    () =>
+      entries.map((entry) => {
+        const message = localizeLogMessage(entry, t)
+        const cause = causeOf(entry)
+        const localizedCause = cause ? localizeLogCause(cause, t) : ''
+        // 有 cause 时消息展示成「本地化消息: 本地化 cause」；cause 与消息重复时不重复拼接。
+        const display =
+          localizedCause !== '' && localizedCause !== message
+            ? message
+              ? `${message}: ${localizedCause}`
+              : localizedCause
+            : message
+        return { ...entry, display }
+      }),
     [entries, language, t]
   )
 
@@ -313,16 +359,16 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
     setRange(null)
   }, [])
 
-  return (
-    <PageShell
-      title={fromServer ? t('page.serverLogs.title') : t('page.logs.title')}
-      extra={
-        <Button icon={<ReloadOutlined />} loading={logQuery.isFetching} onClick={() => void logQuery.refetch()}>
-          {t('common.refresh')}
-        </Button>
-      }
-    >
-      <SectionCard title={t('log.filter.title')}>
+  const content = (
+    <>
+      <SectionCard
+        title={t('log.filter.title')}
+        extra={
+          <Button icon={<ReloadOutlined />} loading={logQuery.isFetching} onClick={() => void logQuery.refetch()}>
+            {t('common.refresh')}
+          </Button>
+        }
+      >
         <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
           <Space wrap size={spacing.sm}>
             <Select
@@ -385,7 +431,6 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
             {t('log.entries.count', { shown: filtered.length, total: entries.length })}
           </Typography.Text>
         }
-        flush
       >
         {logQuery.error ? (
           <div style={{ padding: spacing.md }}>
@@ -453,6 +498,12 @@ export function LogViewer({ source = 'agent' }: LogViewerProps): JSX.Element {
           }}
         />
       </SectionCard>
-    </PageShell>
+    </>
+  )
+
+  if (embedded) return content
+
+  return (
+    <PageShell title={fromServer ? t('page.serverLogs.title') : t('page.logs.title')}>{content}</PageShell>
   )
 }

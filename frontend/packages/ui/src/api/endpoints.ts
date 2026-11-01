@@ -542,6 +542,11 @@ export class VaultApi extends ApiClient {
     return this.request<DiskDTO>('GET', `/v1/disks/${encodeURIComponent(id)}`)
   }
 
+  /** 全部磁盘（仅超管）：任务中心 / 审计日志解析对象名称用，避免逐条查询已删除磁盘。 */
+  listDisks(): Promise<ListResponse<DiskDTO>> {
+    return this.request<ListResponse<DiskDTO>>('GET', '/v1/disks')
+  }
+
   deleteDisk(id: string): Promise<JobDTO> {
     return this.request<JobDTO>('DELETE', `/v1/disks/${encodeURIComponent(id)}`)
   }

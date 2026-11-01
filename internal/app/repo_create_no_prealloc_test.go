@@ -134,9 +134,9 @@ func TestCreateSharedRepoWithoutPreallocateWaitsForParent(t *testing.T) {
 		t.Fatal("应入队一条 JobCreateVHDX 建母盘任务")
 	}
 
-	// 母盘建好 → 库收敛为 active（JobCreateVHDX 的收尾，见 DiskService.finishParentOnlyPrepare）。
+	// 母盘建好 → 库收敛为 active（JobCreateVHDX 的收尾，见 DiskService.finishDiskPrepare）。
 	diskSvc := &DiskService{Deps: svc.Deps, Repos: svc}
-	diskSvc.finishParentOnlyPrepare(ctx, disk)
+	diskSvc.finishDiskPrepare(ctx, disk)
 	got, err := st.GetRepository(ctx, repo.ID)
 	if err != nil {
 		t.Fatalf("回查存储库失败：%v", err)

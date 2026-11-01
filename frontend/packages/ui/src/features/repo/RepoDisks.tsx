@@ -102,6 +102,10 @@ export function RepoDisks({
     queryFn: () => api.listRepoDisks(repoId)
   })
 
+  const disks = disksQuery.data?.items ?? []
+  // 母盘是存储库的根：只剩下这一块母盘时不允许删（删掉库就没有数据了）。
+  const parentDiskCount = disks.filter((disk) => disk.kind === 'parent').length
+
   const allocationsQuery = useQuery({
     queryKey: ['repo-allocations', repoId],
     queryFn: () => api.listAllocations(repoId)
@@ -407,9 +411,12 @@ export function RepoDisks({
                 >
                   {t('action.compact')}
                 </Button>
-                <Button type="link" size="small" danger onClick={() => setPendingDelete(disk)}>
-                  {t('common.delete')}
-                </Button>
+                {/* 库里只剩下这一块母盘时不提供删除入口：删掉就等于清空整个存储库。 */}
+                {disk.kind === 'parent' && parentDiskCount <= 1 ? null : (
+                  <Button type="link" size="small" danger onClick={() => setPendingDelete(disk)}>
+                    {t('common.delete')}
+                  </Button>
+                )}
               </>
             ) : null}
           </Space>
@@ -460,7 +467,6 @@ export function RepoDisks({
         rowKey={(disk) => disk.id}
         loading={disksQuery.isLoading}
         empty={t('common.empty')}
-        pagination={false}
         scroll={{ x: 1500 }}
       />
       <ConfirmDialog

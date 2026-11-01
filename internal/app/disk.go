@@ -171,6 +171,15 @@ func (s *DiskService) ListByRepo(ctx context.Context, repoID string) ([]domain.D
 	return s.Store.ListDisksByRepo(ctx, repoID)
 }
 
+// ListAll 列出全部磁盘。
+//
+// 管理端任务中心与审计日志需要把 ref_id（磁盘 ID）解析成可读名称/所属存储库；
+// 逐条 GET /v1/disks/{id} 会让已删除磁盘每次 404 并在服务端日志里刷一条 WARN，
+// 因此提供一次性的全量列表（仅超管可访问）。
+func (s *DiskService) ListAll(ctx context.Context) ([]domain.Disk, error) {
+	return s.Store.ListAllDisks(ctx)
+}
+
 // MarkCreateFailed 把"建盘任务彻底失败"回写到磁盘状态（creating → error）。
 //
 // 为什么必须有：建盘（含差异盘派生）是异步任务，中间态是 creating；挂载/发布路径会
@@ -385,37 +394,38 @@ func (s *DiskService) runCreateVHDX(ctx context.Context, j *domain.Job, rep job.
 	if err := s.buildVHDXFromSource(ctx, disk, p.SourceDir, rep); err != nil {
 		return err
 	}
-	s.finishParentOnlyPrepare(ctx, disk)
+	s.finishDiskPrepare(ctx, disk)
 	return nil
 }
 
-// finishParentOnlyPrepare 给"非预创建共享库"的母盘建盘任务收尾：库从 creating 转 active。
+// finishDiskPrepare 给"由 JobCreateVHDX 异步建盘"的库收尾：库从 creating 转 active。
 //
-// 为什么非预创建也要等母盘：库若在母盘文件出现之前就 active，客户端可以在那一刻分配/挂载，
-// 差异盘派生会以"父文件不存在"直接失败（不是共享冲突，不走退避），盘被永久标成 error。
-// 见 RepoService.Create 与 Allocate 的说明。
+// 覆盖两条路径：
+//   - 共享库的母盘（不预创建池位时也走这里，见 RepoService.Create）；
+//   - **从服务端目录导入的独享库**（standalone 盘）：它同样在 creating 等数据拷完，
+//     否则客户端会在盘还没建好时点挂载。
 //
 // 预创建（池位）路径不经过这里：那个任务由 JobPrepareRepo 在"母盘 + 池位 + 目标"全部
 // 就绪后自己 FinishRepoPrepare，提前置 active 会让用户看到"能挂但池位还在建"的假象。
-func (s *DiskService) finishParentOnlyPrepare(ctx context.Context, disk *domain.Disk) {
-	if disk == nil || disk.Kind != domain.DiskKindParent || s.Repos == nil {
+func (s *DiskService) finishDiskPrepare(ctx context.Context, disk *domain.Disk) {
+	if disk == nil || s.Repos == nil {
 		return
 	}
 	repo, err := s.Store.GetRepository(ctx, disk.RepoID)
 	if err != nil || repo.State != domain.RepoStateCreating {
 		return
 	}
-	// 只收尾"停在母盘阶段"的非预创建库：预创建库的母盘阶段进度也长这样，但它的任务
+	// 只收尾"停在母盘阶段"的库：预创建库的母盘阶段进度也长这样，但它的任务
 	// 不是 JobCreateVHDX（见上面），不会走到这里。这里再加一层 phase 判断是为了防未来
 	// 有人把 JobPrepareRepo 的母盘拆成独立任务时误置 active。
 	if repo.Meta.Prepare == nil || repo.Meta.Prepare.Phase != domain.RepoPhaseParent {
 		return
 	}
 	if err := s.Repos.FinishRepoPrepare(ctx, repo.ID); err != nil {
-		s.Log.Warn("母盘建好后更新存储库状态失败", "repo_id", repo.ID, "error", err)
+		s.Log.Warn("建盘完成后更新存储库状态失败", "repo_id", repo.ID, "error", err)
 		return
 	}
-	s.Log.Info("母盘已就绪，存储库转为可用", "repo_id", repo.ID, "disk_id", disk.ID)
+	s.Log.Info("盘已就绪，存储库转为可用", "repo_id", repo.ID, "disk_id", disk.ID)
 }
 
 // buildVHDXFromSource 是建盘核心流水线：创建动态盘 → 挂载 → 格式化 → 拷入目录 →
@@ -456,7 +466,18 @@ func (s *DiskService) buildVHDXFromSource(ctx context.Context, disk *domain.Disk
 		// 拷入这一段是整条流水线里唯一的长活（源目录有多大就要写多大的盘：30G 的库就是
 		// 30G 的读 + 30G 的写），而它此前只上报 15 → 85 两个端点，中间几十分钟进度条纹丝不动，
 		// 用户看到的就是"卡住了"。这里把卷后端采样到的字节进度映射到同一区间，让它走得动。
-		onCopy := copyProgressReporter(rep, 15, 85)
+		//
+		// 同时把同一份字节进度写进库的 prepare 快照（setRepoPrepareCopy）：任务进度只是
+		// 一个 0-100 的数字，卡片/详情页要的是"已写入 12GB / 100GB、85MB/s、还剩 3 小时"。
+		jobCopy := copyProgressReporter(rep, 15, 85)
+		meter := &copyMeter{}
+		onCopy := func(copied, total int64) {
+			jobCopy(copied, total)
+			if s.Repos != nil {
+				speed, eta := meter.update(copied, total)
+				s.Repos.setRepoPrepareCopy(ctx, disk.RepoID, copied, total, speed, eta)
+			}
+		}
 		if _, _, err := s.Vol.MountAndCopy(ctx, disk.VHDXPath, sourceDir, fs, "VAULT", onCopy); err != nil {
 			return err
 		}
@@ -522,6 +543,59 @@ func copyProgressReporter(rep job.Reporter, from, to int) platform.CopyProgressF
 		last = pct
 		rep.Progress(pct)
 	}
+}
+
+// copyMeter 用采样窗口估算"拷入母盘"的平滑速率与剩余时间。
+//
+// 为什么不在前端算：进度事件是服务端推的，事件间隔并不均匀（只在字节真的前进时才发），
+// 每个客户端按自己的到达时间估算会得到不同的速度。服务端按真实采样点算一次，所有客户端
+// 看到同一个数字。
+//
+// 平滑方式与本机上传一致（见 internal/agent/upload.go 的 sample）：新样本权重 0.4，
+// 既跟得上带宽变化，又不被单次抖动带偏。单次窗口不足 1 秒时不更新，避免瞬时值乱跳。
+type copyMeter struct {
+	at    time.Time
+	bytes int64
+	speed float64
+}
+
+func (m *copyMeter) update(copied, total int64) (speed, eta int64) {
+	now := time.Now()
+	if m.at.IsZero() {
+		m.at, m.bytes = now, copied
+		return 0, 0
+	}
+	dt := now.Sub(m.at).Seconds()
+	if dt < 1 {
+		return int64(m.speed), copyEtaSeconds(total, copied, m.speed)
+	}
+	delta := copied - m.bytes
+	m.at, m.bytes = now, copied
+	if delta > 0 {
+		inst := float64(delta) / dt
+		if m.speed <= 0 {
+			m.speed = inst
+		} else {
+			m.speed = m.speed*0.6 + inst*0.4
+		}
+	}
+	// 窗口内没有新增时保持上一次速率：拷贝可能短暂停顿（校验、目录切换），
+	// 速度瞬间归零会让 ETA 闪成"--"，比数字偏大更让人不安。
+	return int64(m.speed), copyEtaSeconds(total, copied, m.speed)
+}
+
+// copyEtaSeconds 用平滑速率估计剩余秒数；速度未知、已拷完或结果离谱时返回 0
+// （界面显示 "--"，不编一个不可信的数字）。
+func copyEtaSeconds(total, copied int64, speed float64) int64 {
+	if total <= 0 || copied >= total || speed <= 0 {
+		return 0
+	}
+	eta := int64(float64(total-copied) / speed)
+	const maxEtaSeconds = 30 * 24 * 3600
+	if eta > maxEtaSeconds {
+		return 0
+	}
+	return eta
 }
 
 // isDiskBuilt 判断磁盘是否已经建好（published 蕴含"已建好"，是 ready 的超集）。

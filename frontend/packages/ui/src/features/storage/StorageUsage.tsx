@@ -1,4 +1,4 @@
-import { ArrowLeftOutlined, ArrowRightOutlined } from '@ant-design/icons'
+import { ArrowLeftOutlined, RightOutlined } from '@ant-design/icons'
 import { Button, Card, Progress, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
 import { useQuery } from '@tanstack/react-query'
 
@@ -157,7 +157,7 @@ export function StorageUsageCard({
             type="text"
             size="small"
             aria-label={t('storage.usage.detail')}
-            icon={<ArrowRightOutlined />}
+            icon={<RightOutlined />}
             iconPosition="end"
             onClick={onOpen}
             style={{ paddingInline: 0, height: 'auto', fontWeight: 600 }}

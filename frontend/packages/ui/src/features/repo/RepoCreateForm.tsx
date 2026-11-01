@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Button, Checkbox, Col, Form, Input, InputNumber, Progress, Row, Segmented, Select, Space, Typography } from 'antd'
+import { Button, Checkbox, Col, Form, Input, InputNumber, Progress, Row, Segmented, Select, Space, Spin, Typography } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ErrorNotice } from '../../components/ErrorNotice'
@@ -17,6 +17,7 @@ import { useI18n } from '../../i18n'
 import { CAPACITY_UNIT, capacityNormalize, capacityValueProps } from '../../utils/format'
 import { spacing } from '../../tokens/palette'
 import { RepoGroupSelect } from './RepoGroupSelect'
+import { RepoPrepareDetail, useRepoPrepare } from './repoPrepareView'
 import { SourceDirPicker, type SourceDirValue } from './SourceDirPicker'
 import {
   UploadBuildStage,
@@ -71,6 +72,11 @@ export function RepoCreateForm({
   const [error, setError] = useState<unknown>(null)
   const [sourceDirValid, setSourceDirValid] = useState(true)
   const [upload, setUpload] = useState<UploadState | null>(null)
+  // 从服务端目录导入：建库请求返回后**留在本页**显示进度，而不是立刻跳详情 ——
+  // 与本机上传一致（上传也是替换表单区域，完成后才给「打开存储库」）。
+  const [importRepo, setImportRepo] = useState<RepoDTO | null>(null)
+  // 本次导入的源目录：面板上要像上传那样把"从哪来"写清楚。
+  const [importSource, setImportSource] = useState('')
   const { uploads, refreshUploads } = useAgent()
   // 上一次**由源目录自动写入**的库名，用来判断"这个名字还是不是我填的"（见 autoFillName）。
   const autoNameRef = useRef('')
@@ -93,11 +99,21 @@ export function RepoCreateForm({
   )
 
   const mutation = useMutation({
-    mutationFn: (values: CreateRepoRequest) => api.createRepo(values),
+    mutationFn: async (input: { payload: CreateRepoRequest; stayForImport: boolean }) => {
+      const response = await api.createRepo(input.payload)
+      return { ...response, stayForImport: input.stayForImport, sourceDir: input.payload.source_dir ?? '' }
+    },
     onSuccess: (response) => {
       // 新建库立刻占用用户配额（「我的存储库」顶部的总账），列表页的 ['me'] 必须一起失效，
       // 否则用户建完库回到列表，看到的还是建库前的"已用"。
       void queryClient.invalidateQueries({ queryKey: ['me'] })
+      // 服务端目录导入是异步长活（100GB 可能要几小时）：留在新建页看进度，
+      // 由下面的 ImportPanel 接管；完成后用户自己点「打开存储库」。
+      if (response.stayForImport) {
+        setImportSource(response.sourceDir)
+        setImportRepo(response.repo)
+        return
+      }
       onCreated(response.repo)
     },
     onError: (err) => setError(err)
@@ -133,6 +149,9 @@ export function RepoCreateForm({
         : uploads.find((item) => item.upload_id === upload.upload_id)) ?? upload
     : null
 
+  // 服务端目录导入：用库详情轮询 + SSE 跟踪 prepare 快照（字节 / 速度 / 剩余时间）。
+  const trackedImport = useRepoPrepare(importRepo?.id, importRepo ?? undefined)
+
   useEffect(() => {
     if (tracked) return
     const active = uploads.find((item) => ACTIVE_UPLOAD_STATES.includes(item.state))
@@ -148,6 +167,14 @@ export function RepoCreateForm({
     void queryClient.invalidateQueries({ queryKey: ['repos'] })
     void queryClient.invalidateQueries({ queryKey: ['me'] })
   }, [tracked?.state, queryClient])
+
+  // 导入结束（成功或失败）：列表/总账都要刷新一次 —— 库记录已经存在，但状态与容量
+  // 在完成那一刻才最终确定。
+  useEffect(() => {
+    if (trackedImport?.state !== 'active' && trackedImport?.state !== 'error') return
+    void queryClient.invalidateQueries({ queryKey: ['repos'] })
+    void queryClient.invalidateQueries({ queryKey: ['me'] })
+  }, [trackedImport?.state, queryClient])
 
   /**
    * 选了源目录就顺手把库名填上（真实反馈："从文件创建库会自动填写库名为目录名"）。
@@ -197,14 +224,18 @@ export function RepoCreateForm({
       })
       return
     }
-    mutation.mutate(buildCreatePayload(values, source))
+    const serverImport = source?.kind === 'server' && Boolean(source.path)
+    mutation.mutate({
+      payload: buildCreatePayload(values, source),
+      stayForImport: serverImport
+    })
   }
 
   return (
     <PageShell
       title={t('repo.create.title')}
       extra={
-        tracked ? (
+        tracked || importRepo || mutation.isPending ? (
           <Button onClick={onCancel}>{t('common.back')}</Button>
         ) : (
           <Space>
@@ -232,6 +263,25 @@ export function RepoCreateForm({
               onOpenRepo && tracked.repo_id ? () => onOpenRepo(tracked.repo_id as string) : undefined
             }
           />
+        </SectionCard>
+      ) : importRepo ? (
+        <SectionCard>
+          <ImportPanel
+            repo={trackedImport ?? importRepo}
+            sourceDir={importSource}
+            onOpenRepo={onOpenRepo ? () => onOpenRepo(importRepo.id) : undefined}
+          />
+        </SectionCard>
+      ) : mutation.isPending ? (
+        // 服务端目录导入在返回前要先把源目录走一遍算容量（100GB / 海量小文件可能是分钟级）。
+        // 这段没有可细分的进度，但必须马上告诉用户"已经在干活了"，而不是让按钮一直转圈。
+        <SectionCard>
+          <Space size={spacing.sm}>
+            <Spin size="small" />
+            <Typography.Text type="secondary">
+              {t(mutation.variables?.stayForImport ? 'repo.create.pending' : 'repo.create.creating')}
+            </Typography.Text>
+          </Space>
         </SectionCard>
       ) : (
         <Form
@@ -423,6 +473,54 @@ function preallocateCount(values: RepoFormValues): number {
   const count = Number(values.max_diff_disks ?? 1)
   if (!Number.isFinite(count) || count <= 0) return 1
   return Math.trunc(count)
+}
+
+/**
+ * 从服务端目录导入的进度面板（替代表单区域，不跳转页面）。
+ *
+ * 与本机上传的 UploadPanel 保持同一套交互：留在新建页、完成后给「打开存储库」。
+ * 差别只在数据源 —— 这里读库的 prepare 快照（字节 / 速度 / 剩余时间），
+ * 上传读本机代理的任务快照。
+ */
+function ImportPanel({
+  repo,
+  sourceDir,
+  onOpenRepo
+}: {
+  repo: RepoDTO
+  sourceDir?: string
+  onOpenRepo?: () => void
+}): JSX.Element {
+  const { t } = useI18n()
+  const active = repo.state === 'creating' || repo.state === 'importing'
+
+  return (
+    <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
+      <Typography.Title level={5} style={{ margin: 0 }}>
+        {t('repo.prepare.title')}
+      </Typography.Title>
+      <Typography.Text strong>{repo.name}</Typography.Text>
+      {sourceDir ? (
+        <Typography.Text type="secondary" style={{ wordBreak: 'break-all' }}>
+          {sourceDir}
+        </Typography.Text>
+      ) : null}
+      {active ? <RepoPrepareDetail prepare={repo.prepare} /> : null}
+      {repo.state === 'active' ? (
+        <Space size={spacing.sm} wrap>
+          <Typography.Text type="success">{t('repo.prepare.done')}</Typography.Text>
+          {onOpenRepo ? (
+            <Button type="link" size="small" onClick={onOpenRepo}>
+              {t('upload.openRepo')}
+            </Button>
+          ) : null}
+        </Space>
+      ) : null}
+      {repo.state === 'error' ? (
+        <ErrorNotice error={new ApiError({ kind: 'business', code: repo.prepare?.error || 'system.internal' })} />
+      ) : null}
+    </Space>
+  )
 }
 
 /** 本地目录上传进度面板（替代表单区域，不跳转页面）。 */

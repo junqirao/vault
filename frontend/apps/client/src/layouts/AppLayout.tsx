@@ -1,6 +1,5 @@
 import {
   AppstoreOutlined,
-  AuditOutlined,
   CloudOutlined,
   ClusterOutlined,
   ControlOutlined,
@@ -9,37 +8,32 @@ import {
   DesktopOutlined,
   DownOutlined,
   FileTextOutlined,
-  HddOutlined,
   InfoCircleOutlined,
-  ReloadOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
   SettingOutlined,
-  TeamOutlined,
-  UserOutlined
+  TeamOutlined
 } from '@ant-design/icons'
-import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Typography } from 'antd'
+import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
 import { useState } from 'react'
 import { Outlet, useLocation, useNavigate } from 'react-router-dom'
 
 // 侧边栏品牌处展示对外的发布版本（内部构建号只在「关于」里展示）。
-import { CLIENT_VERSION, RELEASE_CHANNEL, RELEASE_VERSION } from '../config'
+import { RELEASE_CHANNEL, RELEASE_VERSION } from '../config'
 // 与本地条目比对服务端地址用同一口径：代理回传的 url 与本地 baseUrl 可能差一个尾斜杠。
 import { normalizeUrl, rememberManualServerSwitch } from '../store/appStore'
 
 import {
-  LanguageSwitcher,
   LayoutModeProvider,
   LoadingState,
   SystemDepsBanner,
   layout,
   palette,
-  isAgentVersionBehind,
   roleLabel,
   spacing,
-  translateError,
   useAgent,
   useAgentEventNotifier,
-  useAgentVersion,
   useAuth,
   useI18n,
   useServerConfig,
@@ -54,7 +48,6 @@ export interface AppLayoutProps {
   mode: AppShellMode
   language: Language
   onLanguageChange: (language: Language) => void
-  onManageServers: () => void
 }
 
 /**
@@ -66,8 +59,44 @@ export interface AppLayoutProps {
  */
 const SERVER_SWITCH_RELOAD_DELAY_MS = 300
 
+/** 侧边栏收起后只露出图标：把菜单图标从 antd 默认的 16px 提到 20px（不改变展开态）。 */
+const SIDEBAR_COLLAPSED_CSS = `
+.vault-sidebar {
+  transition: all 200ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+}
+.vault-sidebar .ant-menu-item .anticon,
+.vault-sidebar .ant-menu-submenu-title .anticon {
+  transition: font-size 200ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+}
+.vault-sidebar-collapsed .ant-menu-inline-collapsed .ant-menu-item .anticon,
+.vault-sidebar-collapsed .ant-menu-inline-collapsed .ant-menu-submenu-title .anticon {
+  font-size: 20px !important;
+}
+`
+/** 侧边栏收起状态的本机偏好键：只影响布局，不进客户端配置。 */
+const SIDEBAR_COLLAPSED_KEY = 'vault.sidebar.collapsed'
+
+/** 读取侧边栏收起偏好；从未设置过时默认收起。 */
+function readSidebarCollapsed(): boolean {
+  try {
+    const raw = window.localStorage.getItem(SIDEBAR_COLLAPSED_KEY)
+    return raw === null ? true : raw === '1'
+  } catch {
+    return true
+  }
+}
+
+/** 记住侧边栏收起偏好；写不进去只当没记住，不影响使用。 */
+function storeSidebarCollapsed(collapsed: boolean): void {
+  try {
+    window.localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0')
+  } catch {
+    // 忽略：偏好没记住不是错误。
+  }
+}
+
 /** 主界面布局：按 mode 渲染应用端或管理端两套菜单，顶栏元素两模式一致。 */
-export function AppLayout({ mode, language, onLanguageChange, onManageServers }: AppLayoutProps): JSX.Element {
+export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
   const { t } = useI18n()
   const navigate = useNavigate()
   // 代理事件的全局通知出口：整个应用只注册一次（放外壳里）。
@@ -75,28 +104,26 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
   useAgentEventNotifier()
   const location = useLocation()
   const { user, isSuperAdmin, logout } = useAuth()
+  // 侧边栏收起后只剩品牌首字母与用户头像首字母，避免用两个不同风格的占位图标。
+  const appInitial = (t('app.name').trim().charAt(0) || 'V').toUpperCase()
+  const userInitial = (user?.username ?? '').trim().charAt(0).toUpperCase() || '?'
   const { servers, activeKey, active, setActive } = useServerConfig()
   const agent = useAgent()
-  const agentVersion = useAgentVersion()
-  /*
-   * 本地服务版本与"是否不一致"必须来自同一口径。
-   *
-   * 主进程的版本信息是异步补全的（拉一次 /agent/health 后回填），失败时 version/mismatch
-   * 会一直为空；而健康快照是界面自己拉的，可能已经拿到版本。只信主进程的 mismatch 会
-   * 出现"版本号显示旧值、却不提示不一致"。这里保留主进程判定，并用**本体版本**兜底比对
-   * （clientVersion 取的是运行时本体版本，不是渲染层热更包的版本，见 config.ts）。
-   *
-   * 只在代理**落后**时告警：代理自更新可以先于客户端本体完成，"代理比客户端新"是正常
-   * 过渡态（本体随后会带着同版本代理重启），提示只会制造噪音。
-   */
-  const agentVersionText = agentVersion.agent || agent.health?.agent_version || ''
-  const expectedAgentVersion = agentVersion.expected || CLIENT_VERSION
-  const agentMismatch =
-    agentVersion.mismatch || isAgentVersionBehind(agentVersionText, expectedAgentVersion)
   // 服务端往返延迟（顶栏指标，每 10 秒自测一次）：见下面 latencyText / latencyColor。
   const latency = useServerLatency(active?.baseUrl)
   // 手动重连进行中（按钮转圈）：只影响按钮，不参与任何状态判定。
   const [serverRetrying, setServerRetrying] = useState(false)
+  // 侧边栏收起状态：底部按钮切换，记在本机（下次打开保持）。
+  const [collapsed, setCollapsed] = useState(readSidebarCollapsed)
+  // 服务器下拉：受控打开状态，底部「管理地址」点击后要能主动收起。
+  const [serverMenuOpen, setServerMenuOpen] = useState(false)
+  const toggleCollapsed = (): void => {
+    setCollapsed((previous) => {
+      const next = !previous
+      storeSidebarCollapsed(next)
+      return next
+    })
+  }
 
   // 渠道标签：stable 不展示；beta / rc / alpha 以标签形式跟在版本号后面。
   const releaseTag = RELEASE_CHANNEL && RELEASE_CHANNEL !== 'stable' ? RELEASE_CHANNEL.toUpperCase() : null
@@ -115,9 +142,8 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
     { key: '/admin/users', icon: <TeamOutlined />, label: t('nav.users') },
     { key: '/admin/repos', icon: <AppstoreOutlined />, label: t('nav.repos') },
     { key: '/admin/storages', icon: <DatabaseOutlined />, label: t('nav.storages') },
-    { key: '/admin/leases', icon: <HddOutlined />, label: t('nav.leases') },
     { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
-    { key: '/admin/audit', icon: <AuditOutlined />, label: t('nav.audit') },
+    // 审计日志与服务端日志已合并为一页，入口只留「服务日志」，页内用 Tab 切换。
     { key: '/admin/logs', icon: <FileTextOutlined />, label: t('nav.serverLogs') },
     { key: '/admin/system', icon: <ClusterOutlined />, label: t('nav.system') },
     // 管理端也留一个：关于里的版本/许可是登录角色无关的，排障时不该因为"当前在管理端"就找不到。
@@ -135,13 +161,18 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
         label: server.serverName || server.baseUrl
       })),
       { type: 'divider' as const },
-      { key: '__manage__', label: t('boot.changeAddress') }
+      {
+        key: '__manage__',
+        icon: <SettingOutlined />,
+        label: t('settings.servers.manageAddress')
+      }
     ],
     selectable: true,
     selectedKeys: activeKey ? [activeKey] : [],
     onClick: ({ key }) => {
       if (key === '__manage__') {
-        onManageServers()
+        setServerMenuOpen(false)
+        navigate('/settings')
         return
       }
       // 点当前这台不用刷新（否则等于无故重载一次）。
@@ -192,8 +223,6 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
           ? agent.state?.servers?.find((item) => normalizeUrl(item.url) === normalizeUrl(active.baseUrl))
           : undefined))
       : undefined) ?? agent.state?.server
-  // 排障面板逐台列出：新代理给 servers[]，旧代理退回兼容的 health.server（只有一台）。
-  const serverList = agent.state?.servers?.length ? agent.state.servers : agent.health?.servers ?? []
   const serverPhase = server?.connected ? 'connected' : server?.phase
   // "连接中"：代理正在连/自动重连。它不再出现在顶栏（顶栏"通没通"由延迟指标说明），
   // 只留在两处判定里：管理端不在此时遮罩（瞬时抖动不该盖死内容区），以及下面的"未连接"。
@@ -286,143 +315,107 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
     })()
   }
 
-  // 最近一次挂载失败的**原始报错**（代理侧 last_error_detail）。
-  //
-  // 为什么在这里露出来：按项目约定，界面上平时只能看到稳定错误码（如 agent.mount_failed），
-  // 用户完全无从知道"为什么"（真实工单："客户端报错至少要知道为什么"）。它只存在挂载状态里，
-  // 不进任何 API 错误响应，这里如实展示并支持一键复制（便于贴给运维/开发）。
-  const lastMountFailure = (() => {
-    const failed = (agent.state?.mounts ?? []).filter(
-      (item) => item.state === 'error' && (item.last_error_detail || item.last_error)
-    )
-    return failed.length > 0 ? failed[failed.length - 1] : undefined
-  })()
-
-  const agentDetail = (
-    <Space direction="vertical" size={4} style={{ maxWidth: 360 }}>
-      {!agent.available ? <Typography.Text type="warning">{t('agent.hostMissing')}</Typography.Text> : null}
-      {agent.health ? (
-        <>
-          <Typography.Text>{`${t('agent.version')}: ${agentVersionText || '-'}`}</Typography.Text>
-          <Typography.Text>{`${t('agent.platform')}: ${agent.health.platform}`}</Typography.Text>
-          <Typography.Text>
-            {`${t('agent.admin')}: ${agent.health.admin ? t('agent.admin.yes') : t('agent.admin.no')}`}
-          </Typography.Text>
-          {serverList.length > 0
-            ? serverList.map((item) => (
-                <Space direction="vertical" size={0} key={item.server_key ?? item.url}>
-                  <Typography.Text>{`${t('agent.server.url')}: ${item.url || '-'}`}</Typography.Text>
-                  <Typography.Text>{`${t('agent.server.name')}: ${item.name || '-'}`}</Typography.Text>
-                  <Typography.Text>
-                    {`${t('agent.server.connected')}: ${item.connected ? t('common.yes') : t('common.no')}`}
-                  </Typography.Text>
-                  {item.last_error ? (
-                    <Typography.Text type="warning">
-                      {`${t('agent.server.lastError')}: ${item.last_error}`}
-                    </Typography.Text>
-                  ) : null}
-                </Space>
-              ))
-            : (
-                <>
-                  <Typography.Text>{`${t('agent.server.url')}: ${agent.health.server.url || '-'}`}</Typography.Text>
-                  <Typography.Text>{`${t('agent.server.name')}: ${agent.health.server.name || '-'}`}</Typography.Text>
-                  <Typography.Text>
-                    {`${t('agent.server.connected')}: ${agent.health.server.connected ? t('common.yes') : t('common.no')}`}
-                  </Typography.Text>
-                  {agent.health.server.last_error ? (
-                    <Typography.Text type="warning">
-                      {`${t('agent.server.lastError')}: ${agent.health.server.last_error}`}
-                    </Typography.Text>
-                  ) : null}
-                </>
-              )}
-        </>
-      ) : null}
-      {lastMountFailure ? (
-        <Typography.Text
-          type="warning"
-          copyable={{
-            text: [
-              lastMountFailure.repo_name || lastMountFailure.repo_id,
-              lastMountFailure.last_error || '',
-              lastMountFailure.last_error_detail || ''
-            ]
-              .filter((part) => part !== '')
-              .join('\n'),
-            tooltips: [t('common.copy'), t('common.copied')]
-          }}
-        >
-          {`${t('agent.lastMountError')}（${lastMountFailure.repo_name || lastMountFailure.repo_id}）：${
-            lastMountFailure.last_error_detail || lastMountFailure.last_error || ''
-          }`}
-        </Typography.Text>
-      ) : null}
-      {agent.error ? <Typography.Text type="danger">{translateError(agent.error)}</Typography.Text> : null}
-      {agentMismatch ? (
-        <Typography.Text type="warning">
-          {t('agent.versionMismatch.detail', {
-            agent: agentVersionText || '-',
-            client: expectedAgentVersion || '-'
-          })}
-        </Typography.Text>
-      ) : null}
-    </Space>
-  )
-
   return (
     <LayoutModeProvider mode={mode}>
+      <style>{SIDEBAR_COLLAPSED_CSS}</style>
       <Layout style={{ height: '100vh' }}>
-        <Layout.Sider width={layout.sidebarWidth} theme="light" style={{ borderRight: `1px solid ${palette.border}` }}>
+        <Layout.Sider
+          width={layout.sidebarWidth}
+          collapsedWidth={80}
+          collapsed={collapsed}
+          trigger={null}
+          theme="light"
+          className={collapsed ? 'vault-sidebar vault-sidebar-collapsed' : 'vault-sidebar'}
+          style={{ borderRight: `1px solid ${palette.border}` }}
+        >
           <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-            <div style={{ padding: `${spacing.md}px ${spacing.lg}px ${spacing.sm}px` }}>
-              <Space direction="vertical" size={0}>
-                <Space align="center" size={6}>
-                  <Typography.Text strong style={{ fontSize: 16 }}>
-                    {t('app.name')}
-                  </Typography.Text>
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      v{RELEASE_VERSION}
+            <div
+              style={{
+                padding: collapsed ? `${spacing.md}px ${spacing.xs}px` : `${spacing.md}px ${spacing.lg}px ${spacing.sm}px`,
+                display: 'flex',
+                justifyContent: collapsed ? 'center' : 'flex-start'
+              }}
+            >
+              {collapsed ? (
+                <Avatar
+                  shape="square"
+                  size={36}
+                  style={{
+                    background: palette.accent,
+                    color: palette.textInverse,
+                    fontWeight: 600,
+                    fontSize: 16
+                  }}
+                >
+                  {appInitial}
+                </Avatar>
+              ) : (
+                <Space direction="vertical" size={0}>
+                  <Space align="center" size={6}>
+                    <Typography.Text strong style={{ fontSize: 16 }}>
+                      {t('app.name')}
                     </Typography.Text>
-                    {releaseTag ? (
-                      <Tag
-                        color={releaseTagColor}
-                        style={{
-                          marginInlineEnd: 0,
-                          fontSize: 10,
-                          lineHeight: '16px',
-                          paddingInline: 5,
-                          fontWeight: 600
-                        }}
-                      >
-                        {releaseTag}
-                      </Tag>
-                    ) : null}
-                  </span>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        v{RELEASE_VERSION}
+                      </Typography.Text>
+                      {releaseTag ? (
+                        <Tag
+                          color={releaseTagColor}
+                          style={{
+                            marginInlineEnd: 0,
+                            fontSize: 10,
+                            lineHeight: '16px',
+                            paddingInline: 5,
+                            fontWeight: 600
+                          }}
+                        >
+                          {releaseTag}
+                        </Tag>
+                      ) : null}
+                    </span>
+                  </Space>
+                  {mode === 'admin' ? (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {t('nav.admin')}
+                    </Typography.Text>
+                  ) : null}
                 </Space>
-                {mode === 'admin' ? (
-                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    {t('nav.admin')}
-                  </Typography.Text>
-                ) : null}
-              </Space>
+              )}
             </div>
             <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
               <Menu
                 mode="inline"
+                inlineCollapsed={collapsed}
                 selectedKeys={[selectedKey]}
                 items={menuItems}
-                style={{ borderInlineEnd: 'none' }}
+                // 收起后只露出图标：把字号调大一档（20px），否则 14px 图标在窄栏里显得发虚。
+                style={{ borderInlineEnd: 'none', fontSize: collapsed ? 20 : 14 }}
                 // 每一项都是路由（包括「关于」）：不再有"点了开弹窗、不留高亮"的特例。
                 onClick={({ key }) => navigate(key)}
               />
             </div>
-            {mode === 'admin' ? (
-              <div style={{ padding: spacing.xs, borderTop: `1px solid ${palette.border}` }}>
-                <LanguageSwitcher compact value={language} onChange={onLanguageChange} />
-              </div>
-            ) : null}
+            <div
+              style={{
+                padding: spacing.xs,
+                borderTop: `1px solid ${palette.border}`,
+                display: 'flex',
+                justifyContent: collapsed ? 'center' : 'flex-start'
+              }}
+            >
+              <Tooltip title={t(collapsed ? 'nav.expandSidebar' : 'nav.collapseSidebar')} placement="right">
+                <Button
+                  type="text"
+                  block={!collapsed}
+                  style={collapsed ? { width: 40 } : undefined}
+                  icon={collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />}
+                  aria-label={t(collapsed ? 'nav.expandSidebar' : 'nav.collapseSidebar')}
+                  onClick={toggleCollapsed}
+                >
+                  {collapsed ? null : t('nav.collapseSidebar')}
+                </Button>
+              </Tooltip>
+            </div>
           </div>
         </Layout.Sider>
 
@@ -437,73 +430,56 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
             }}
           >
             <Space size={spacing.xs}>
-              <Dropdown menu={serverMenu} trigger={['click']}>
-                <Button type="text">
-                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                    {/* 悬停信息放在右侧展开（不再用 Tooltip 压在切换器上）：
-                        实例 ID / 地址 / 延迟口径都较长，右侧浮层不遮挡当前选择。
-                        点击 ms 不再弹任何浮层；排障详情由右侧独立的信息按钮打开。 */}
-                    <Popover
-                      trigger="hover"
-                      placement="rightTop"
-                      mouseEnterDelay={0.3}
-                      content={serverTip}
-                    >
-                      <span>{active?.serverName || active?.baseUrl || t('settings.server.noName')}</span>
-                    </Popover>
-                    {/* 延迟指标：数字即状态。点击它只作为普通读数，不弹出任何浮层，
-                        也不触发服务端下拉（否则会被当成"点 ms 出来 tooltip"）。 */}
-                    <span
-                      onClick={(event) => event.stopPropagation()}
-                      style={{ color: latencyColor, fontVariantNumeric: 'tabular-nums' }}
-                    >
-                      {latencyText}
-                    </span>
-                    <DownOutlined style={{ fontSize: 10 }} />
-                  </span>
-                </Button>
-              </Dropdown>
+              {/* 悬停信息挂在整个选择器外层：鼠标落在名称、延迟数字或下拉箭头上都展示。 */}
               <Popover
-                content={agentDetail}
-                trigger="click"
-                placement="bottomLeft"
-                title={
-                  <Space size={spacing.xs}>
-                    <span>{t('agent.troubleshoot.title')}</span>
-                    <Button
-                      type="text"
-                      size="small"
-                      icon={<ReloadOutlined />}
-                      title={t('common.refresh')}
-                      aria-label={t('common.refresh')}
-                      onClick={() => void agent.refresh()}
-                    />
-                  </Space>
-                }
+                trigger="hover"
+                placement="rightTop"
+                mouseEnterDelay={0.3}
+                content={serverTip}
               >
-                <Button
-                  type="text"
-                  size="small"
-                  icon={<InfoCircleOutlined />}
-                  aria-label={t('agent.troubleshoot.title')}
-                />
+                <span style={{ display: 'inline-flex' }}>
+                  <Dropdown
+                    menu={serverMenu}
+                    trigger={['click']}
+                    open={serverMenuOpen}
+                    onOpenChange={setServerMenuOpen}
+                  >
+                    <Button type="text">
+                      <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                        <span
+                          style={{
+                            maxWidth: 180,
+                            overflow: 'hidden',
+                            textOverflow: 'ellipsis',
+                            whiteSpace: 'nowrap'
+                          }}
+                        >
+                          {active?.serverName || active?.baseUrl || t('settings.server.noName')}
+                        </span>
+                        {/* 延迟指标：数字即状态。点击它只作为普通读数，不弹出任何浮层，
+                            也不触发服务端下拉（否则会被当成"点 ms 出来 tooltip"）。 */}
+                        <span
+                          onClick={(event) => event.stopPropagation()}
+                          style={{ color: latencyColor, fontVariantNumeric: 'tabular-nums' }}
+                        >
+                          {latencyText}
+                        </span>
+                        <DownOutlined style={{ fontSize: 10 }} />
+                      </span>
+                    </Button>
+                  </Dropdown>
+                </span>
               </Popover>
               {serverExhausted ? (
                 <Button size="small" type="link" loading={serverRetrying} onClick={handleServerRetry}>
                   {t('agent.server.retry')}
                 </Button>
               ) : null}
-              {agentMismatch ? (
-                <Tag color={palette.warning} style={{ cursor: 'pointer' }}>
-                  {t('agent.versionMismatch')}
-                </Tag>
-              ) : null}
             </Space>
 
             <Space size={spacing.xs}>
               {isSuperAdmin ? (
                 <Button
-                  size="small"
                   type="text"
                   icon={mode === 'admin' ? <DesktopOutlined /> : <ControlOutlined />}
                   onClick={() => navigate(mode === 'admin' ? '/my-repos' : '/admin/users')}
@@ -514,7 +490,12 @@ export function AppLayout({ mode, language, onLanguageChange, onManageServers }:
               <Dropdown menu={userMenu} trigger={['click']}>
                 <Button type="text">
                   <Space size={6}>
-                    <Avatar size="small" icon={<UserOutlined />} />
+                    <Avatar
+                      size="small"
+                      style={{ backgroundColor: palette.textTertiary, fontSize: 12, fontWeight: 600 }}
+                    >
+                      {userInitial}
+                    </Avatar>
                     <span>{user?.username ?? '-'}</span>
                   </Space>
                 </Button>

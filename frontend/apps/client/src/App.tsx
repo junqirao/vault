@@ -23,7 +23,6 @@ import {
   isApiError,
   subscribeAgentSession,
   trustServerCertificate,
-  useAgent,
   type AgentIdentity,
   type AgentSessionState,
   type BootstrapResponse,
@@ -34,7 +33,6 @@ import {
 } from '@vault/ui'
 
 import { PhaseView, type CertLoginFailure } from './flow/PhaseView'
-import { useAutoUpdate } from './flow/useAutoUpdate'
 import { useStartupFlow } from './flow/useStartupFlow'
 import { normalizeUrl, selectActiveServer, useAppStore } from './store/appStore'
 
@@ -120,9 +118,8 @@ export function App(): JSX.Element {
   )
 
   const flow = useStartupFlow(api)
-  // 全自动更新：只要代理可用就开始检查，不等登录、也不用进设置页（设置页的手动入口保留）。
-  const agent = useAgent()
-  useAutoUpdate(agent.available)
+  // 版本更新在**启动期**由独立更新器完成（见 electron/clientUpdate.ts）；界面运行期
+  // 不再自行触发整包/代理/渲染层更新，避免出现"界面已经换了、本地服务还是旧的"。
   const { setPhase } = flow
 
   useEffect(() => {

@@ -631,19 +631,12 @@ func (a *Agent) onSessionEstablished(key string) {
 	// 自动挂载必须等"服务端确认连上"（见 restoreMountsWhenConnected）：拿到会话不等于连得上，
 	// 系统还没连上就挂只会留下一串失败记录。
 	safeGo(a.logger, "restore_mounts", func() { a.restoreMountsWhenConnected(a.bgContext(), key) })
-	// 静默热更：会话就绪即检查一次渲染层资源（客户端每次启动都会推会话）。
+	// 版本更新只在**启动期**由独立更新器完成（Vault-Updator bootstrap，见 bootstrap.go）：
+	// 前端与本地服务来自同一个已签名整包，要么一起换、要么都不换。
 	//
-	// 语义：完全静默 —— 后台拉清单 → 下载 → 校验 → 激活，全程只经 web_update 事件
-	// 同步进度，不弹窗、不打断；客户端主进程收到"已激活"事件后会**自动切换到新资源**
-	// （见 electron/main.ts 的 applyWebLayer），无需用户手动"立即重启"。
-	// 只有比本机应用版本更新的资源才会被激活（见 webTargetApplies），因此重复启动
-	// 只会命中"已是目标版本"的幂等分支，不重复下载。
-	//
-	// 多服务端：渲染层资源只能有一个来源（更新源 = 主服务端，见 docs/implementation.md §7.4.1），
-	// 因此只有主服务端推来会话时才检查；否则后推会话的那台会把资源层换成它的版本。
-	if key == a.store.PrimaryKey() {
-		a.startWebUpdate()
-	}
+	// 这里刻意**不再**自动触发热更渲染层资源。渲染层热更是独立于整包的第三条更新通道，
+	// 它会让"界面已经换成新版本、程序目录和本地服务还是旧的"再次出现，并在界面上留下
+	// "立即重启"的误导提示（真实反馈）。手动接口仍保留给排障使用，但绝不自动执行。
 }
 
 // updateServerFromInfo 用系统信息补全**某台**服务端的展示字段并标记已连接。

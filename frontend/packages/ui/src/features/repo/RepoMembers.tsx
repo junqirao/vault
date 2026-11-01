@@ -15,12 +15,14 @@ import { permissionLabel } from '../../utils/labels'
 export interface RepoMembersProps {
   repoId: string
   isSuperAdmin: boolean
+  /** 设置页里的模块说明。 */
+  description?: string
 }
 
 const PERMISSIONS: Permission[] = ['read', 'mount', 'manage']
 
 /** 存储库可管理成员（覆盖式设置）。 */
-export function RepoMembers({ repoId, isSuperAdmin }: RepoMembersProps): JSX.Element {
+export function RepoMembers({ repoId, isSuperAdmin, description }: RepoMembersProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const queryClient = useQueryClient()
@@ -106,6 +108,11 @@ export function RepoMembers({ repoId, isSuperAdmin }: RepoMembersProps): JSX.Ele
 
   return (
     <SectionCard title={t('repo.detail.members')}>
+      {description ? (
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          {description}
+        </Typography.Paragraph>
+      ) : null}
       {error ? <ErrorNotice error={error} /> : null}
       <Space style={{ marginBottom: spacing.md }} wrap>
         <Select
@@ -136,7 +143,6 @@ export function RepoMembers({ repoId, isSuperAdmin }: RepoMembersProps): JSX.Ele
         rowKey={(member) => member.user_id}
         loading={membersQuery.isLoading}
         empty={t('common.empty')}
-        pagination={false}
       />
     </SectionCard>
   )

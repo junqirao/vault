@@ -761,8 +761,9 @@ export interface UpdateInfo {
   /**
    * 升级后将不再兼容的服务端（对应代理侧 UpdateCheckResult.breaks_servers）。
    *
-   * 非空表示升级会让这些服务端在它们升级前无法协作，属于**必须由用户确认**的动作；
-   * 自动更新流程遇到非空会跳过整包安装（见 apps/client/src/flow/useAutoUpdate.ts）。
+   * 非空表示升级会让这些服务端在它们升级前无法协作，属于**必须由用户确认**的动作。
+   * 启动期更新器（Vault-Updator bootstrap）只做整包替换，兼容性预检仍由设置页的手动
+   * 检查入口负责展示。
    */
   breaks_servers?: { server_name: string; max: string }[]
   /**

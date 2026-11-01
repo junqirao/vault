@@ -16,13 +16,14 @@ import {
   message
 } from 'antd'
 import type { TableColumnsType } from 'antd'
-import { AppstoreOutlined, ArrowLeftOutlined, BarsOutlined, FolderOutlined, SettingOutlined } from '@ant-design/icons'
+import { AppstoreOutlined, ArrowLeftOutlined, BarsOutlined, FolderOutlined, SettingOutlined, SortAscendingOutlined } from '@ant-design/icons'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
+import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
 import { UsageBar, usageColor } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
@@ -79,6 +80,9 @@ interface RepoListEntry {
 
 /** 用户端展示形式：卡片网格（默认，一眼扫过多块盘）/ 整页宽度的列表（一库一行，便于横向比对）。 */
 type RepoViewMode = 'card' | 'list'
+
+/** 分组与组内库的排序模式：名称（升序）/ 大小（容量，降序）。 */
+type RepoSortMode = 'name' | 'size'
 
 /**
  * 每页条数按形态分别取值：卡片一行 3~4 张（每页 8 张 = 两行上下），列表一行一库（每页 10 行）。
@@ -326,6 +330,28 @@ function UsageOverviewCard({
   )
 }
 
+/** 排序按钮：名称 / 大小 两种模式，点击切换。 */
+function RepoSortButton({
+  value,
+  onChange
+}: {
+  value: RepoSortMode
+  onChange: (next: RepoSortMode) => void
+}): JSX.Element {
+  const { t } = useI18n()
+  return (
+    <Tooltip title={t('repo.sort.hint')}>
+      <Button
+        size="small"
+        icon={<SortAscendingOutlined />}
+        onClick={() => onChange(value === 'name' ? 'size' : 'name')}
+      >
+        {t(value === 'name' ? 'repo.sort.name' : 'repo.sort.size')}
+      </Button>
+    </Tooltip>
+  )
+}
+
 /** 卡片 / 列表形态切换：只挂在分组标题行右侧（见 RepoGroupHeader 的 extra）。 */
 function RepoViewSwitch({
   value,
@@ -487,8 +513,28 @@ interface RepoGroupBucket {
   items: RepoListEntry[]
 }
 
+/** 分组容量：组内各库标称容量之和（用于「大小」排序与分组卡片口径）。 */
+function groupCapacity(bucket: RepoGroupBucket): number {
+  return bucket.items.reduce((sum, entry) => sum + (entry.repo.capacity_bytes || 0), 0)
+}
+
+/** 组内库排序：名称升序；大小按容量降序（容量相同再按名称）。 */
+function sortRepoEntries(entries: RepoListEntry[], sortMode: RepoSortMode): RepoListEntry[] {
+  return [...entries].sort((a, b) => {
+    if (sortMode === 'size') {
+      const diff = (b.repo.capacity_bytes || 0) - (a.repo.capacity_bytes || 0)
+      if (diff !== 0) return diff
+    }
+    return a.repo.name.localeCompare(b.repo.name)
+  })
+}
+
 /** 按分组聚合条目，供"总览"页渲染分组卡片；未分组排在最后。 */
-function buildGroups(entries: RepoListEntry[], ungroupedLabel: string): RepoGroupBucket[] {
+function buildGroups(
+  entries: RepoListEntry[],
+  ungroupedLabel: string,
+  sortMode: RepoSortMode = 'name'
+): RepoGroupBucket[] {
   const map = new Map<string, RepoListEntry[]>()
   for (const entry of entries) {
     const key = groupKeyOf(entry.repo)
@@ -505,7 +551,11 @@ function buildGroups(entries: RepoListEntry[], ungroupedLabel: string): RepoGrou
   buckets.sort((a, b) => {
     if (a.key === '') return 1
     if (b.key === '') return -1
-    return a.key.localeCompare(b.key)
+    if (sortMode === 'size') {
+      const diff = groupCapacity(b) - groupCapacity(a)
+      if (diff !== 0) return diff
+    }
+    return a.title.localeCompare(b.title)
   })
   return buckets
 }
@@ -908,9 +958,12 @@ function RepoGroupCard({
 /** 分组下钻后的内容：返回 + 组名 + 批量挂载/卸载 + 分组设置 + 库列表。 */
 function RepoGroupDetail({
   bucket,
+  items,
   currentUserId,
   viewMode,
   onViewModeChange,
+  sortMode,
+  onSortModeChange,
   onBack,
   onOpen,
   onConfigure,
@@ -918,9 +971,13 @@ function RepoGroupDetail({
   onSettings
 }: {
   bucket: RepoGroupBucket
+  /** 当前要展示的条目（搜索时是组内匹配结果；为空时展示空态）。 */
+  items: RepoListEntry[]
   currentUserId: string
   viewMode: RepoViewMode
   onViewModeChange: (next: RepoViewMode) => void
+  sortMode: RepoSortMode
+  onSortModeChange: (next: RepoSortMode) => void
   onBack: () => void
   onOpen: (repoId: string) => void
   onConfigure: (repo: RepoDTO) => void
@@ -932,6 +989,8 @@ function RepoGroupDetail({
   // 防误触：进入分组的那一次点击如果是双击的第二下（或手速很快），会正好落在
   // 刚出现的「返回」按钮上，表现为"一点进去就弹回总览"。这里忽略挂载后极短时间内的返回。
   const mountedAt = useRef(Date.now())
+  // 分组级动作始终作用于**整个分组**：搜索只是缩小展示范围，不该让"挂载分组"
+  // 悄悄变成只挂载搜索命中的那几块库。
   const repos = bucket.items.map((entry) => entry.repo)
   const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
   const mounts = agent.state?.mounts ?? []
@@ -955,7 +1014,7 @@ function RepoGroupDetail({
         <FolderOutlined style={{ color: palette.accent }} />
         <Typography.Text strong>{bucket.title}</Typography.Text>
         <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-          {bucket.items.length}
+          {items.length === bucket.items.length ? bucket.items.length : `${items.length} / ${bucket.items.length}`}
         </Typography.Text>
         <span style={{ marginLeft: 'auto' }}>
           <Space wrap>
@@ -983,19 +1042,24 @@ function RepoGroupDetail({
                 />
               </Tooltip>
             ) : null}
+            <RepoSortButton value={sortMode} onChange={onSortModeChange} />
             <RepoViewSwitch value={viewMode} onChange={onViewModeChange} />
           </Space>
         </span>
       </div>
-      <RepoSection
-        title=""
-        items={bucket.items}
-        viewMode={viewMode}
-        currentUserId={currentUserId}
-        onOpen={onOpen}
-        onConfigure={onConfigure}
-        onOpenUpload={onOpenUpload}
-      />
+      {items.length === 0 ? (
+        <EmptyState title={t('repo.search.empty')} description={t('repo.search.emptyDesc')} />
+      ) : (
+        <RepoSection
+          title=""
+          items={sortRepoEntries(items, sortMode)}
+          viewMode={viewMode}
+          currentUserId={currentUserId}
+          onOpen={onOpen}
+          onConfigure={onConfigure}
+          onOpenUpload={onOpenUpload}
+        />
+      )}
     </Space>
   )
 }
@@ -1017,6 +1081,8 @@ export function RepoList({
   // 展示形式只影响用户端（管理端是一张运维表，形态切换对它没有意义）。
   // 初值取本地记住的那一份：用户上次选了列表，刷新/重开客户端仍是列表。
   const [viewMode, setViewMode] = useState<RepoViewMode>(readStoredView)
+  /** 分组与组内库排序：名称（默认）/ 大小。 */
+  const [sortMode, setSortMode] = useState<RepoSortMode>('name')
   /** 切换形态：即时生效并记住（下次进来直接是这一种）。 */
   const changeView = (next: RepoViewMode): void => {
     setViewMode(next)
@@ -1088,7 +1154,7 @@ export function RepoList({
     if (finished) void refetchRepos()
   }, [activeUploadIds, refetchRepos])
 
-  const entries = useMemo<RepoListEntry[]>(() => {
+  const allEntries = useMemo<RepoListEntry[]>(() => {
     const items = reposQuery.data?.items ?? []
     const byName = new Map(activeUploads.map((upload) => [upload.repo_name, upload]))
 
@@ -1130,13 +1196,23 @@ export function RepoList({
       merged.push({ repo: uploadPlaceholderRepo(upload, user?.id ?? ''), upload })
     }
 
+    return merged
+  }, [reposQuery.data, activeUploads, user?.id, agent.repoEvents])
+
+  // 搜索统一在这里做：名称或分组名命中都算。总览里按命中结果重新分组展示，
+  // 进入某个分组后只在这一个分组内过滤 —— 两处用的是同一套匹配规则。
+  const filteredEntries = useMemo<RepoListEntry[]>(() => {
     const lowered = keyword.trim().toLowerCase()
-    if (!lowered) return merged
-    return merged.filter((entry) => entry.repo.name.toLowerCase().includes(lowered))
-  }, [reposQuery.data, keyword, activeUploads, user?.id, agent.repoEvents])
+    if (!lowered) return allEntries
+    return allEntries.filter(
+      (entry) =>
+        entry.repo.name.toLowerCase().includes(lowered) ||
+        (entry.repo.group ?? '').toLowerCase().includes(lowered)
+    )
+  }, [allEntries, keyword])
 
   // 状态类事件只触发一次列表刷新（事件本身可能丢/滞后，不直接改本地快照）。
-  // 进度类事件（move_progress / prepare_progress）不在这里，靠上面的 entries 合并实时更新。
+  // 进度类事件（move_progress / prepare_progress）不在这里，靠上面的 allEntries 合并实时更新。
   const repoStateEventKey = useMemo(
     () =>
       Object.values(agent.repoEvents)
@@ -1152,14 +1228,13 @@ export function RepoList({
 
   // 记忆的分组可能已经被改名/删空：这时落回总览，别停在一个不存在的分组里。
   //
-  // 用 entries（含**上传中的占位库**）判断，而不是只看服务端已存在的记录：
-  // 未分组的上传占位库同样属于「未分组」这个分组，只看服务端列表会把它误判成
-  // "分组不存在"，于是点进未分组又被立刻弹回总览。
+  // 用 allEntries（含**上传中的占位库**、且不受搜索过滤影响）判断：
+  // 搜索只是缩小展示范围，不该因为"当前分组里没搜到"就把用户踢回总览。
   useEffect(() => {
     if (isSuperAdmin || activeGroup === null || reposQuery.isLoading) return
-    const exists = entries.some((entry) => groupKeyOf(entry.repo) === activeGroup)
+    const exists = allEntries.some((entry) => groupKeyOf(entry.repo) === activeGroup)
     if (!exists) setActiveGroup(null)
-  }, [activeGroup, isSuperAdmin, reposQuery.isLoading, entries, setActiveGroup])
+  }, [activeGroup, isSuperAdmin, reposQuery.isLoading, allEntries, setActiveGroup])
 
   const columns = useMemo<TableColumnsType<RepoDTO>>(() => {
     const base: TableColumnsType<RepoDTO> = [
@@ -1225,8 +1300,20 @@ export function RepoList({
       </Row>
     )
 
-    // 上传中的占位库已经算在 entries 里，所以这里不必再单独判一次"有没有在上传"。
-    if (entries.length === 0) {
+    const userId = user?.id ?? ''
+    const quotaRepos = allEntries
+      .filter((entry) => !isPlaceholderRepoId(entry.repo.id))
+      .map((entry) => entry.repo)
+    const keywordActive = keyword.trim() !== ''
+    // 分组卡片与"当前分组是否存在"都以未过滤的全集为准：搜索不应影响"我在哪个分组里"。
+    const allGroups = buildGroups(allEntries, t('repo.group.ungrouped'), sortMode)
+    // 搜索结果按命中的库重新分组：分组 A 有命中就展示 A 的命中库，B 同理，而不是只筛掉分组。
+    const resultGroups = buildGroups(filteredEntries, t('repo.group.ungrouped'), sortMode)
+    const currentGroup =
+      activeGroup === null ? undefined : allGroups.find((bucket) => bucket.key === activeGroup)
+
+    // 上传中的占位库已经算在 allEntries 里，所以这里不必再单独判一次"有没有在上传"。
+    if (allEntries.length === 0) {
       return (
         <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
           {overview([])}
@@ -1239,41 +1326,96 @@ export function RepoList({
       )
     }
 
-    const userId = user?.id ?? ''
-    const groups = buildGroups(entries, t('repo.group.ungrouped'))
-    const current = activeGroup === null ? undefined : groups.find((bucket) => bucket.key === activeGroup)
-
-    // 下钻视图：只列当前分组的库。分组被删除/改名（服务端数据变了）时回退到总览。
-    if (current) {
+    // 分组详情不再替换整页：性能模块留在上方，下面直接展开当前分组的库列表。
+    // 搜索时只展示当前分组内的命中项，别的分组不混进来。
+    if (currentGroup) {
+      const currentItems = filteredEntries.filter((entry) => groupKeyOf(entry.repo) === currentGroup.key)
       return (
-        <RepoGroupDetail
-          key={`${current.key}-${keyword}`}
-          bucket={current}
-          currentUserId={userId}
-          viewMode={viewMode}
-          onViewModeChange={changeView}
-          onBack={() => setActiveGroup(null)}
-          onOpen={onOpen}
-          onConfigure={setSettingsRepo}
-          onOpenUpload={onOpenUpload}
-          onSettings={() => setSettingsGroup(current.key)}
-        />
+        <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
+          {overview(quotaRepos)}
+          <RepoGroupDetail
+            key={currentGroup.key}
+            bucket={currentGroup}
+            items={currentItems}
+            currentUserId={userId}
+            viewMode={viewMode}
+            onViewModeChange={changeView}
+            sortMode={sortMode}
+            onSortModeChange={setSortMode}
+            onBack={() => setActiveGroup(null)}
+            onOpen={onOpen}
+            onConfigure={setSettingsRepo}
+            onOpenUpload={onOpenUpload}
+            onSettings={() => setSettingsGroup(currentGroup.key)}
+          />
+        </Space>
+      )
+    }
+
+    // 总览里搜索：按分组展示命中结果（每个分组一段），组名与库名同时参与匹配。
+    if (keywordActive) {
+      return (
+        <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
+          {overview(quotaRepos)}
+          <div
+            style={{
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: spacing.sm,
+              flexWrap: 'wrap'
+            }}
+          >
+            <Typography.Title level={5} style={{ margin: 0 }}>
+              {t('repo.group.searchResults')}
+            </Typography.Title>
+            <Space wrap>
+              <RepoSortButton value={sortMode} onChange={setSortMode} />
+              <RepoViewSwitch value={viewMode} onChange={changeView} />
+            </Space>
+          </div>
+          {resultGroups.length === 0 ? (
+            <EmptyState title={t('repo.search.empty')} description={t('repo.search.emptyDesc')} />
+          ) : (
+            resultGroups.map((bucket) => (
+              <RepoSection
+                key={bucket.key || '__ungrouped__'}
+                title={bucket.title}
+                items={sortRepoEntries(bucket.items, sortMode)}
+                viewMode={viewMode}
+                currentUserId={userId}
+                onOpen={onOpen}
+                onConfigure={setSettingsRepo}
+                onOpenUpload={onOpenUpload}
+              />
+            ))
+          )}
+        </Space>
       )
     }
 
     return (
       <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
         {/* 顶部总览：性能指标（左 2/3） + 存储/配额（右 1/3）。 */}
-        {overview(entries.filter((entry) => !isPlaceholderRepoId(entry.repo.id)).map((entry) => entry.repo))}
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs }}>
+        {overview(quotaRepos)}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+            gap: spacing.sm,
+            flexWrap: 'wrap'
+          }}
+        >
           <Typography.Title level={5} style={{ margin: 0 }}>
             {t('repo.group.title')}
           </Typography.Title>
+          <RepoSortButton value={sortMode} onChange={setSortMode} />
         </div>
         {/* 一行一个分组：组卡片信息按整行宽度排布，组再多也不会挤成两列
             （真实反馈："存储库分组一行一个，不要一行多个"）。 */}
         <Row gutter={[spacing.md, spacing.md]}>
-          {groups.map((bucket) => (
+          {allGroups.map((bucket) => (
             <Col key={bucket.key || '__ungrouped__'} span={24}>
               <RepoGroupCard
                 bucket={bucket}
@@ -1291,15 +1433,18 @@ export function RepoList({
   return (
     <PageShell
       title={t(isSuperAdmin ? 'page.repos.title' : 'page.myRepos.title')}
+      subtitle={isSuperAdmin ? t('page.repos.subtitle') : undefined}
       extra={
         <>
-          {/* 展示形式切换已移入内容区第一个分组标题行右侧（只服务用户端，见 RepoViewSwitch）。 */}
-          <Input.Search
-            allowClear
-            placeholder={t('common.search')}
-            style={{ width: 220 }}
-            onChange={(event) => setKeyword(event.target.value)}
-          />
+          {/* 管理端把搜索放进「筛选」模块；用户端的搜索仍是页面级入口（列表形态没有独立筛选区）。 */}
+          {!isSuperAdmin ? (
+            <Input.Search
+              allowClear
+              placeholder={t('common.search')}
+              style={{ width: 220 }}
+              onChange={(event) => setKeyword(event.target.value)}
+            />
+          ) : null}
           <Button onClick={() => void reposQuery.refetch()}>{t('common.refresh')}</Button>
           {/* 导入放在「新建」左边：它是低频的迁移动作，位置上与主操作区分开，
               免得日常建库时手滑点进来。 */}
@@ -1320,7 +1465,7 @@ export function RepoList({
         <GroupMountSettingsModal
           group={settingsGroup}
           // 组内的库：勾选列表默认全选。上传占位条目不是真库，别混进去。
-          repos={entries
+          repos={allEntries
             .filter((entry) => !isPlaceholderRepoId(entry.repo.id))
             .filter((entry) => (entry.repo.group ?? '').trim() === settingsGroup)
             .map((entry) => entry.repo)}
@@ -1329,19 +1474,42 @@ export function RepoList({
         />
       ) : null}
       {isSuperAdmin ? (
-        <DataTable<RepoDTO>
-          columns={columns}
-          rows={entries.map((entry) => entry.repo)}
-          rowKey={(repo) => repo.id}
-          loading={reposQuery.isLoading}
-          empty={
-            <EmptyState
-              title={t('repo.empty')}
-              description={t('repo.empty.desc')}
-              action={{ label: t('common.create'), onClick: onCreate }}
+        <>
+          <SectionCard title={t('common.filters')}>
+            <Space wrap size={spacing.sm}>
+              <Input.Search
+                allowClear
+                value={keyword}
+                placeholder={t('common.search')}
+                style={{ width: 260 }}
+                onChange={(event) => setKeyword(event.target.value)}
+              />
+              <Button onClick={() => setKeyword('')}>{t('common.reset')}</Button>
+            </Space>
+          </SectionCard>
+          <SectionCard
+            title={t('repo.list.title')}
+            extra={
+              <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+                {t('common.total', { total: filteredEntries.length })}
+              </Typography.Text>
+            }
+          >
+            <DataTable<RepoDTO>
+              columns={columns}
+              rows={filteredEntries.map((entry) => entry.repo)}
+              rowKey={(repo) => repo.id}
+              loading={reposQuery.isLoading}
+              empty={
+                <EmptyState
+                  title={t('repo.empty')}
+                  description={t('repo.empty.desc')}
+                  action={{ label: t('common.create'), onClick: onCreate }}
+                />
+              }
             />
-          }
-        />
+          </SectionCard>
+        </>
       ) : (
         renderUserRepos()
       )}

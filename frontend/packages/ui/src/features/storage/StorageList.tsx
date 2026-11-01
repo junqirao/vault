@@ -8,6 +8,7 @@ import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
+import { SectionCard } from '../../components/SectionCard'
 import { useApi } from '../../api/provider'
 import type { StorageDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
@@ -325,6 +326,7 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
   return (
     <PageShell
       title={t('storage.title')}
+      subtitle={t('page.storages.subtitle')}
       extra={
         <>
           {supportsVolumes ? (
@@ -341,26 +343,34 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
       {storagesQuery.error ? <ErrorNotice error={storagesQuery.error} /> : null}
 
       {volumeSummaries.length > 0 ? (
-        <Space size={spacing.md} wrap style={{ marginBottom: spacing.sm }}>
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
-            {t('storage.volumeSummary')}
-          </Typography.Text>
-          {volumeSummaries.map((volume) => (
-            <Typography.Text key={volume.volumeName} style={{ fontSize: fontSize.sm }}>
-              {`${volume.volumeName} · ${formatBytes(volume.freeBytes)} / ${formatBytes(volume.totalBytes)} · ${volume.count}`}
-            </Typography.Text>
-          ))}
-        </Space>
+        <SectionCard title={t('storage.volumeSummary')}>
+          <Space size={spacing.md} wrap>
+            {volumeSummaries.map((volume) => (
+              <Typography.Text key={volume.volumeName} style={{ fontSize: fontSize.sm }}>
+                {`${volume.volumeName} · ${formatBytes(volume.freeBytes)} / ${formatBytes(volume.totalBytes)} · ${volume.count}`}
+              </Typography.Text>
+            ))}
+          </Space>
+        </SectionCard>
       ) : null}
 
-      <DataTable<StorageDTO>
-        columns={columns}
-        rows={storages}
-        rowKey={(storage) => storage.id}
-        loading={storagesQuery.isLoading}
-        empty={<EmptyState title={t('storage.empty')} />}
-        scroll={{ x: 1280 }}
-      />
+      <SectionCard
+        title={t('storage.list.title')}
+        extra={
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+            {t('common.total', { total: storages.length })}
+          </Typography.Text>
+        }
+      >
+        <DataTable<StorageDTO>
+          columns={columns}
+          rows={storages}
+          rowKey={(storage) => storage.id}
+          loading={storagesQuery.isLoading}
+          empty={<EmptyState title={t('storage.empty')} />}
+          scroll={{ x: 1280 }}
+        />
+      </SectionCard>
 
       <Modal
         open={formOpen}

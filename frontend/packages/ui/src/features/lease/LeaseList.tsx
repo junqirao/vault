@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Button } from 'antd'
+import { Button, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -8,10 +8,12 @@ import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
+import { SectionCard } from '../../components/SectionCard'
 import { StatusTag } from '../../components/StatusTag'
 import { useApi } from '../../api/provider'
 import type { LeaseDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
+import { fontSize } from '../../tokens/palette'
 import { formatTime } from '../../utils/format'
 
 export interface LeaseListProps {
@@ -98,18 +100,28 @@ export function LeaseList({ canRevoke }: LeaseListProps): JSX.Element {
   return (
     <PageShell
       title={t('page.leases.title')}
+      subtitle={t('page.leases.subtitle')}
       extra={<Button onClick={() => void leasesQuery.refetch()}>{t('common.refresh')}</Button>}
     >
       {error ? <ErrorNotice error={error} /> : null}
       {leasesQuery.error ? <ErrorNotice error={leasesQuery.error} /> : null}
-      <DataTable<LeaseDTO>
-        columns={columns}
-        rows={leasesQuery.data?.items ?? []}
-        rowKey={(lease) => lease.id}
-        loading={leasesQuery.isLoading}
-        empty={<EmptyState title={t('lease.empty')} />}
-        scroll={{ x: 1000 }}
-      />
+      <SectionCard
+        title={t('lease.list.title')}
+        extra={
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+            {t('common.total', { total: leasesQuery.data?.items.length ?? 0 })}
+          </Typography.Text>
+        }
+      >
+        <DataTable<LeaseDTO>
+          columns={columns}
+          rows={leasesQuery.data?.items ?? []}
+          rowKey={(lease) => lease.id}
+          loading={leasesQuery.isLoading}
+          empty={<EmptyState title={t('lease.empty')} />}
+          scroll={{ x: 1000 }}
+        />
+      </SectionCard>
       <ConfirmDialog
         open={pendingRevoke !== null}
         danger

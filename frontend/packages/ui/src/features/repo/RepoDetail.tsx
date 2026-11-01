@@ -28,6 +28,7 @@ import { RepoMountActions, useRepoMount } from './RepoMount'
 import { RepoGroupSelect } from './RepoGroupSelect'
 import { RepoMountSettingsPanel } from './RepoMountSettings'
 import { diffUsageAsVolume, RepoUsageTooltip, useRepoDiffUsage } from './RepoUsageTip'
+import { RepoPrepareDetail } from './repoPrepareView'
 
 export interface RepoDetailProps {
   repoId: string
@@ -54,7 +55,6 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const agent = useAgent()
   const queryClient = useQueryClient()
   const [error, setError] = useState<unknown>(null)
-  const [editOpen, setEditOpen] = useState(false)
   const [copyOpen, setCopyOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
   // 维护态「清理差异盘」的异步任务：提交后跟踪它的进度，终态再刷新页面数据。
@@ -84,7 +84,13 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
 
   const repoQuery = useQuery({
     queryKey: ['repo', repoId],
-    queryFn: () => api.getRepo(repoId)
+    queryFn: () => api.getRepo(repoId),
+    // 建库/导入是分钟到小时级的长活：SSE 的 prepare_progress 负责实时刷新，
+    // 这里再按 2 秒兜底轮询一次，事件丢失/重连时进度也不会停住。
+    refetchInterval: (current) => {
+      const state = current.state.data?.state
+      return state === 'creating' || state === 'importing' ? 2000 : false
+    }
   })
 
   // 目标存储列表既用于「迁移」弹窗，也用于概览顶部的存储使用情况：
@@ -135,7 +141,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const updateMutation = useMutation({
     mutationFn: (values: UpdateRepoRequest) => api.updateRepo(repoId, values),
     onSuccess: () => {
-      setEditOpen(false)
+      message.success(t('settings.saved'))
       refresh()
     },
     onError: (err) => setError(err)
@@ -277,6 +283,10 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     liveRepoEvent?.action === 'move_started' || liveRepoEvent?.action === 'move_progress'
       ? liveRepoEvent.move
       : undefined
+  // 建库/导入进度同样走 SSE（prepare_progress）：不合并的话，详情页只能等 2 秒轮询，
+  // 而卡片已经在实时动了 —— 同一份快照在两个页面显示不同步。
+  const livePrepare =
+    liveRepoEvent?.action === 'prepare_progress' ? liveRepoEvent.prepare : undefined
   const repoEventAction = liveRepoEvent?.action
   useEffect(() => {
     if (repoEventAction === 'moved' || repoEventAction === 'move_canceled' || repoEventAction === 'state_changed') {
@@ -296,9 +306,26 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [moveJob, moveProgress?.state, t])
 
+  // 常规设置改为设置 tab 里的内联表单：库记录一到（或保存后 updated_at 变化）就重填。
+  // 用 updated_at 做触发条件，后台轮询/SSE 引起的同版本刷新不会覆盖用户正在编辑的内容。
+  const repoUpdatedAt = repoQuery.data?.updated_at
+  useEffect(() => {
+    const data = repoQuery.data
+    if (!data) return
+    editForm.setFieldsValue({
+      name: data.name,
+      group: data.group,
+      max_diff_disks: data.max_diff_disks,
+      note: data.note
+    })
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [repoQuery.data?.id, repoUpdatedAt, editForm])
+
   if (repoQuery.isLoading) return <LoadingState text={t('common.loading')} />
 
   const repo = repoQuery.data
+  // 详情页的建库进度以 SSE 最新快照优先；没有事件时用查询结果。
+  const prepare = livePrepare ?? repo?.prepare
   // 这个库我现在能不能管理：真源是服务端下发的权限等级（manage = 超管 / 库所有者 / 被授予
   // manage 的成员，见 docs/implementation.md 9.3）。老服务端不带这个字段时回退到"超管或库所有者"
   // —— 宁可少展示管理入口，也不能把它摆给只能看的成员：非库所有者点进详情页只能看，
@@ -337,17 +364,6 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     ? diff.loading
     : !isSuperAdmin && repoUsageLoading(agent.usagePending, repo?.id, usageMeasured)
 
-  const openEdit = (target: RepoDTO): void => {
-    editForm.setFieldsValue({
-      name: target.name,
-      group: target.group,
-      max_diff_disks: target.max_diff_disks,
-      note: target.note
-    })
-    setError(null)
-    setEditOpen(true)
-  }
-
   const isMaintenance = repo?.parent_condition === 'maintenance'
   // 概览顶部「存储使用情况」：本库磁盘的实测物理占用 + 所在存储的容量/可用。
   // 用物理占用而不是配额口径（repo.used_bytes 只计已分配磁盘），否则预创建但尚未分配的
@@ -363,7 +379,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const liveProgressState =
     liveRepoEvent?.action === 'move_started' || liveRepoEvent?.action === 'move_progress'
       ? liveRepoEvent.state
-      : undefined
+      : liveRepoEvent?.action === 'prepare_progress'
+        ? liveRepoEvent.state
+        : undefined
   const repoState = liveProgressState ?? repo?.state
   // 刚发起的那一瞬间 repo 快照可能还是 active：以手头的任务状态补上，界面不要有一帧"看起来没反应"。
   const isMoving = repoState === 'moving' || (moveJob !== null && !isJobTerminal(moveProgress?.state))
@@ -400,82 +418,12 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
         </Tooltip>
       }
       extra={
-        <>
-          {/* 与列表卡片同一套"挂载/卸载"联动按钮：进了详情也不必退回列表才能挂载。
-              库记录可能还没查回来（加载中/出错），此时不渲染。 */}
-          {/* read 成员只能看：挂载/卸载后端都不放行，按钮就不摆出来。 */}
-          {repo && repo.permission !== 'read' && !isMoving ? (
-            <RepoDetailMountActions repo={repo} currentUserId={currentUserId} />
-          ) : null}
-          {/* 管理类操作只对能管理这个库的人展示（非库所有者点详情只能看）。 */}
-          {canManage ? (
-            <>
-              <Button onClick={() => repo && openEdit(repo)} disabled={!repo || isMoving}>
-                {t('common.edit')}
-              </Button>
-              {/* 进入 / 退出维护态合成一个按钮：文案与动作按当前母盘条件切换。 */}
-              {repo?.mode === 'shared' ? (
-                <Button
-                  loading={parentMutation.isPending || parentRunning}
-                  disabled={repo.parent_condition === 'temp_shared' || parentRunning || isMoving}
-                  title={repo.parent_condition === 'temp_shared' ? t('repo.maintenance.unshareFirst') : undefined}
-                  onClick={toggleMaintenance}
-                >
-                  {t(isMaintenance ? 'repo.parent.action.finish_maintenance' : 'repo.parent.action.maintenance')}
-                </Button>
-              ) : null}
-              {/* 退出维护/撤销共享是异步任务：进度 + 取消按钮就摆在这里，卡住时不用去别处找。
-                  取消仅超管可用（服务端同样只放行超管）。 */}
-              {parentRunning ? (
-                <Space>
-                  <Progress percent={parentProgress?.progress ?? 0} size="small" style={{ width: 160 }} />
-                  {isSuperAdmin ? (
-                    <Button
-                      size="small"
-                      danger
-                      loading={cancelJobMutation.isPending}
-                      onClick={() => cancelJobMutation.mutate(parentJob!.id)}
-                    >
-                      {t('job.cancel')}
-                    </Button>
-                  ) : null}
-                </Space>
-              ) : null}
-              {repo?.mode === 'shared' && repo?.parent_disk_id ? (
-                <Button onClick={() => setVerifyOpen(true)} disabled={isMoving}>
-                  {t('repo.verifyDiff.button')}
-                </Button>
-              ) : null}
-              <Button
-                disabled={isMoving}
-                onClick={() => {
-                  copyForm.setFieldsValue({ new_repo_name: `${repo?.name ?? 'repo'}-copy` })
-                  setCopyOpen(true)
-                }}
-              >
-                {t('action.copy')}
-              </Button>
-              {/* 迁移放在「复制」之后：两者都是整库级动作，但迁移会移动原库本身。 */}
-              <Button
-                disabled={
-                  !repo ||
-                  repo.state !== 'active' ||
-                  (repo.mode === 'shared' && (repo.parent_condition ?? 'idle') !== 'idle')
-                }
-                onClick={() => {
-                  setMoveStorageID('')
-                  setError(null)
-                  setMoveOpen(true)
-                }}
-              >
-                {t('repo.move.button')}
-              </Button>
-              <Button danger disabled={isMoving} onClick={() => setDeleteOpen(true)}>
-                {t('common.delete')}
-              </Button>
-            </>
-          ) : null}
-        </>
+        // 标题栏只保留最常用的挂载/卸载；其余管理动作统一收进「设置」tab。
+        // 与列表卡片同一套联动按钮：进了详情也不必退回列表才能挂载。
+        // read 成员只能看：挂载/卸载后端都不放行，按钮就不摆出来。
+        repo && repo.permission !== 'read' && !isMoving ? (
+          <RepoDetailMountActions repo={repo} currentUserId={currentUserId} />
+        ) : null
       }
     >
       {error ? <ErrorNotice error={error} /> : null}
@@ -483,6 +431,17 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       {/* 只能看的库（非所有者 / read、mount 成员）说清楚为什么没有管理入口。 */}
       {repo && !canManage ? (
         <Alert type="info" showIcon message={t('repo.detail.readOnly')} style={{ marginBottom: spacing.md }} />
+      ) : null}
+      {/* 建库/从服务端目录导入的明细：字节、速度、预计剩余。列表卡片只放进度条，
+          这里补上"还要多久"——100GB 的导入可能要跑几个小时，没有这行就只剩焦虑。 */}
+      {repo && prepare && (repoState === 'creating' || repoState === 'importing') ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: spacing.md }}
+          message={t('repo.prepare.banner')}
+          description={<RepoPrepareDetail prepare={prepare} />}
+        />
       ) : null}
       {/* 迁移横幅：复制期间库不可用，进度与中止入口都放在这里。 */}
       {isMoving ? (
@@ -582,20 +541,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       ) : null}
 
       <Tabs
-        // 用户端默认落在「设置」：卡片「详情」进来看的就是"这个库在本机怎么挂"。
-        // 管理端没有挂载配置（配置存在本机），保持原来的「概览」默认。
-        defaultActiveKey={isSuperAdmin ? 'overview' : 'settings'}
+        // 「设置」固定在最右：管理动作与挂载配置都收在这里，详情默认先看概览。
+        defaultActiveKey="overview"
         items={[
-          ...(isSuperAdmin
-            ? []
-            : [
-                {
-                  key: 'settings',
-                  label: t('repo.detail.settings'),
-                  // 库记录还没到（加载中/出错）时先占位：不能因为详情没回来就少一个默认 tab。
-                  children: repo ? <RepoMountSettingsPanel repo={repo} /> : <LoadingState />
-                }
-              ]),
           {
             key: 'overview',
             label: t('repo.detail.overview'),
@@ -652,27 +600,6 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
               </SectionCard>
             )
           },
-          // 可管理成员是管理信息：只有能管这个库的人才看得到这一页。
-          ...(canManage
-            ? [
-                {
-                  key: 'members',
-                  label: t('repo.detail.members'),
-                  children: <RepoMembers repoId={repoId} isSuperAdmin={isSuperAdmin} />
-                }
-              ]
-            : []),
-          // 维护态下直接管理母盘文件：服务端本地挂载 + 文件 API（不再挂到客户端）。
-          // 只有**已无差异盘**时才开放：有差异盘时改母盘会让它们基于旧基线。
-          ...(parentFilesReady
-            ? [
-                {
-                  key: 'parentFiles',
-                  label: t('repo.parentFiles.tab'),
-                  children: <RepoParentFiles repoId={repoId} />
-                }
-              ]
-            : []),
           {
             key: 'disks',
             label: t('repo.detail.disks'),
@@ -687,42 +614,160 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                 currentUserName={currentUserName}
               />
             )
+          },
+          // 维护态下直接管理母盘文件：服务端本地挂载 + 文件 API（不再挂到客户端）。
+          // 只有**已无差异盘**时才开放：有差异盘时改母盘会让它们基于旧基线。
+          ...(parentFilesReady
+            ? [
+                {
+                  key: 'parentFiles',
+                  label: t('repo.parentFiles.tab'),
+                  children: <RepoParentFiles repoId={repoId} />
+                }
+              ]
+            : []),
+          {
+            key: 'settings',
+            label: t('repo.detail.settings'),
+            children: repo ? (
+              <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
+                {/* 常规设置：原「编辑」弹窗里的字段直接内联在设置页顶部。 */}
+                {canManage ? (
+                  <SectionCard title={t('repo.settings.basic.title')}>
+                    <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+                      {t('repo.settings.basic.desc')}
+                    </Typography.Paragraph>
+                    <Form form={editForm} layout="vertical" disabled={isMoving}>
+                      <Form.Item name="name" label={t('field.name')} rules={[{ required: true }]}>
+                        <Input maxLength={64} />
+                      </Form.Item>
+                      <Form.Item name="group" label={t('field.group')}>
+                        <RepoGroupSelect />
+                      </Form.Item>
+                      {/* 备注写在母盘旁边的元数据文件里跟着盘走：换服务端把 disks/ 拷过去后，
+                          导入页面就能直接告诉管理员"这是财务的 Win10 母盘，别删"。 */}
+                      <Form.Item name="note" label={t('field.note')}>
+                        <Input.TextArea maxLength={512} rows={2} showCount />
+                      </Form.Item>
+                      <Form.Item name="max_diff_disks" label={t('field.maxDiffDisks')}>
+                        <InputNumber min={0} style={{ width: '100%' }} />
+                      </Form.Item>
+                    </Form>
+                    <Button
+                      type="primary"
+                      loading={updateMutation.isPending}
+                      disabled={isMoving}
+                      onClick={() => {
+                        void editForm.validateFields().then((values) => updateMutation.mutate(values))
+                      }}
+                    >
+                      {t('common.save')}
+                    </Button>
+                  </SectionCard>
+                ) : null}
+
+                {/* 挂载配置：与列表卡片弹窗同一份数据、同一套控件。 */}
+                <RepoMountSettingsPanel repo={repo} description={t('repo.settings.mount.desc')} />
+
+                {canManage && repo.mode === 'shared' ? (
+                  <SectionCard title={t('repo.settings.maintenance.title')}>
+                    <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+                      {t('repo.settings.maintenance.desc')}
+                    </Typography.Paragraph>
+                    <Space wrap>
+                      {/* 进入 / 退出维护态合成一个按钮：文案与动作按当前母盘条件切换。 */}
+                      <Button
+                        loading={parentMutation.isPending || parentRunning}
+                        disabled={repo.parent_condition === 'temp_shared' || parentRunning || isMoving}
+                        title={repo.parent_condition === 'temp_shared' ? t('repo.maintenance.unshareFirst') : undefined}
+                        onClick={toggleMaintenance}
+                      >
+                        {t(isMaintenance ? 'repo.parent.action.finish_maintenance' : 'repo.parent.action.maintenance')}
+                      </Button>
+                      {repo.parent_disk_id ? (
+                        <Button onClick={() => setVerifyOpen(true)} disabled={isMoving}>
+                          {t('repo.verifyDiff.button')}
+                        </Button>
+                      ) : null}
+                    </Space>
+                    {/* 退出维护/撤销共享是异步任务：进度 + 取消按钮跟着模块走，卡住时不用去别处找。 */}
+                    {parentRunning ? (
+                      <Space wrap style={{ marginTop: spacing.sm }}>
+                        <Progress percent={parentProgress?.progress ?? 0} size="small" style={{ width: 160 }} />
+                        {isSuperAdmin ? (
+                          <Button
+                            size="small"
+                            danger
+                            loading={cancelJobMutation.isPending}
+                            onClick={() => cancelJobMutation.mutate(parentJob!.id)}
+                          >
+                            {t('job.cancel')}
+                          </Button>
+                        ) : null}
+                      </Space>
+                    ) : null}
+                  </SectionCard>
+                ) : null}
+
+                {canManage ? (
+                  <SectionCard title={t('repo.settings.copyMove.title')}>
+                    <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+                      {t('repo.settings.copyMove.desc')}
+                    </Typography.Paragraph>
+                    <Space wrap>
+                      <Button
+                        disabled={isMoving}
+                        onClick={() => {
+                          copyForm.setFieldsValue({ new_repo_name: `${repo.name}-copy` })
+                          setCopyOpen(true)
+                        }}
+                      >
+                        {t('action.copy')}
+                      </Button>
+                      {/* 迁移会移动原库本身，与复制同属整库级动作，放在同一模块里。 */}
+                      <Button
+                        disabled={
+                          repo.state !== 'active' ||
+                          (repo.mode === 'shared' && (repo.parent_condition ?? 'idle') !== 'idle')
+                        }
+                        onClick={() => {
+                          setMoveStorageID('')
+                          setError(null)
+                          setMoveOpen(true)
+                        }}
+                      >
+                        {t('repo.move.button')}
+                      </Button>
+                    </Space>
+                  </SectionCard>
+                ) : null}
+
+                {canManage ? (
+                  <SectionCard title={t('repo.settings.danger.title')}>
+                    <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+                      {t('repo.settings.danger.desc')}
+                    </Typography.Paragraph>
+                    <Button danger disabled={isMoving} onClick={() => setDeleteOpen(true)}>
+                      {t('common.delete')}
+                    </Button>
+                  </SectionCard>
+                ) : null}
+
+                {/* 成员管理放在设置最底下：它是权限配置，不是日常常用的操作。 */}
+                {canManage ? (
+                  <RepoMembers
+                    repoId={repoId}
+                    isSuperAdmin={isSuperAdmin}
+                    description={t('repo.settings.members.desc')}
+                  />
+                ) : null}
+              </Space>
+            ) : (
+              <LoadingState />
+            )
           }
         ]}
       />
-
-      <Modal
-        open={editOpen}
-        title={t('repo.edit.title')}
-        width={520}
-        centered
-        okText={t('common.save')}
-        cancelText={t('common.cancel')}
-        confirmLoading={updateMutation.isPending}
-        onCancel={() => setEditOpen(false)}
-        onOk={() => {
-          void editForm.validateFields().then((values) => {
-            updateMutation.mutate(values)
-          })
-        }}
-      >
-        <Form form={editForm} layout="vertical">
-          <Form.Item name="name" label={t('field.name')} rules={[{ required: true }]}>
-            <Input maxLength={64} />
-          </Form.Item>
-          <Form.Item name="group" label={t('field.group')}>
-            <RepoGroupSelect />
-          </Form.Item>
-          {/* 备注写在母盘旁边的元数据文件里跟着盘走：换服务端把 disks/ 拷过去后，
-              导入页面就能直接告诉管理员"这是财务的 Win10 母盘，别删"。 */}
-          <Form.Item name="note" label={t('field.note')}>
-            <Input.TextArea maxLength={512} rows={2} showCount />
-          </Form.Item>
-          <Form.Item name="max_diff_disks" label={t('field.maxDiffDisks')}>
-            <InputNumber min={0} style={{ width: '100%' }} />
-          </Form.Item>
-        </Form>
-      </Modal>
 
       <Modal
         open={copyOpen}

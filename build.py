@@ -86,8 +86,10 @@ CLIENT_PKG_JSON = CLIENT_APP_DIR / "package.json"
 GO_TARGETS = [
     ("Vault-Server.exe", "./cmd/vault-server", False),
     ("Vault-Agent.exe", "./cmd/vault-agent", True),
-    # 客户端本体更新的独立切换器（随客户端程序目录分发，见 electron-builder.yml 的 extraFiles）。
-    ("Vault-Updator.exe", "./cmd/vault-updator", False),
+    # 客户端版本更新的独立入口（随客户端程序目录分发，见 electron-builder.yml 的 extraFiles）。
+    # 它现在自己完成"检查 → 验签 → 下载 → 解压 → 激活"，因此**必须注入发布方公钥**：
+    # 否则启动期更新器永远用开发公钥验签失败，自动更新会静默失效。
+    ("Vault-Updator.exe", "./cmd/vault-updator", True),
 ]
 
 # Linux 服务端的交叉编译产物名（无 .exe 后缀）。
@@ -98,6 +100,12 @@ LINUX_SERVER_TARGET = "vault-server-linux-amd64"
 
 # 决定"客户端版本是否变化"的源码范围。
 # 只覆盖会影响 Vault-Agent 行为与其依赖的路径 —— 服务端专属改动不应触发客户端版本递增。
+# 客户端自带的两个后台程序必须以 **GUI 子系统**链接：它们是控制台程序的话，双击/被
+# Electron 拉起时 Windows 会先创建控制台窗口，再等 Go 代码去隐藏——用户能看到黑窗口一闪。
+# Vault-Agent 的 AGENT_READY 与更新器的 JSON Lines 都走 Electron 建立的管道，GUI 子系统
+# 仍能正常写入（已实测）；换成 GUI 后彻底没有控制台窗口。
+GUI_SUBSYSTEM_TARGETS = {"Vault-Agent.exe", "Vault-Updator.exe"}
+
 CLIENT_SOURCE_PATHS = [
     "frontend",
     "internal/agent",
@@ -781,6 +789,8 @@ def build_go(version: str, public_key: str | None, args, prebuilt: set[str] | No
         if needs_pubkey and not public_key:
             die(f"{out_name} 需要注入发布方公钥，但公钥不可用")
         ldflags = _ldflags(version, commit, build_time, public_key if needs_pubkey else None)
+        if out_name in GUI_SUBSYSTEM_TARGETS:
+            ldflags += " -H=windowsgui"
 
         run([
             go, "build", "-trimpath",
@@ -844,7 +854,7 @@ def _electron_env() -> dict[str, str]:
 _client_app_dir: Path | None = None
 
 
-REQUIRED_APP_FILES = ("Vault.exe", "resources/app.asar", "icudtl.dat")
+REQUIRED_APP_FILES = ("Vault.exe", "resources/app.asar", "icudtl.dat", "Vault-Agent.exe", "Vault-Updator.exe")
 
 # 程序目录里的最小文件数。
 #
@@ -1025,18 +1035,19 @@ def build_client_app(args) -> Path | None:
     #
     # updator 缺失不阻断打包：客户端会退回"请求代理拉起切换器副本"的兜底路径（功能等价），
     # 只是排障时在客户端目录里看不到独立进程，所以这里明确告警。
-    for name, hint in (
-        ("Vault-Agent.exe", "客户端会因找不到本地代理而进入降级模式"),
-        ("Vault-Updator.exe", "本体更新将退回代理侧切换器（可用，但客户端里没有独立 updator）"),
-    ):
+    for name in ("Vault-Agent.exe", "Vault-Updator.exe"):
         src = DIST_DIR / name
-        if src.is_file():
-            staged = CLIENT_APP_DIR / "build" / name
-            staged.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, staged)
-            info(f"已暂存 {name} → {staged.relative_to(ROOT)}")
-        else:
-            warn(f"未找到 dist/{name}：{hint}")
+        if not src.is_file():
+            # 这两个文件都是客户端程序目录的**必备件**：
+            #   - Vault-Agent.exe 缺失 → 本地服务永远起不来；
+            #   - Vault-Updator.exe 缺失 → 下一次无法在启动前完成整包更新。
+            # 与其产出一个人畜无害但会永久卡在旧版本的客户端包，不如直接失败。
+            fail(f"未找到 dist/{name}，无法打包客户端（先完成 Go 构建）")
+            return None
+        staged = CLIENT_APP_DIR / "build" / name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, staged)
+        info(f"已暂存 {name} → {staged.relative_to(ROOT)}")
 
     proc = run([pnpm, "--filter", "@vault/client", "run", "package"],
                cwd=FRONTEND_DIR, capture=False, check=False,
@@ -1092,9 +1103,10 @@ def build_client_artifact(version: str) -> Path | None:
 
     与 client_web 的分工：
       - client_web 只替换渲染层资源，不重启进程；
-      - client 是整份程序目录（Vault.exe + resources/app.asar + Chromium 运行时），
-        代理下载校验后解压到 %ProgramData%\\Vault\\client\\<版本>\\，
-        由客户端主进程在下一次启动时切换（见 internal/agent/updateclient.go）。
+      - client 是整份程序目录（Vault.exe + resources/app.asar + Vault-Agent.exe +
+        Vault-Updator.exe + Chromium 运行时）。启动期更新器下载校验后解压到
+        %ProgramData%\\Vault\\client\\<版本>\\ 并重启整个应用（见
+        internal/agent/bootstrap.go）。前后端来自同一个已签名包，不允许分开更新。
 
     内容**平铺**（不加顶层目录）：解压后即为程序目录，Vault.exe 直接位于根。
     产物命名 Vault-Client-<version>.zip（符合 updatepkg 的产物名白名单 [A-Za-z0-9._-]）。
@@ -1117,6 +1129,9 @@ def build_client_artifact(version: str) -> Path | None:
         for path in sorted(app_dir.rglob("*")):
             if path.is_file():
                 zf.write(path, path.relative_to(app_dir).as_posix())
+        # VERSION 是**包内容与清单版本一致**的最后一道防线：启动期更新器解压后会读它，
+        # 与已验签清单里的 version 不一致就拒绝激活（防止"包名新、内容旧"）。
+        zf.writestr("VERSION", version + "\n")
     ok(f"客户端程序目录包：{out.name}（{out.stat().st_size:,} 字节）")
     return out
 

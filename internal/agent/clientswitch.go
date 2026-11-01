@@ -57,7 +57,7 @@ const (
 	// Electron 的单实例锁与 asar 文件句柄由内核在进程退出时释放，但 Windows 上句柄回收
 	// 偶尔滞后几十到几百毫秒。抢跑的话新进程会拿不到锁，进而走 takeover/blocked 分支
 	// ——那正是"没有更新"与"闪屏"的来源。留出这段稳定期比任何重试都可靠。
-	clientSwitchSettleDelay = 800 * time.Millisecond
+	clientSwitchSettleDelay = 1500 * time.Millisecond
 )
 
 // ClientSwitchOptions 是 client-switch 子命令的入参。
@@ -159,7 +159,11 @@ func startClientExe(exe, version string, extraEnv ...string) error {
 	cmd.Stdin = nil
 	cmd.Stdout = nil
 	cmd.Stderr = nil
-	env := append(os.Environ(), "VAULT_CLIENT_HANDOFF=1")
+	env := append(os.Environ(), "VAULT_CLIENT_HANDOFF=1",
+		// 更新器已经完成"检查 → 验签 → 解压 → 激活"，新进程启动时不要再自己检查一遍：
+		// 否则切过去的新版可能又立刻发起一次更新并退出，和正在等待它加载的旧更新器
+		// 互相干扰（两个版本同时启动、回退误判）。下一次用户启动时仍会正常检查。
+		"VAULT_CLIENT_SKIP_UPDATE=1")
 	if strings.TrimSpace(version) != "" {
 		env = append(env, "VAULT_CLIENT_UPDATED_TO="+strings.TrimSpace(version))
 	}

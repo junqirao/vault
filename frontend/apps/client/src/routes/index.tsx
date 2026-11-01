@@ -2,18 +2,17 @@ import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 're
 
 import {
   AboutPage,
-  AuditList,
   ClientSettings,
   DiskImport,
   EmptyState,
   JobList,
-  LeaseList,
   LogViewer,
   MyRepos,
   PageShell,
   RepoCreateForm,
   RepoDetail,
   RepoList,
+  ServerLogsPage,
   StorageCreateForm,
   StorageList,
   StorageUsagePage,
@@ -33,7 +32,6 @@ import { useAppStore } from '../store/appStore'
 export interface AppRoutesProps {
   language: Language
   onLanguageChange: (language: Language) => void
-  onManageServers: () => void
 }
 
 /** 阻止非超级管理员访问管理模块（整棵 /admin/* 子树统一包裹）。 */
@@ -117,7 +115,7 @@ function NotFoundRoute(): JSX.Element {
 }
 
 /** 路由表：应用端与管理端各自独立的外壳与菜单，互不混用。 */
-export function AppRoutes({ language, onLanguageChange, onManageServers }: AppRoutesProps): JSX.Element {
+export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.Element {
   const navigate = useNavigate()
   const { isSuperAdmin } = useAuth()
 
@@ -130,7 +128,6 @@ export function AppRoutes({ language, onLanguageChange, onManageServers }: AppRo
             mode="app"
             language={language}
             onLanguageChange={onLanguageChange}
-            onManageServers={onManageServers}
           />
         }
       >
@@ -188,7 +185,6 @@ export function AppRoutes({ language, onLanguageChange, onManageServers }: AppRo
               mode="admin"
               language={language}
               onLanguageChange={onLanguageChange}
-              onManageServers={onManageServers}
             />
           </RequireSuperAdmin>
         }
@@ -223,7 +219,8 @@ export function AppRoutes({ language, onLanguageChange, onManageServers }: AppRo
             />
           }
         />
-        <Route path="leases" element={<LeaseList canRevoke />} />
+        {/* 在线租约页已并入用户管理（每个用户的「查看租约」弹窗）；保留旧路径重定向。 */}
+        <Route path="leases" element={<Navigate to="/admin/users" replace />} />
         <Route path="storages" element={<StorageList onCreate={() => navigate('/admin/storages/new')} />} />
         <Route
           path="storages/new"
@@ -237,10 +234,11 @@ export function AppRoutes({ language, onLanguageChange, onManageServers }: AppRo
           }
         />
         <Route path="jobs" element={<JobList />} />
-        <Route path="audit" element={<AuditList />} />
-        {/* 管理端看的是**服务端**日志（GET /v1/system/logs，仅超管）；
+        {/* 审计日志已并入「服务日志」Tabs；保留旧路径重定向，避免书签/历史链接 404。 */}
+        <Route path="audit" element={<Navigate to="/admin/logs" replace />} />
+        {/* 管理端看的是**服务端**日志与审计日志（合并页内按 Tab 区分）；
             客户端自己的代理日志在应用端 /logs，两者不是一回事。 */}
-        <Route path="logs" element={<LogViewer source="server" />} />
+        <Route path="logs" element={<ServerLogsPage />} />
         <Route path="system" element={<SystemSettings isSuperAdmin={isSuperAdmin} />} />
         {/* 管理端同一份内容、同一个页面组件：版本/许可与登录角色无关（见 AppLayout 管理端菜单）。 */}
         <Route path="about" element={<AboutPage clientVersion={CLIENT_VERSION} />} />

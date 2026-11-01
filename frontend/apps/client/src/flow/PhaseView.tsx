@@ -223,7 +223,6 @@ export function PhaseView({
     <AppRoutes
       language={language}
       onLanguageChange={onLanguageChange}
-      onManageServers={() => setConfiguring(true)}
     />
   )
 }

@@ -6,15 +6,12 @@ import { BrowserWindow, Menu, Tray, app, dialog, ipcMain, nativeImage, shell } f
 import { AgentManager, listProcesses, runPowerShell, type AgentRequestOptions, type NamedProcess } from './agent'
 import { syncAutoStart } from './autostart'
 import {
-  awaitStartupClientUpdate,
+  awaitStartupBootstrap,
   logClientUpdate,
-  maybeHandoffOnStartup,
-  setHiddenStartProbe,
-  startClientUpdateWatch,
-  type ClientUpdateWatch,
+  type StartupUpdateOutcome,
   type StartupUpdateStatus
 } from './clientUpdate'
-import { resolveBundledVersion, resolveWebappEntry } from './webapp'
+import { agentDataDir, resolveBundledVersion, resolveWebappEntry } from './webapp'
 
 /**
  * Electron 主进程。
@@ -73,6 +70,15 @@ const QUIT_UNMOUNT_WAIT_MS = 8000
  */
 const CLIENT_HIDDEN_ENV = 'VAULT_CLIENT_HIDDEN'
 
+/**
+ * 由更新器设置的"本次启动不要再检查更新"标记。
+ *
+ * 更新器刚完成检查/解压并启动新版本；新版本如果立刻又检查一次，可能与仍在等待它加载的
+ * 旧更新器互相干扰（新版退出 → 旧更新器误判失败 → 回退旧版本，同时另一个更新器又拉起
+ * 新版）。下一次用户正常启动时没有这个变量，会照常检查。
+ */
+const SKIP_UPDATE_ENV = 'VAULT_CLIENT_SKIP_UPDATE'
+
 /** 自启项在命令行上传入的参数（与 autostart.ts 的 AUTOSTART_HIDDEN_ARG 一致）。 */
 const CLIENT_HIDDEN_ARG = '--hidden'
 
@@ -105,8 +111,16 @@ let startHidden = !DEV_SERVER_URL && wantsHiddenStart(process.argv, process.env)
 // 它们再拉起客户端（切换器 / 代理侧切换器）时不至于把这个语义弄丢。只写不删：值为 '1' 才是
 // 隐藏，其余一律显示，残留的 '0' 无害。
 if (startHidden) process.env[CLIENT_HIDDEN_ENV] = '1'
-/** 客户端本体更新的运行期守护（见 clientUpdate.ts）；退出时停掉，避免往回连。 */
-let clientUpdateWatch: ClientUpdateWatch | null = null
+
+/**
+ * 本次启动是否由更新器刚刚拉起。
+ *
+ * 为 true 时：跳过重复的更新检查，并**强制加载随包内置的渲染层**（不采用 %ProgramData%
+ * 下的热更层）。更新器已经用整包保证前后端一致，这里再叠加一层历史热更资源只会让
+ * "界面版本"与"程序目录版本"重新分叉。
+ */
+const launchedByUpdater = process.env[SKIP_UPDATE_ENV] === '1'
+if (launchedByUpdater) delete process.env[SKIP_UPDATE_ENV]
 /**
  * 是否正在切换渲染层。
  *
@@ -151,27 +165,28 @@ let pendingLayerVersion = ''
 let layerReadyTimer: ReturnType<typeof setTimeout> | null = null
 
 /**
- * 最近一次整包更新请求的时间（毫秒）；代理重启就绪后据此重新加载界面。
- *
- * 用时间戳而不是布尔：代理替换 exe 时会**先退出再重启**，请求本身可能因连接中断而
- * 拿不到响应；只要窗口期内看到代理重新可用，就认为更新已完成并刷新界面。
- */
-let updateAppliedAt = 0
-/** 整包更新请求到界面重载之间认账的窗口：超出这个时间就不再把代理重启当成更新完成。 */
-const UPDATE_RELOAD_WINDOW_MS = 10 * 60 * 1000
-/** "代理就绪后补查客户端本体更新"的节流间隔（代理可能反复重启，别每次都读盘）。 */
-const CLIENT_HANDOFF_RECHECK_MS = 60 * 1000
-/**
  * 启动期更新门是否已经跑过。
  *
  * 只在**首次建窗**时等更新：窗口关掉再从托盘打开、或热更重载界面时都不该再让用户等一次。
  */
 let startupUpdateGateDone = false
-/** 启动期更新门是否正在等待（期间不让 onChanged 的补查抢着切换，避免重复拉起）。 */
-let startupUpdateGateRunning = false
 
 /** 本地代理守护器（单例）。 */
 const agent = new AgentManager()
+/**
+ * 是否已经拉起过本地代理。
+ *
+ * createWindow 可能在"关窗到托盘 → 再打开"时被再次调用；AgentManager.start() 不是幂等的
+ * （会再 spawn 一个进程，和现有代理抢 Global\VaultAgent）。因此只允许真正的首次启动拉起。
+ */
+let agentStarted = false
+
+/** 拉起本地代理（仅首次生效）。 */
+function ensureAgentStarted(): void {
+  if (agentStarted) return
+  agentStarted = true
+  agent.start()
+}
 
 /**
  * 版本变化时清理渲染进程缓存。
@@ -429,6 +444,59 @@ async function syncAutoStartFromAgent(): Promise<void> {
   console.warn('[vault] 代理未就绪，跳过开机自启校准（保持系统现有登记不变）')
 }
 
+/**
+ * 把桌面 / 开始菜单 / 任务栏里指向旧版 Vault.exe 的快捷方式改到**当前版本**。
+ *
+ * 为什么必须做：整包更新会把程序换到 `%ProgramData%\Vault\client\<版本>\`，但用户桌面上的
+ * `Vault.lnk` 仍指向最初的 `C:\Program Files\vault-client\Vault.exe`。用户每次从旧快捷方式
+ * 启动，都要先跑旧版本、再由更新器切到新版本 —— 表现就是"每次打开都闪几下才到新版本"
+ * （真实反馈）。这里一次性把快捷方式校准到当前 exe，之后启动直达最新版。
+ *
+ * 只改**文件名是 Vault.exe、且路径看起来属于本客户端**的快捷方式，避免误改同名的其它程序。
+ */
+async function repairClientShortcuts(): Promise<void> {
+  if (process.platform !== 'win32') return
+  const currentExe = app.getPath('exe')
+  const currentDir = path.dirname(currentExe)
+  const psLiteral = (value: string): string => `'${value.replace(/'/g, "''")}'`
+  const script = [
+    `$ErrorActionPreference='SilentlyContinue'`,
+    `$current=${psLiteral(currentExe)}`,
+    `$cwd=${psLiteral(currentDir)}`,
+    `$roots=@([Environment]::GetFolderPath('Desktop'),[Environment]::GetFolderPath('CommonDesktopDirectory'),(Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs'),(Join-Path $env:ProgramData 'Microsoft\\Windows\\Start Menu\\Programs'),(Join-Path $env:APPDATA 'Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar'))`,
+    `$roots=$roots | Where-Object { $_ -and (Test-Path -LiteralPath $_) }`,
+    `$sh=New-Object -ComObject WScript.Shell`,
+    `$n=0`,
+    `foreach($root in $roots){`,
+    `  Get-ChildItem -LiteralPath $root -Filter *.lnk -Recurse -ErrorAction SilentlyContinue | ForEach-Object {`,
+    `    try {`,
+    `      $l=$sh.CreateShortcut($_.FullName)`,
+    `      $t=[string]$l.TargetPath`,
+    `      if([string]::IsNullOrWhiteSpace($t)){ return }`,
+    `      if([IO.Path]::GetFileName($t) -ne 'Vault.exe'){ return }`,
+    `      if([string]::Equals($t,$current,[StringComparison]::OrdinalIgnoreCase)){ return }`,
+    `      $lower=$t.ToLowerInvariant()`,
+    `      $prod=''`,
+    `      try { $prod=[string](Get-Item -LiteralPath $t -ErrorAction SilentlyContinue).VersionInfo.ProductName } catch { }`,
+    `      if(-not (($prod -eq 'Vault') -or $lower.Contains('vault-client') -or $lower.Contains('\\vault\\client\\'))){ return }`,
+    `      $l.TargetPath=$current; $l.WorkingDirectory=$cwd; $l.Save(); $n++`,
+    `    } catch { return }`,
+    `  }`,
+    `}`,
+    `$n`
+  ].join('; ')
+  try {
+    const out = (await runPowerShell(script, 20000)).trim()
+    const updated = Number.parseInt(out, 10)
+    if (Number.isFinite(updated) && updated > 0) {
+      console.info(`[vault] 已校准 ${updated} 个客户端快捷方式 → ${currentExe}`)
+    }
+  } catch (error) {
+    // 快捷方式修不修不影响本次运行：下一次启动还会再试。
+    console.warn(`[vault] 校准客户端快捷方式失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
+
 /** 过渡页支持的语言（与 @vault/ui 的 Language 一致）。 */
 const LOADING_LANGUAGES = ['zh-CN', 'en-US', 'ja-JP', 'ko-KR'] as const
 
@@ -465,6 +533,27 @@ async function showLayerLoading(): Promise<void> {
 }
 
 /**
+ * 通知更新器"新版本界面已经加载完成"。
+ *
+ * 更新器启动新版本后会等这份凭据：只看到进程存活不够（可能起来了但白屏），
+ * 没有凭据就回退旧版本（见 internal/agent/bootstrap.go 的 waitForBootOK）。
+ */
+async function markBootOK(version: string): Promise<void> {
+  try {
+    const dir = path.join(agentDataDir(), 'update')
+    await fs.mkdir(dir, { recursive: true })
+    await fs.writeFile(
+      path.join(dir, 'boot-ok.json'),
+      JSON.stringify({ version, at: Date.now() }),
+      'utf8'
+    )
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    console.warn(`[vault] 写入启动成功凭据失败（不影响本进程）：${reason}`)
+  }
+}
+
+/**
  * 把启动期更新进度写到全屏过渡页上。
  *
  * 文案表在 `public/loading.html` 的 BOOT 里（按语言取）：主进程只传状态 key 与百分比，
@@ -493,14 +582,7 @@ function registerIpc(): void {
   ipcMain.handle('vault:agent-request', async (_event, options: unknown) => {
     const parsed = parseAgentRequest(options)
     if (!parsed) return { status: 0, error: 'network', message: 'invalid_request' }
-    const isUpdateApply = parsed.path.startsWith('/agent/update/apply')
     const result = await agent.request(parsed)
-    // 没受理成功就不算更新（例如没有可用产物）：别让下一次无关的代理重启误触发刷新。
-    if (isUpdateApply && (result.status < 200 || result.status >= 300)) {
-      updateAppliedAt = 0
-    } else if (isUpdateApply) {
-      updateAppliedAt = Date.now()
-    }
     // 开机自启开关存在代理配置里，系统自启项由主进程维护：配置一写入就立刻对齐，
     // 用户拨完开关不必等下次启动才生效。
     if (parsed.method === 'PATCH' && parsed.path === '/agent/config' && result.status === 200) {
@@ -670,9 +752,6 @@ function broadcastAgentInfo(): void {
 async function quitGracefully(): Promise<void> {
   if (quittingStarted) return
   quittingStarted = true
-  // 退出期间不再检查本体更新：更新切换器是直接 app.exit 的，会把这里的卸载等待一刀切断。
-  clientUpdateWatch?.stop()
-  clientUpdateWatch = null
   try {
     // 先隐藏：用户看不到窗口被拆掉，也就没有"退出得慢"的观感。
     mainWindow?.hide()
@@ -836,6 +915,9 @@ async function createWindow(): Promise<void> {
   })
 
   if (DEV_SERVER_URL) {
+    // 开发态没有打包目录里的独立更新器，也不应该在每次热重载时检查更新；
+    // 但本地服务仍要起来（界面所有功能都依赖它）。
+    ensureAgentStarted()
     await mainWindow.loadURL(DEV_SERVER_URL)
     return
   }
@@ -852,14 +934,19 @@ async function createWindow(): Promise<void> {
    * 新进程接管后本进程会被结束，所以这里**不要**再加载界面：停在过渡页即可，避免
    * 闪一下旧界面再被关掉。
    */
+  if (!startupUpdateGateDone && launchedByUpdater) {
+    startupUpdateGateDone = true
+    // 这次是更新器刚拉起的新版本：它已经确认过没有更新，直接进界面。
+    logClientUpdate('本次启动由更新器接管，跳过重复的启动期更新检查')
+  }
+
   if (!startupUpdateGateDone) {
     startupUpdateGateDone = true
-    startupUpdateGateRunning = true
     await showLayerLoading()
     setBootStatus('checking')
-    let outcome: string = 'failed'
+    let outcome: StartupUpdateOutcome = 'none'
     try {
-      outcome = await awaitStartupClientUpdate(agent, bundledVersion, {
+      outcome = await awaitStartupBootstrap(bundledVersion, {
         onStatus: setBootStatus,
         onSwitching: handleSwitching
       })
@@ -867,20 +954,25 @@ async function createWindow(): Promise<void> {
       // 更新门本身出问题绝不能把用户锁在启动页上：记日志，照常进界面。
       const reason = error instanceof Error ? error.message : String(error)
       logClientUpdate(`启动期更新门异常，直接进入界面：${reason}`)
-    } finally {
-      startupUpdateGateRunning = false
     }
     if (outcome === 'switched') {
       // 正常路径下 onSwitching 里已经 app.exit 了，走不到这里；保留是为了兜底
       // （onSwitching 未生效时，也要把"隐窗 → 停代理 → 退出"补完，不能停在过渡页不动）。
-      logClientUpdate('启动期已发起本体更新切换，等待切换器启动新版本')
+      logClientUpdate('启动期已发起版本更新切换，等待更新器启动新版本')
       await handleSwitching()
       return
     }
-    logClientUpdate(`启动期更新门结束（${outcome}），继续加载界面`)
+    logClientUpdate(`启动期更新门结束（${outcome}），启动本地服务并加载界面`)
   }
 
+  // ★ 顺序契约：**本地服务必须晚于更新检查**。
+  // 更新器此时已经确认"没有可安装的版本"（或不可用），当前程序目录就是最终版本；
+  // 从这里开始启动 Vault-Agent，前端与本地服务必然同版本，不会再出现更新中途的版本错位。
+  ensureAgentStarted()
   await loadRendererLayer()
+  // 界面已成功加载：告诉（可能还在等待的）更新器"新版本真的起来了"。
+  // 正常手动启动时没有更新器在等，这份凭据只是覆盖写入，无害。
+  await markBootOK(bundledVersion)
 }
 
 /**
@@ -893,6 +985,14 @@ async function createWindow(): Promise<void> {
  */
 async function loadRendererLayer(): Promise<void> {
   if (!mainWindow) return
+  if (launchedByUpdater) {
+    // 刚完成整包更新：以随包内置的界面为准，忽略之前遗留的渲染层热更资源。
+    await mainWindow.loadFile(BUNDLED_RENDERER)
+    loadedRendererFile = BUNDLED_RENDERER
+    loadedLayerActivatedAt = 0
+    console.info(`[vault] 更新后加载内置渲染层（版本 ${bundledVersion}）`)
+    return
+  }
   badLayerVersion = await readBadLayerVersion()
   const entry = await resolveWebappEntry(bundledVersion)
   if (entry.ok && entry.version !== badLayerVersion) {
@@ -1209,9 +1309,6 @@ function startPrimaryInstance(): void {
     if (wantsHiddenStart(argv, {})) return
     showWindow()
   })
-  // 让本体更新切换器知道"这次是不是后台启动"（见 clientUpdate.ts 的 launchUpdator）。
-  setHiddenStartProbe(() => startHidden)
-
   app.whenReady().then(async () => {
     // 应用自带完整 UI，不需要 Electron 默认的 File/Edit/View/Window/Help 菜单栏。
     // 托盘菜单（createTray）是独立对象，不受影响。
@@ -1229,50 +1326,21 @@ function startPrimaryInstance(): void {
     // 那样才能在"全屏启动页上等更新装完"，而不是让界面先跑起来、再被更新重启掉。
     bundledVersion = await resolveBundledVersion(app.getAppPath(), app.getVersion())
     registerIpc()
-    /** 上一次"代理就绪后补查本体更新"的时间（节流用）。 */
-    let lastHandoffCheckAt = 0
-    agent.onChanged((info) => {
-      broadcastAgentInfo()
-      // 整包更新后代理会以新版本重新起来：此时重新加载界面（会重新解析热更层），
-      // 让前端与代理都回到同一版本，用户不需要手动重启。
-      if (info.available && updateAppliedAt > 0 && Date.now() - updateAppliedAt < UPDATE_RELOAD_WINDOW_MS) {
-        updateAppliedAt = 0
-        console.info('[vault] 代理已更新并就绪，重新加载界面')
-        // loadRendererLayer 内部在加载热更层前会先盖过渡页，这里直接调用即可。
-        void loadRendererLayer()
-      }
-      // 代理就绪后补一次本体切换检查。
-      //
-      // 启动那一刻 current.json 往往还不存在（代理正在后台下载/解压新本体），
-      // 只靠 whenReady 里那一次检查会永远错过；运行期的 watch 又是异步的，
-      // 一旦它的轮询链被代理重启打断，包就绪后也再没人切换。
-      // 这里以"代理可用"为信号补一次，代价只有一次本地文件读。
-      if (
-        !startupUpdateGateRunning &&
-        info.available &&
-        Date.now() - lastHandoffCheckAt > CLIENT_HANDOFF_RECHECK_MS
-      ) {
-        lastHandoffCheckAt = Date.now()
-        void maybeHandoffOnStartup(agent, bundledVersion, { onSwitching: handleSwitching })
-        // 代理刚就绪/刚重连成功：这是"能不能更新"答案发生变化的时刻，立刻补一轮
-        // 请求准备，不要等 watch 的退避定时器（那会让更新看起来根本没开始）。
-        clientUpdateWatch?.nudge()
-      }
-    })
-    // 代理必须先于窗口起来：启动期更新门要向它确认"有没有新版本、能不能装"，
-    // 而那道门在 createWindow 里、加载界面之前。找不到可执行文件时进入降级模式，不影响窗口。
-    agent.start()
+    // ★ 本地代理**不在**这里启动：它必须等 createWindow 里的启动期更新门确认
+    // "没有可安装的新版本"之后才启动（见 createWindow 末尾）。这是版本更新与本地服务
+    // 解耦的关键——更新过程中不会有旧代理占着 Global\VaultAgent，也不会有旧代理被误认成
+    // 新版本的一部分。
+    agent.onChanged(() => broadcastAgentInfo())
     // 托盘先于窗口创建：自启那一次是**隐藏**启动的（见 startHidden），而启动期更新门可能
     // 让 createWindow 停留数秒 —— 托盘图标这时是用户唯一能看到的"客户端已经起来了"。
     createTray()
     await createWindow()
-    // 客户端本体更新：请求代理准备新版本（下载/校验/解压），就绪且无活跃挂载时切换。
-    // 有挂载时绝不重启——重启会掐断 iSCSI 会话（见 docs/implementation.md §7.4.4）。
-    clientUpdateWatch = startClientUpdateWatch(agent, bundledVersion, {
-      onSwitching: handleSwitching
-    })
+    if (quitting) return
+    // 把用户桌面/开始菜单/任务栏里指向旧目录的快捷方式校准到当前版本：
+    // 否则用户每次从旧快捷方式启动，都要先跑旧版再切换（表现为"闪几下"）。
+    void repairClientShortcuts()
     // 开机自启：等代理就绪后把系统自启项对齐到配置里的开关。这一步同时负责修复
-    // "本体更新换了程序目录，自启项还指着已清理的旧 exe"（见 autostart.ts 的文件头）。
+    // "版本更新换了程序目录，自启项还指着已清理的旧 exe"（见 autostart.ts 的文件头）。
     void syncAutoStartFromAgent()
     app.on('activate', () => showWindow())
   })
@@ -1293,8 +1361,6 @@ function startPrimaryInstance(): void {
 
   // 应用退出时停止守护，避免代理成为孤儿进程。
   app.on('will-quit', () => {
-    clientUpdateWatch?.stop()
-    clientUpdateWatch = null
     agent.stop()
   })
 }

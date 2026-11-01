@@ -489,6 +489,19 @@ func (r *Router) handleListRepoDisks(w http.ResponseWriter, req *http.Request) {
 	r.writeJSON(w, http.StatusOK, map[string]any{"items": toDiskDTOs(disks)})
 }
 
+// handleListAllDisks 列出全部磁盘（仅超管）。
+//
+// 任务中心 / 审计日志要按 ref_id 解析磁盘所属存储库；逐条查询已删除磁盘会产生大量 404
+// 警告，因此管理端改为一次拉全量列表，在内存里做映射。
+func (r *Router) handleListAllDisks(w http.ResponseWriter, req *http.Request) {
+	disks, err := r.deps.App.Disks().ListAll(req.Context())
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusOK, map[string]any{"items": toDiskDTOs(disks)})
+}
+
 // handleGetDisk 查询磁盘。
 func (r *Router) handleGetDisk(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")

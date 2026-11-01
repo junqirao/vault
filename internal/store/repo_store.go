@@ -187,6 +187,20 @@ func (s *Store) SetRepositoryMetaState(ctx context.Context, id string, meta doma
 	return mustAffect(res, apperr.RepoNotFound().WithArg("id", id))
 }
 
+// SetRepositoryMeta 只更新 meta 列（不动 updated_at）。
+//
+// 建库进度每 2 秒写一次：走整行回写会同时改 updated_at，详情页"记录变化就重填编辑
+// 表单"的逻辑会在导入期间反复覆盖用户正在编辑的内容。进度是易变的展示数据，
+// 不属于"库被修改"，不该改 updated_at；只写 meta 也避开了覆盖并发改名/配额的风险。
+func (s *Store) SetRepositoryMeta(ctx context.Context, id string, meta domain.RepoMeta) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE repositories SET meta = ? WHERE id = ?`), toJSON(meta), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新存储库元数据失败: %w", err)
+	}
+	return mustAffect(res, apperr.RepoNotFound().WithArg("id", id))
+}
+
 // GetRepository 按 ID 查询存储库。
 func (s *Store) GetRepository(ctx context.Context, id string) (*domain.Repository, error) {
 	var row repoRow

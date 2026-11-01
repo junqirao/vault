@@ -18,7 +18,11 @@ import (
 	"vault/internal/updatepkg"
 )
 
-// 客户端本体更新（kind=client）
+// 客户端本体更新（kind=client，旧客户端兼容路径）
+//
+// 说明：新客户端在**启动期**由独立进程 Vault-Updator 完成整包更新（见 bootstrap.go），
+// 不再依赖本地代理。本文件的"代理下载/解压 + 客户端轮询切换"链路只保留给尚未升级到
+// 新架构的旧客户端使用，避免出现"老版本永远升不上来"。
 //
 // 与渲染层资源热更（client_web）是两条独立的通道：
 //   - client_web 只替换渲染层静态资源，不重启进程；
@@ -229,9 +233,9 @@ func (a *Agent) startClientUpdate(currentVersion string) ClientUpdateState {
 	}
 	m.running = true
 	m.state = ClientUpdateState{
-		State:         ClientStateDownloading,
-		ReadyVersion:  ready,
-		UpdatedAt:     time.Now().UnixMilli(),
+		State:        ClientStateDownloading,
+		ReadyVersion: ready,
+		UpdatedAt:    time.Now().UnixMilli(),
 	}
 	s := m.state
 	m.mu.Unlock()
@@ -464,9 +468,24 @@ func cleanupClientTemp(root string, logger *slog.Logger) {
 // 保留上一个版本不是浪费：新版起不来时用户可以直接从旧目录启动（见 clientUpdate.ts
 // 的坏版本判定），删光就没有退路了。
 func pruneClientVersions(root, keepVersion string, logger *slog.Logger) {
+	pruneClientVersionsExcept(root, keepVersion, "", logger)
+}
+
+// pruneClientVersionsExcept 同 pruneClientVersions，但**永不删除 excludeDir**。
+//
+// 启动期更新器运行在"当前正在使用的版本目录"里；清理历史版本时必须把它排除在外，
+// 否则会把用户正在运行的程序目录删除（Windows 只会拒绝删除仍被占用的 Vault.exe，
+// 其它文件却可能被删掉，留下一个再也启动不了的程序目录）。
+func pruneClientVersionsExcept(root, keepVersion, excludeDir string, logger *slog.Logger) {
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return
+	}
+	exclude := ""
+	if strings.TrimSpace(excludeDir) != "" {
+		if abs, err := filepath.Abs(excludeDir); err == nil {
+			exclude = strings.ToLower(filepath.Clean(abs))
+		}
 	}
 	type versionedDir struct {
 		name string
@@ -479,6 +498,13 @@ func pruneClientVersions(root, keepVersion string, logger *slog.Logger) {
 		}
 		if e.Name() == keepVersion {
 			continue
+		}
+		if exclude != "" {
+			if abs, err := filepath.Abs(filepath.Join(root, e.Name())); err == nil {
+				if strings.ToLower(filepath.Clean(abs)) == exclude {
+					continue
+				}
+			}
 		}
 		if !isCompleteClientDir(filepath.Join(root, e.Name())) {
 			// 残缺目录直接清掉（半途失败留下的空壳）。

@@ -85,28 +85,10 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   const updatePercent =
     progressTotal > 0 ? Math.min(100, Math.round((progressReceived / progressTotal) * 100)) : undefined
 
-  // 客户端资源热更：进度真源在 agent.webUpdate（来自 web_update 事件 / GET /agent/update/web）。
-  const webState = agent.webUpdate
-  const webTotal = webState?.total_bytes ?? 0
-  const webReceived = webState?.received_bytes ?? 0
-  const webPercent = webTotal > 0 ? Math.min(100, Math.round((webReceived / webTotal) * 100)) : undefined
-  const webBusy =
-    webState !== null &&
-    (webState.state === 'downloading' || webState.state === 'verifying' || webState.state === 'extracting')
-  const webStageKey =
-    webState?.state === 'downloading'
-      ? 'update.web.downloading'
-      : webState?.state === 'verifying'
-        ? 'update.web.verifying'
-        : webState?.state === 'extracting'
-          ? 'update.web.extracting'
-          : null
-  // 无可用资源产物：上次热更失败且明确"服务端没有可下发的资源包"（网络类失败不算）。
-  const webNoArtifact =
-    webState !== null &&
-    webState.state === 'failed' &&
-    webState.error !== 'server_unreachable' &&
-    (webState.error === 'no_artifact' || !webState.available_version)
+  // 本次发布是否带**客户端本体**产物。带本体时更新的唯一正确入口是"重启客户端"：
+  // 新版启动时由 Vault-Updator 整包替换前端与本地服务（见 electron/clientUpdate.ts）。
+  // 不能再走代理自更新或渲染层热更，否则会出现"界面新了、本地服务还是旧的"。
+  const clientPackageUpdate = Boolean(update?.client_available && hasUpdate)
 
   useEffect(() => {
     if (!agent.available) {
@@ -282,19 +264,14 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
     }
   }
 
-  // "检查更新"一键完成整个流程：整包更新检查 + 客户端资源热更（进度经 web_update 事件驱动）。
-  // 不再拆成两个按钮：两者本来就是同一次"检查并更新"（真实反馈："功能重复了，做完整个功能"）。
+  // "检查更新"只做检查，不再顺手热更渲染层资源：
+  // 版本更新统一由启动期更新器整包完成，这里只负责告诉用户"要不要重启安装"。
   const checkUpdate = async (): Promise<void> => {
     setChecking(true)
     setError(null)
     setNotice(null)
     try {
       setUpdate(await agentApi.checkUpdate())
-    } catch (err) {
-      setError(err)
-    }
-    try {
-      await agent.applyWebUpdate()
     } catch (err) {
       setError(err)
     } finally {
@@ -720,13 +697,8 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
       <SectionCard
         title={t('settings.update.title')}
         extra={
-          // 唯一的入口：一次点击完成"整包检查 + 资源热更"全流程；热更进行中同样锁住按钮。
-          <Button
-            loading={checking || webBusy}
-            disabled={disabled || webBusy}
-            onClick={() => void checkUpdate()}
-          >
-            {checking || webBusy ? t('settings.update.checking') : t('settings.update.check')}
+          <Button loading={checking} disabled={disabled} onClick={() => void checkUpdate()}>
+            {checking ? t('settings.update.checking') : t('settings.update.check')}
           </Button>
         }
       >
@@ -752,20 +724,31 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
           {hasUpdate ? (
             <Space direction="vertical" size={spacing.xs} style={{ width: '100%' }}>
               <Typography.Text>{t('settings.update.available', { version: targetVersion ?? '-' })}</Typography.Text>
-              {updatePercent === undefined ? <Progress status="active" /> : <Progress percent={updatePercent} />}
-              <Space>
-                <Typography.Text type="secondary">
-                  {t('update.progress', { received: formatBytes(progressReceived), total: formatBytes(progressTotal) })}
-                </Typography.Text>
-                <Button
-                  type="primary"
-                  loading={applying || (updateState?.downloading ?? false)}
-                  disabled={disabled}
-                  onClick={() => void applyUpdate()}
-                >
-                  {t('update.downloadAndInstall')}
-                </Button>
-              </Space>
+              {clientPackageUpdate ? (
+                <Space>
+                  <Typography.Text type="secondary">{t('settings.update.restartToInstall')}</Typography.Text>
+                  <Button type="primary" onClick={() => void relaunchClient()}>
+                    {t('settings.update.restartNow')}
+                  </Button>
+                </Space>
+              ) : (
+                <>
+                  {updatePercent === undefined ? <Progress status="active" /> : <Progress percent={updatePercent} />}
+                  <Space>
+                    <Typography.Text type="secondary">
+                      {t('update.progress', { received: formatBytes(progressReceived), total: formatBytes(progressTotal) })}
+                    </Typography.Text>
+                    <Button
+                      type="primary"
+                      loading={applying || (updateState?.downloading ?? false)}
+                      disabled={disabled}
+                      onClick={() => void applyUpdate()}
+                    >
+                      {t('update.downloadAndInstall')}
+                    </Button>
+                  </Space>
+                </>
+              )}
             </Space>
           ) : update ? (
             <Typography.Text type="success">
@@ -775,44 +758,6 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
             <Typography.Text type="secondary">{t('settings.update.notAvailable')}</Typography.Text>
           ) : null}
 
-          <div>
-            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
-              {t('update.web.title')}
-            </Typography.Text>
-            <Space direction="vertical" size={spacing.xs} style={{ width: '100%' }}>
-              {webState?.active_version ? (
-                <Typography.Text type="secondary">
-                  {t('update.web.activeVersion', { version: webState.active_version })}
-                </Typography.Text>
-              ) : null}
-              {webStageKey ? (
-                <>
-                  <Typography.Text type="secondary">{t(webStageKey)}</Typography.Text>
-                  {webPercent === undefined ? <Progress status="active" /> : <Progress percent={webPercent} />}
-                </>
-              ) : null}
-              {webState?.state === 'activated' ? (
-                <Space>
-                  <Typography.Text type="success">
-                    {t('update.web.activated', {
-                      version: webState.active_version || webState.available_version || '-'
-                    })}
-                  </Typography.Text>
-                  <Button onClick={() => void relaunchClient()}>{t('update.web.restart')}</Button>
-                </Space>
-              ) : null}
-              {/* 资源版本不高于当前版本，或服务端根本没有可下发的资源包，都等于"没有要更新的东西"：
-                  这是**正常结果**而非错误，用绿色对勾直说"无需更新"
-                  （真实反馈："版本相同不是错误，绿色对勾才对"）。 */}
-              {webState?.state === 'failed' && (webState.error === 'not_newer' || webNoArtifact) ? (
-                <Typography.Text type="success">
-                  <CheckCircleOutlined /> {t('update.web.upToDate')}
-                </Typography.Text>
-              ) : webState?.state === 'failed' && webState.error ? (
-                <ErrorNotice error={new ApiError({ kind: 'business', code: webState.error })} />
-              ) : null}
-            </Space>
-          </div>
         </Space>
       </SectionCard>
     </PageShell>

@@ -163,7 +163,13 @@ type repoPrepareDTO struct {
 	Phase string `json:"phase"`
 	Done  int    `json:"done"`
 	Total int    `json:"total"`
-	Error string `json:"error,omitempty"`
+	// 母盘拷入阶段的字节进度与速率（见 domain.RepoPrepare）：卡片据此复用
+	// "用量"那一格的进度条，详情页据此显示已写入 / 总量、速度与预计剩余。
+	BytesDone        int64 `json:"bytes_done,omitempty"`
+	BytesTotal       int64 `json:"bytes_total,omitempty"`
+	SpeedBytesPerSec int64 `json:"speed_bytes_per_sec,omitempty"`
+	EtaSeconds       int64 `json:"eta_seconds,omitempty"`
+	Error            string `json:"error,omitempty"`
 }
 
 // repoMoveDTO 是存储库迁移的进度快照（state=moving 期间存在）。
@@ -201,6 +207,8 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 	if p := r.Meta.Prepare; p != nil {
 		dto.Prepare = &repoPrepareDTO{
 			Phase: string(p.Phase), Done: p.Done, Total: p.Total, Error: p.Error,
+			BytesDone: p.BytesDone, BytesTotal: p.BytesTotal,
+			SpeedBytesPerSec: p.SpeedBytesPerSec, EtaSeconds: p.EtaSeconds,
 		}
 	}
 	if m := r.Meta.Move; m != nil {
