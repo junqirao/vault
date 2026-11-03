@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"vault/internal/apperr"
 	"vault/internal/platform"
@@ -26,6 +27,12 @@ const headFingerprintBytes = 1 << 20
 
 // maxLVNameLen 是映射出的 LV 名长度上限；LVM 的 dm 名上限 127 字节，留出 vg 前缀与转义余量。
 const maxLVNameLen = 100
+
+// thin 快照合并的轮询参数：合并通常瞬间完成，但内核里的延迟合并可能持续数秒。
+const (
+	mergeWaitTimeout  = 30 * time.Second
+	mergePollInterval = 200 * time.Millisecond
+)
 
 // lvNameRe 约束本包创建的 VG 与 LV 名。
 //
@@ -284,6 +291,64 @@ func (m *Manager) CreateDiff(ctx context.Context, childRef, parentRef string) er
 		return err
 	}
 	m.logger.Info("已创建 thin snapshot", "child", childRef, "parent", parentRef)
+	return nil
+}
+
+// MergeDiff 把 thin 快照（差异盘）合并进原点 thin LV（母盘）。
+//
+// LVM 语义：`lvconvert --merge <snap>` 让原点取得快照的内容并删除快照；
+// 若任一方仍处于打开状态（挂载/被 LIO 使用），合并会被延迟到原点下次激活，
+// 因此这里先停用两张 LV，再合并并重新激活原点，最后轮询确认快照确实消失。
+//
+// ⚠️ 合并会改变原点内容，同一原点下的其它快照会失去基线。调用方必须先清理
+// 其它差异盘（见 DiskService.runMergeDiff）。
+func (m *Manager) MergeDiff(ctx context.Context, childRef, parentRef string) error {
+	cvg, clv, err := parseRef(childRef)
+	if err != nil {
+		return err
+	}
+	pvg, plv, err := parseRef(parentRef)
+	if err != nil {
+		return err
+	}
+	if cvg != pvg {
+		return apperr.InvalidParam("parent_ref").WithArg("child_vg", cvg).WithArg("parent_vg", pvg)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// 先摘分区映射再停用：分区子设备还在时内核会拒绝停用父设备。
+	m.dropPartitionMappings(ctx, childRef)
+	m.dropPartitionMappings(ctx, parentRef)
+	// 已停用/本就未激活都是正常出口，用 runQuiet 免得日志里出现误导性的 ERROR。
+	if _, err := m.runQuiet(ctx, "lvchange", "-an", cvg+"/"+clv); err != nil {
+		m.logger.Debug("合并前停用差异盘未成功（可能本就未激活）", "ref", childRef, "err", err.Error())
+	}
+	if _, err := m.runQuiet(ctx, "lvchange", "-an", pvg+"/"+plv); err != nil {
+		m.logger.Debug("合并前停用母盘未成功（可能本就未激活）", "ref", parentRef, "err", err.Error())
+	}
+
+	if _, err := m.run(ctx, "lvconvert", "--merge", cvg+"/"+clv); err != nil {
+		return err
+	}
+	// 若合并曾被延迟，激活原点会触发它；-K 用于忽略 thin snapshot 的 skip-activation。
+	if _, err := m.run(ctx, "lvchange", "-ay", "-K", pvg+"/"+plv); err != nil {
+		return err
+	}
+	// 合并是内核里的异步过程：轮询到快照消失，避免"接口已返回、盘其实还没合完"。
+	deadline := time.Now().Add(mergeWaitTimeout)
+	for m.exists(cvg, clv) {
+		if time.Now().After(deadline) {
+			return apperr.New(CodeVHDFailed, http.StatusInternalServerError).
+				WithArg("reason", "merge_delayed").
+				WithArg("child", childRef)
+		}
+		time.Sleep(mergePollInterval)
+	}
+	if _, err := m.run(ctx, "sync"); err != nil {
+		m.logger.Warn("合并后 sync 失败", "ref", parentRef, "err", err.Error())
+	}
+	m.logger.Info("已把 thin 快照合并进原点", "child", childRef, "parent", parentRef)
 	return nil
 }
 

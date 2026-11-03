@@ -143,6 +143,8 @@ export interface RepoDTO {
    * 能一眼看出"这是财务的 Win10 母盘，别删"。
    */
   note?: string
+  /** 是否自动回收磁盘空间；老服务端不带此字段时按默认开启处理。 */
+  auto_compact?: boolean
   client_config?: Record<string, unknown>
   /** 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。 */
   pool: boolean
@@ -299,6 +301,37 @@ export interface ParentFileListingDTO {
 
 /** 上传核对模式：size=只比大小；hash=大小 + SHA-256。 */
 export type VerifyDiffMode = 'size' | 'hash'
+
+/** 从目录创建差异盘的比较模式：auto=大小+修改时间；hash=大小+SHA-256；size=只比大小。 */
+export type DiffSyncMode = 'auto' | 'hash' | 'size'
+
+/** 从目录创建差异盘时实际执行的一条改动。 */
+export interface DiffSyncEntryDTO {
+  path: string
+  /** add | modify | delete */
+  kind: 'add' | 'modify' | 'delete' | string
+  size?: number
+  /** missing | size | mtime | hash | extra */
+  reason?: string
+}
+
+/** 从目录创建差异盘的结果（服务端记录的改动清单）。 */
+export interface DiffSyncResultDTO {
+  repo_id: string
+  diff_disk_id: string
+  source_dir: string
+  mode: DiffSyncMode
+  added: number
+  modified: number
+  deleted: number
+  source_files: number
+  source_bytes: number
+  diff_files: number
+  diff_bytes: number
+  entries: DiffSyncEntryDTO[]
+  warnings: string[]
+  truncated: boolean
+}
 
 /** 上传核对里的一条差异。 */
 export interface VerifyDiffEntryDTO {
@@ -849,6 +882,8 @@ export interface UpdateRepoRequest {
   group?: string
   /** 说明备注；传空串表示清空。它会随母盘元数据一起迁移。 */
   note?: string
+  /** 是否自动回收磁盘空间；不传表示不修改。 */
+  auto_compact?: boolean
 }
 
 export interface ParentActionRequest {

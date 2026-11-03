@@ -119,6 +119,8 @@ type UpdateRepoInput struct {
 	// 它同时会写进母盘的元数据 sidecar（见 app/diskmeta.go）：迁移到别的服务端后，
 	// "这是财务的 Win10 母盘，别删"这类信息只能靠它带过去。
 	Note *string
+	// AutoCompact 是否自动回收磁盘空间；nil 表示不修改。
+	AutoCompact *bool
 }
 
 // AllocateInput 是创建分配的入参。
@@ -360,6 +362,10 @@ func (s *RepoService) List(ctx context.Context, ownerID string, limit, offset in
 
 // Update 更新存储库的可变字段（改名 / 配额 / 差异盘上限 / 共享磁盘限制 / 分组）。
 func (s *RepoService) Update(ctx context.Context, id string, in UpdateRepoInput) (*domain.Repository, error) {
+	// 差异盘创建/合并期间整库锁定：连名称/备注等设置也不接受修改，避免并发写 meta。
+	if err := s.ensureNoActiveDiffOperation(ctx, id); err != nil {
+		return nil, err
+	}
 	var out *domain.Repository
 	err := s.Store.Tx(ctx, func(tx *store.Store) error {
 		r, err := tx.LockRepository(ctx, id)
@@ -391,6 +397,11 @@ func (s *RepoService) Update(ctx context.Context, id string, in UpdateRepoInput)
 		if in.Note != nil {
 			// 说明备注存在 RepoMeta 里，并且会跟着母盘的 sidecar 一起迁移（见 diskmeta.go）。
 			r.Meta.Note = strings.TrimSpace(*in.Note)
+		}
+		if in.AutoCompact != nil {
+			// 显式落库：false 必须能压过"未配置 = 默认开启"的语义。
+			v := *in.AutoCompact
+			r.Meta.AutoCompact = &v
 		}
 		if err := tx.UpdateRepository(ctx, r); err != nil {
 			return err
@@ -432,6 +443,9 @@ func (s *RepoService) Update(ctx context.Context, id string, in UpdateRepoInput)
 // 已知取舍：回收完成前"库里已无记录、但 VHDX 仍在盘上"。这段时间用户的配额**已经**退回
 // （按 disks 表重算），比"记录留着但空间迟迟不释放"更符合用户直觉。
 func (s *RepoService) Delete(ctx context.Context, id string) error {
+	if err := s.ensureNoActiveDiffOperation(ctx, id); err != nil {
+		return err
+	}
 	repo, err := s.Get(ctx, id)
 	if err != nil {
 		return err
@@ -1288,6 +1302,10 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 	if repo.State == domain.RepoStateMoving {
 		return nil, apperr.New("repo.move_in_progress", 409).WithArg("repo_id", repoID)
 	}
+	// 差异盘创建/合并正在占用整块盘：此时不能退出维护、撤销共享或重新进入维护。
+	if err := s.ensureNoActiveDiffOperation(ctx, repo.ID); err != nil {
+		return nil, err
+	}
 
 	var to domain.ParentCondition
 	switch action {
@@ -1519,6 +1537,9 @@ func (s *RepoService) CleanupDiffs(ctx context.Context, repoID, operatorID strin
 		return nil, apperr.RepoParentConditionViolation(
 			string(repo.Condition()), string(domain.ParentMaintenance))
 	}
+	if err := s.ensureNoActiveDiffJob(ctx, repo.ID); err != nil {
+		return nil, err
+	}
 	if repo.ParentDiskID == nil {
 		return nil, apperr.New("repo.disk_missing", 500)
 	}
@@ -1558,6 +1579,9 @@ func (s *RepoService) ResizeParentDisk(ctx context.Context, repoID string, sizeB
 	}
 	if sizeBytes <= 0 {
 		return nil, apperr.InvalidParam("size_bytes")
+	}
+	if err := s.ensureNoActiveDiffOperation(ctx, repo.ID); err != nil {
+		return nil, err
 	}
 	if repo.ParentDiskID == nil {
 		return nil, apperr.New("repo.disk_missing", 500)

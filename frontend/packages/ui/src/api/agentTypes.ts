@@ -4,7 +4,37 @@
  * 严格对齐 docs/agent-api.md（v1 契约），字段名沿用下划线风格。
  * **绝不包含** lease 的 CHAP 密钥与会话令牌。
  */
-import type { JobState, RepoMoveDTO, RepoPrepareDTO, Role } from './types'
+import type { DiffSyncResultDTO, JobState, RepoMoveDTO, RepoPrepareDTO, Role } from './types'
+
+/** 客户端目录 → 差异盘任务的状态快照（GET /agent/diffs/{id}）。 */
+export interface AgentDiffSyncStatus {
+  diff_sync_id: string
+  repo_id: string
+  local_dir?: string
+  mode?: 'auto' | 'hash' | 'size' | string
+  delete_extra?: boolean
+  state: 'running' | 'succeeded' | 'failed' | 'cancelled'
+  /** scan | hash | plan | upload | done */
+  phase: string
+  done: number
+  total: number
+  bytes: number
+  total_bytes: number
+  current?: string
+  diff_disk_id?: string
+  warnings?: string[]
+  started_at?: number
+  finished_at?: number
+  /** 成功后的完整结果（与服务端 DiffSyncResult 同形）。 */
+  result?: DiffSyncResultDTO
+  error_code?: string
+  error_message?: string
+}
+
+export interface AgentDiffSyncStartResult {
+  diff_sync_id: string
+  status: AgentDiffSyncStatus
+}
 
 export type AgentMountMode = 'letter' | 'directory'
 export type AgentMountStatus = 'mounting' | 'mounted' | 'unmounting' | 'error' | 'revoked'

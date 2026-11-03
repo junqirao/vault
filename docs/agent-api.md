@@ -673,6 +673,32 @@ GET /agent/fs/manifest/result?id=<manifest_id>
   # 已完成的任务在内存里保留 15 分钟，之后自动回收。
 ```
 
+客户端目录 → 差异盘（异步；diff 各自算各自的，只有新增/修改文件内容会上传）：
+
+```
+POST /agent/diffs/from-dir
+  ↓ {repo_id, local_dir, mode:"auto|hash|size", delete_extra:bool, server_key?, server_url?}
+  ↑ 202 {diff_sync_id, status:DiffSyncStatus}
+  # 代理：扫描本地目录（可选 SHA-256）→ 服务端 client-plan（只传清单）→ 等 plan 任务
+  # → 按 Needed 流式上传新增/修改文件（multipart，每个文件前有 path 字段）。
+  # local_dir 必须是绝对路径目录；server_key 指明目标服务端（多服务端）。
+  # 服务端要求该存储库处于维护态；执行期间整库锁定，离开页面不影响后台任务。
+
+GET /agent/diffs/{diff_sync_id}
+  ↑ DiffSyncStatus
+
+DELETE /agent/diffs/{diff_sync_id}
+  ↑ {ok:true}
+  # 取消并尽力清理服务端仍处于 creating 的差异盘；已完成的盘不会被误删。
+
+DiffSyncStatus = {
+  diff_sync_id, state:"running"|"succeeded"|"failed"|"cancelled",
+  phase:"scan"|"hash"|"plan"|"upload"|"done",
+  done, total, bytes, total_bytes, current?, warnings?:[string],
+  diff_disk_id?, result?:DiffSyncResult, error_code?, error_message?
+}
+```
+
 POST /agent/uploads/start
   ↓ {local_dir, repo_name, repo_mode?, storage_id?, quota_bytes?, max_diff_disks?,
      source_mode?, server_key?, server_url?}

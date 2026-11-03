@@ -151,12 +151,6 @@ export function RepoDisks({
     void queryClient.invalidateQueries({ queryKey: ['jobs'] })
   }
 
-  const compactMutation = useMutation({
-    mutationFn: (diskId: string) => api.compactDisk(diskId),
-    onSuccess: invalidate,
-    onError: (err) => setError(err)
-  })
-
   const deleteMutation = useMutation({
     mutationFn: (diskId: string) => api.deleteDisk(diskId),
     onSuccess: () => {
@@ -400,17 +394,10 @@ export function RepoDisks({
                 {t('disk.copyToLocal')}
               </Button>
             ) : null}
-            {/* 压缩与删除动的是库里的盘：只有能管理这个库的人才有入口。 */}
+            {/* 删除动的是库里的盘：只有能管理这个库的人才有入口。
+                空间回收已改为按库设置自动执行，不再提供手动按钮。 */}
             {canManage ? (
               <>
-                <Button
-                  type="link"
-                  size="small"
-                  onClick={() => compactMutation.mutate(disk.id)}
-                  loading={compactMutation.isPending && compactMutation.variables === disk.id}
-                >
-                  {t('action.compact')}
-                </Button>
                 {/* 库里只剩下这一块母盘时不提供删除入口：删掉就等于清空整个存储库。 */}
                 {disk.kind === 'parent' && parentDiskCount <= 1 ? null : (
                   <Button type="link" size="small" danger onClick={() => setPendingDelete(disk)}>

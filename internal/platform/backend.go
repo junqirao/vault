@@ -103,6 +103,15 @@ type DiskBackend interface {
 	// CreateDiff 创建差异盘（childRef 引用 parentRef，容量继承父盘）。
 	CreateDiff(ctx context.Context, childRef, parentRef string) error
 
+	// MergeDiff 把差异盘 childRef 合并进它的祖先盘 parentRef。
+	//
+	// 语义（平台差异由实现吸收）：
+	//   - 合并是**离线**操作：两张盘都必须未挂载、未被 iSCSI 打开；
+	//   - 成功后 parentRef 的内容 = 合并前 parentRef + childRef 的全部改动；
+	//   - childRef 不再有效（实现会尽力删除子盘；调用方仍应再调 Delete 兜底）；
+	//   - 只允许单层差异盘合并到母盘，调用方必须先清理同一母盘下的其它差异盘。
+	MergeDiff(ctx context.Context, childRef, parentRef string) error
+
 	// Clone 完整复制一块虚拟磁盘到 dstRef（目标已存在时返回错误），
 	// 并重置磁盘标识，保证克隆结果可作为独立盘被识别。
 	Clone(ctx context.Context, srcRef, dstRef string) error

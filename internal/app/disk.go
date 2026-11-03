@@ -151,6 +151,9 @@ func (s *DiskService) RegisterHandlers(w *job.Worker) {
 	w.Register(job.HandlerFunc{T: domain.JobCreateVHDX, F: s.runCreateVHDX})
 	w.Register(job.HandlerFunc{T: domain.JobCreateVHDXFromDir, F: s.runCreateVHDX})
 	w.Register(job.HandlerFunc{T: domain.JobCreateDiff, F: s.runCreateDiff})
+	w.Register(job.HandlerFunc{T: domain.JobCreateDiffFromDir, F: s.runCreateDiffFromDir})
+	w.Register(job.HandlerFunc{T: domain.JobPlanClientDiff, F: s.runClientDiffPlan})
+	w.Register(job.HandlerFunc{T: domain.JobMergeDiff, F: s.runMergeDiff})
 	w.Register(job.HandlerFunc{T: domain.JobPrepareRepo, F: s.runPrepareRepo})
 	w.Register(job.HandlerFunc{T: domain.JobResetDiff, F: s.runResetDiff})
 	w.Register(job.HandlerFunc{T: domain.JobCopyVHDX, F: s.runCopyVHDX})
@@ -241,6 +244,9 @@ func (s *DiskService) StartCopy(ctx context.Context, diskID, newRepoName, operat
 		// 迁移、建库、写入中都不是稳定状态：复制会把任务正在改写的源盘翻一遍。
 		if repo.State != domain.RepoStateActive {
 			return nil, apperr.New("repo.state_invalid", 409).WithArg("state", string(repo.State))
+		}
+		if err := s.ensureNoActiveDiffOperation(ctx, repo.ID); err != nil {
+			return nil, err
 		}
 	}
 	if disk.Mounted {
@@ -337,6 +343,112 @@ func (s *DiskService) StartCompact(ctx context.Context, diskID string) (*domain.
 	}
 	s.audit(ctx, "", "disk.compact.start", "disk:"+diskID, "", domain.AuditResultOK)
 	return j, nil
+}
+
+// autoCompactCooldown 是同一块盘两次自动回收之间的最小间隔。
+//
+// 压缩是 IO 密集操作，不能每轮扫描都跑；同时保留较长的观察窗口，
+// 让一块盘一天最多被自动压缩一次。
+const autoCompactCooldown = 24 * time.Hour
+
+// AutoCompact 扫描全部存储库，为启用「自动回收空间」的空闲磁盘排队压缩任务。
+//
+// 由后台定时任务调用（见 cmd/vault-server/main.go）。这里只做**筛选与入队**，
+// 真正的压缩在 JobCompact 的 worker 里执行，因此不会阻塞定时任务。
+//
+// 安全边界（为什么条件比手动 StartCompact 更严）：
+//   - 库必须 active 且共享库处于 idle（维护/临时共享期间母盘正被使用）；
+//   - 库下不能有 active/expired 租约（expired 可能被客户端心跳续回 active）；
+//   - 盘自身不能是服务端本地挂载中、且必须已经建好；
+//   - 同一块盘 24 小时内不重复自动压缩（手动接口不受此限制）。
+func (s *DiskService) AutoCompact(ctx context.Context) error {
+	const pageSize = 200
+	for offset := 0; ; offset += pageSize {
+		repos, err := s.Store.ListRepositories(ctx, "", pageSize, offset)
+		if err != nil {
+			return err
+		}
+		for i := range repos {
+			if err := s.autoCompactRepo(ctx, &repos[i]); err != nil {
+				// 单个库失败不能拖垮整轮扫描：记录后继续处理其它库。
+				s.Log.Warn("自动回收存储库空间失败", "repo_id", repos[i].ID, "error", err)
+			}
+		}
+		if len(repos) < pageSize {
+			return nil
+		}
+	}
+}
+
+// autoCompactRepo 处理单个存储库的自动回收。
+func (s *DiskService) autoCompactRepo(ctx context.Context, repo *domain.Repository) error {
+	if !repo.Meta.AutoCompactEnabled() {
+		return nil
+	}
+	if repo.State != domain.RepoStateActive {
+		return nil
+	}
+	// 共享库只有在 idle 时母盘才是"可压缩的基线"；维护/临时共享期间跳过。
+	if repo.IsShared() && repo.Condition() != domain.ParentIdle {
+		return nil
+	}
+	open, err := s.Store.CountOpenLeasesByRepo(ctx, repo.ID)
+	if err != nil {
+		return err
+	}
+	if open > 0 {
+		return nil
+	}
+	disks, err := s.Store.ListDisksByRepo(ctx, repo.ID)
+	if err != nil {
+		return err
+	}
+	// 母盘一旦被差异盘引用，就不能在自动维护里压缩：压缩会改写基线文件的块布局，
+	// 而差异盘正依赖它。母盘只能在共享库没有差异盘（或维护态人工确认后）处理。
+	parentsWithChildren := make(map[string]bool, len(disks))
+	for i := range disks {
+		if disks[i].ParentID != nil {
+			parentsWithChildren[*disks[i].ParentID] = true
+		}
+	}
+	for i := range disks {
+		disk := &disks[i]
+		if disk.Mounted || !isDiskBuilt(disk.State) {
+			continue
+		}
+		if disk.Kind == domain.DiskKindParent && parentsWithChildren[disk.ID] {
+			continue
+		}
+		recent, err := s.autoCompactRecently(ctx, disk.ID)
+		if err != nil {
+			return err
+		}
+		if recent {
+			continue
+		}
+		if _, err := s.StartCompact(ctx, disk.ID); err != nil {
+			// 扫描与入队之间盘可能刚被挂载/库刚进入迁移；跳过即可，下一轮再看。
+			s.Log.Debug("跳过自动回收", "disk_id", disk.ID, "error", err)
+		}
+	}
+	return nil
+}
+
+// autoCompactRecently 判断该盘最近是否已有自动/手动压缩任务。
+//
+// 未结束的任务视为"已在处理"；已结束的按冷却窗口判断，避免每轮扫描重复入队。
+func (s *DiskService) autoCompactRecently(ctx context.Context, diskID string) (bool, error) {
+	latest, err := s.Store.GetLatestJobByRef(ctx, diskID)
+	if err != nil {
+		return false, err
+	}
+	if latest == nil || latest.Type != domain.JobCompact {
+		return false, nil
+	}
+	if !latest.State.IsTerminal() {
+		return true, nil
+	}
+	return time.Since(time.UnixMilli(latest.CreatedAt)) < autoCompactCooldown, nil
 }
 
 // SamplePhysicalUsage 采样磁盘物理占用并写回 disks.physical_bytes。

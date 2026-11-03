@@ -640,6 +640,11 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	startTicker("disk_usage_sample", 5*time.Minute, func(ctx context.Context) error {
 		return application.Disks().SamplePhysicalUsage(ctx)
 	})
+	// 自动回收空间：逐库筛选空闲磁盘并入队压缩任务（库级开关见 RepoMeta.AutoCompact）。
+	// 实际压缩是异步任务，定时任务只负责筛选，不会阻塞 HTTP 或其它后台任务。
+	startTicker("disk_auto_compact", time.Hour, func(ctx context.Context) error {
+		return application.Disks().AutoCompact(ctx)
+	})
 	// 存储卷信息缓存：Windows 上查卷空间要起 PowerShell，绝不能放在请求路径里。
 	// 启动先预热一次，之后每分钟刷新（列表/详情只读缓存，见 app/storage.go）。
 	startTicker("storage_volume_cache", time.Minute, func(ctx context.Context) error {

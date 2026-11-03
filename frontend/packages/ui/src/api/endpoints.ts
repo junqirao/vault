@@ -16,6 +16,8 @@ import type {
   CreateUserRequest,
   CreateUserResponse,
   DeviceReleaseReportDTO,
+  DiffSyncMode,
+  DiffSyncResultDTO,
   DiskDTO,
   DiskImportRequestDTO,
   DiskImportResultDTO,
@@ -333,6 +335,19 @@ export class VaultApi extends ApiClient {
     })
   }
 
+  /** 当前正在执行的差异盘工具任务（建盘/合并）；无则 job 为空。 */
+  getActiveDiffOperation(id: string): Promise<{ job?: JobDTO | null }> {
+    return this.request<{ job?: JobDTO | null }>(
+      'GET',
+      `/v1/repos/${encodeURIComponent(id)}/diff-operation`
+    )
+  }
+
+  /** 取消当前存储库正在执行的差异盘工具任务（库管理者即可）。 */
+  cancelDiffOperation(id: string): Promise<void> {
+    return this.request<void>('POST', `/v1/repos/${encodeURIComponent(id)}/diff-operation/cancel`)
+  }
+
   /**
    * 维护态下清理该库全部差异盘（异步任务，202）。
    *
@@ -341,6 +356,39 @@ export class VaultApi extends ApiClient {
    */
   cleanupDiffs(id: string): Promise<JobDTO> {
     return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/cleanup-diffs`)
+  }
+
+  /**
+   * 维护态下选择一个差异盘合并进母盘（异步任务，202）。
+   *
+   * ⚠️ 破坏性：同一母盘下未选中的差异盘会被删除；成功后母盘版本 +1 并退出维护。
+   */
+  mergeDiff(id: string, diffDiskId: string): Promise<JobDTO> {
+    return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/parent/merge-diff`, {
+      diff_disk_id: diffDiskId
+    })
+  }
+
+  /**
+   * 从服务端目录创建一块差异盘（异步任务，202）。
+   *
+   * 服务端先比较源目录与母盘现有内容，只把新增/修改/删除写进新差异盘；母盘不变。
+   */
+  startDiffFromDir(
+    id: string,
+    input: { source_dir: string; mode: DiffSyncMode; delete_extra: boolean }
+  ): Promise<JobDTO> {
+    return this.request<JobDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/diffs/from-dir`, input)
+  }
+
+  /** 读取"从目录创建差异盘"的改动清单（服务端结果文件）。 */
+  getDiffFromDirResult(id: string, jobId: string): Promise<DiffSyncResultDTO> {
+    return this.request<DiffSyncResultDTO>(
+      'GET',
+      `/v1/repos/${encodeURIComponent(id)}/diffs/from-dir/result`,
+      undefined,
+      { job: jobId }
+    )
   }
 
   /** 维护态下扩容母盘（只扩不缩）；要求没有差异盘、没有在线客户端。 */
@@ -549,10 +597,6 @@ export class VaultApi extends ApiClient {
 
   deleteDisk(id: string): Promise<JobDTO> {
     return this.request<JobDTO>('DELETE', `/v1/disks/${encodeURIComponent(id)}`)
-  }
-
-  compactDisk(id: string): Promise<JobDTO> {
-    return this.request<JobDTO>('POST', `/v1/disks/${encodeURIComponent(id)}/compact`)
   }
 
   releaseAllocation(id: string): Promise<void> {

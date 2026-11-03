@@ -130,6 +130,11 @@ type RepoMeta struct {
 	// 导入时原样恢复，所以放在这里而不是另开一列（无需为文本框做双库迁移）。
 	Note string `json:"note,omitempty"`
 
+	// AutoCompact 是否自动回收磁盘空间（默认开启）。
+	//
+	// 用指针区分"未配置"与"显式关闭"：老库与新建库都不写这个字段，
+	// nil 按默认开启处理；只有用户主动取消勾选时才落 false。
+	AutoCompact *bool `json:"auto_compact,omitempty"`
 	// Pool 标记该库是"池化共享库"：建库时已按 MaxDiffDisks（共享数量）预创建了差异盘池。
 	//
 	// 只有池化库在释放分配时把差异盘**原地重建回池**（JobResetDiff），
@@ -142,6 +147,14 @@ type RepoMeta struct {
 	// 迁移是异步任务，卡片与详情页都要能看到"复制到哪了"；任务进度只是一个 0-100 的
 	// 数字，而库列表需要的是按库聚合的字节/文件进度，所以和 Prepare 一样落库。
 	Move *RepoMove `json:"move,omitempty"`
+}
+
+// AutoCompactEnabled 返回是否启用自动回收空间。
+//
+// 未配置（指针为 nil）时按**开启**处理：这是产品默认值，也让升级前的老库
+// 自动获得该能力，不需要做数据迁移。
+func (m RepoMeta) AutoCompactEnabled() bool {
+	return m.AutoCompact == nil || *m.AutoCompact
 }
 
 // RepoMove 是存储库迁移任务的进度快照。

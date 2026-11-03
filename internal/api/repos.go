@@ -57,6 +57,8 @@ type updateRepoRequest struct {
 	// Note 说明备注（自由文本）。它会写进母盘的元数据 sidecar，跟着盘一起迁移
 	// （见 app/diskmeta.go）；传空串表示清空。
 	Note *string `json:"note"`
+	// AutoCompact 是否自动回收磁盘空间；不传表示不修改。
+	AutoCompact *bool `json:"auto_compact"`
 }
 
 // handleListRepos 列出存储库。
@@ -189,6 +191,7 @@ func (r *Router) handleUpdateRepo(w http.ResponseWriter, req *http.Request) {
 		MaxDiffDisks: in.MaxDiffDisks,
 		Group:        in.Group,
 		Note:         in.Note,
+		AutoCompact:  in.AutoCompact,
 	})
 	if err != nil {
 		r.writeError(w, req, err)

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Skeleton, Space, Tabs, Tooltip, Typography, message } from 'antd'
+import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Skeleton, Space, Switch, Tabs, Tooltip, Typography, message } from 'antd'
 import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -20,6 +20,7 @@ import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { parentConditionLabel, repoModeLabel } from '../../utils/labels'
+import { RepoDiffTools } from './RepoDiffTools'
 import { RepoDisks } from './RepoDisks'
 import { RepoMembers } from './RepoMembers'
 import { RepoParentFiles } from './RepoParentFiles'
@@ -46,6 +47,8 @@ interface EditValues {
   max_diff_disks?: number
   /** 说明备注：随母盘元数据一起迁移，换机器后「导入磁盘」能认出这是谁家的盘。 */
   note?: string
+  /** 自动回收空间：空闲磁盘在后台自动压缩，默认开启。 */
+  auto_compact?: boolean
 }
 
 /** 存储库详情：概览 + 成员 + 磁盘（含分配与挂载），以及编辑/删除/母盘操作/复制。 */
@@ -64,6 +67,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
   const [parentJob, setParentJob] = useState<JobDTO | null>(null)
   // 维护态「扩容母盘」弹窗。
   const [resizeOpen, setResizeOpen] = useState(false)
+  // 差异盘工具正在执行长任务：整个存储库锁定，禁止退出维护/编辑母盘/再发起操作。
+  const [diffToolBusy, setDiffToolBusy] = useState(false)
   // 上传核对弹窗。
   const [verifyOpen, setVerifyOpen] = useState(false)
   // 存储库迁移：目标存储选择弹窗 + 本次发起的迁移任务（用于跟踪进度与终态刷新）。
@@ -101,6 +106,14 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     enabled: Boolean(repoQuery.data)
   })
 
+  // 差异盘工具是否正在执行：即使当前停在概览页（设置页未挂载），也要锁住整库并显示提示。
+  const activeDiffOpQuery = useQuery({
+    queryKey: ['repo-diff-op', repoId],
+    queryFn: () => api.getActiveDiffOperation(repoId),
+    enabled: Boolean(repoQuery.data?.mode === 'shared'),
+    refetchInterval: 10_000
+  })
+
   // 磁盘列表：
   //   - 概览顶部的「存储使用情况」需要按磁盘物理占用汇总本库占用；
   //   - 「母盘文件」页签与「磁盘」页签共用同一 query key，清理完成后自动刷新。
@@ -132,6 +145,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     // 维护相关操作会改磁盘记录（扩容改容量、清理删差异盘、退出维护拆目标），
     // 「磁盘」tab 必须跟着刷新，否则看到的还是操作前的数据。
     void queryClient.invalidateQueries({ queryKey: ['repo-disks', repoId] })
+    // 差异盘工具任务结束/取消后立刻解除整库锁定，不等下一次 10s 轮询。
+    void queryClient.invalidateQueries({ queryKey: ['repo-diff-op', repoId] })
     // 母盘临时挂载的 @temp 占位分配也会随维护进入/退出出现/消失。
     void queryClient.invalidateQueries({ queryKey: ['repo-allocations', repoId] })
     // 迁移/删除/建盘都会改变所在存储的占用与可用空间：概览顶部的存储使用情况要跟着刷新。
@@ -316,7 +331,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
       name: data.name,
       group: data.group,
       max_diff_disks: data.max_diff_disks,
-      note: data.note
+      note: data.note,
+      auto_compact: data.auto_compact !== false
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoQuery.data?.id, repoUpdatedAt, editForm])
@@ -395,7 +411,8 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     (storage) => storage.enabled && storage.mounted && storage.id !== repo?.storage_id
   )
   const diffCount = (disksQuery.data?.items ?? []).filter((disk) => disk.kind === 'diff').length
-  const parentFilesReady = isMaintenance && canManage && diffCount === 0
+  const repoLocked = diffToolBusy || Boolean(activeDiffOpQuery.data?.job)
+  const parentFilesReady = isMaintenance && canManage && diffCount === 0 && !repoLocked
   const toggleMaintenance = (): void => {
     setError(null)
     parentMutation.mutate(isMaintenance ? 'finish_maintenance' : 'maintenance')
@@ -421,13 +438,28 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
         // 标题栏只保留最常用的挂载/卸载；其余管理动作统一收进「设置」tab。
         // 与列表卡片同一套联动按钮：进了详情也不必退回列表才能挂载。
         // read 成员只能看：挂载/卸载后端都不放行，按钮就不摆出来。
-        repo && repo.permission !== 'read' && !isMoving ? (
+        repo && repo.permission !== 'read' && !isMoving && !repoLocked ? (
           <RepoDetailMountActions repo={repo} currentUserId={currentUserId} />
         ) : null
       }
     >
       {error ? <ErrorNotice error={error} /> : null}
       {repoQuery.error ? <ErrorNotice error={repoQuery.error} /> : null}
+      {repoLocked ? (
+        <div
+          style={{
+            border: '1px solid rgba(128, 128, 128, 0.22)',
+            borderRadius: 8,
+            padding: spacing.md,
+            marginBottom: spacing.md
+          }}
+        >
+          <Space direction="vertical" size={spacing.xxs}>
+            <Typography.Text strong>{t('repo.diffTools.busy.title')}</Typography.Text>
+            <Typography.Text type="secondary">{t('repo.diffTools.busy.desc')}</Typography.Text>
+          </Space>
+        </div>
+      ) : null}
       {/* 只能看的库（非所有者 / read、mount 成员）说清楚为什么没有管理入口。 */}
       {repo && !canManage ? (
         <Alert type="info" showIcon message={t('repo.detail.readOnly')} style={{ marginBottom: spacing.md }} />
@@ -505,6 +537,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                 <Space wrap>
                   <Button
                     size="small"
+                    disabled={repoLocked}
                     onClick={() => {
                       const currentGb = Math.ceil((repo?.capacity_bytes ?? 0) / (1024 * 1024 * 1024))
                       resizeForm.setFieldsValue({ size_gb: currentGb + 1 })
@@ -529,7 +562,13 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                       ) : null}
                     </Space>
                   ) : (
-                    <Button danger size="small" loading={cleanupMutation.isPending} onClick={() => cleanupMutation.mutate()}>
+                    <Button
+                      danger
+                      size="small"
+                      disabled={repoLocked}
+                      loading={cleanupMutation.isPending}
+                      onClick={() => cleanupMutation.mutate()}
+                    >
                       {t('repo.maintenance.cleanup')}
                     </Button>
                   )}
@@ -637,7 +676,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                     <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
                       {t('repo.settings.basic.desc')}
                     </Typography.Paragraph>
-                    <Form form={editForm} layout="vertical" disabled={isMoving}>
+                    <Form form={editForm} layout="vertical" disabled={isMoving || repoLocked}>
                       <Form.Item name="name" label={t('field.name')} rules={[{ required: true }]}>
                         <Input maxLength={64} />
                       </Form.Item>
@@ -652,11 +691,19 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                       <Form.Item name="max_diff_disks" label={t('field.maxDiffDisks')}>
                         <InputNumber min={0} style={{ width: '100%' }} />
                       </Form.Item>
+                      <Form.Item
+                        name="auto_compact"
+                        label={t('field.autoCompact')}
+                        valuePropName="checked"
+                        extra={t('field.autoCompactHint')}
+                      >
+                        <Switch />
+                      </Form.Item>
                     </Form>
                     <Button
                       type="primary"
                       loading={updateMutation.isPending}
-                      disabled={isMoving}
+                      disabled={isMoving || repoLocked}
                       onClick={() => {
                         void editForm.validateFields().then((values) => updateMutation.mutate(values))
                       }}
@@ -678,14 +725,14 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                       {/* 进入 / 退出维护态合成一个按钮：文案与动作按当前母盘条件切换。 */}
                       <Button
                         loading={parentMutation.isPending || parentRunning}
-                        disabled={repo.parent_condition === 'temp_shared' || parentRunning || isMoving}
+                        disabled={repo.parent_condition === 'temp_shared' || parentRunning || isMoving || repoLocked}
                         title={repo.parent_condition === 'temp_shared' ? t('repo.maintenance.unshareFirst') : undefined}
                         onClick={toggleMaintenance}
                       >
                         {t(isMaintenance ? 'repo.parent.action.finish_maintenance' : 'repo.parent.action.maintenance')}
                       </Button>
                       {repo.parent_disk_id ? (
-                        <Button onClick={() => setVerifyOpen(true)} disabled={isMoving}>
+                        <Button onClick={() => setVerifyOpen(true)} disabled={isMoving || repoLocked}>
                           {t('repo.verifyDiff.button')}
                         </Button>
                       ) : null}
@@ -709,6 +756,17 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   </SectionCard>
                 ) : null}
 
+                {repo.mode === 'shared' ? (
+                  <RepoDiffTools
+                    repo={repo}
+                    disks={disksQuery.data?.items ?? []}
+                    canManage={canManage}
+                    isMaintenance={isMaintenance}
+                    onRefresh={refresh}
+                    onBusyChange={setDiffToolBusy}
+                  />
+                ) : null}
+
                 {canManage ? (
                   <SectionCard title={t('repo.settings.copyMove.title')}>
                     <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
@@ -716,7 +774,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                     </Typography.Paragraph>
                     <Space wrap>
                       <Button
-                        disabled={isMoving}
+                        disabled={isMoving || repoLocked}
                         onClick={() => {
                           copyForm.setFieldsValue({ new_repo_name: `${repo.name}-copy` })
                           setCopyOpen(true)
@@ -727,6 +785,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                       {/* 迁移会移动原库本身，与复制同属整库级动作，放在同一模块里。 */}
                       <Button
                         disabled={
+                          repoLocked ||
                           repo.state !== 'active' ||
                           (repo.mode === 'shared' && (repo.parent_condition ?? 'idle') !== 'idle')
                         }
@@ -747,7 +806,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                     <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
                       {t('repo.settings.danger.desc')}
                     </Typography.Paragraph>
-                    <Button danger disabled={isMoving} onClick={() => setDeleteOpen(true)}>
+                    <Button danger disabled={isMoving || repoLocked} onClick={() => setDeleteOpen(true)}>
                       {t('common.delete')}
                     </Button>
                   </SectionCard>

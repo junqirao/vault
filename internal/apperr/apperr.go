@@ -324,6 +324,16 @@ func RepoParentConditionViolation(current, expected string) *Error {
 		WithArg("expected", expected)
 }
 
+// RepoOperationInProgress 该存储库已有长时间维护操作（差异盘创建/合并）在执行。
+//
+// 这类操作会占用整块盘（挂载/合并/写入），期间必须锁住存储库：禁止退出维护、
+// 编辑母盘文件、清理差异盘、扩容或再发起另一个合并。
+func RepoOperationInProgress(jobType, jobID string) *Error {
+	return New("repo.operation_in_progress", http.StatusConflict).
+		WithArg("job_type", jobType).
+		WithArg("job_id", jobID)
+}
+
 // RepoDiffLimitExceeded 差异盘数量达到 max_diff_disks 上限。
 func RepoDiffLimitExceeded(limit int) *Error {
 	return New("repo.diff_limit_exceeded", http.StatusConflict).WithArg("limit", limit)

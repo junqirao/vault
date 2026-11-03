@@ -1149,6 +1149,86 @@ IQN         = iqn.2026-01.com.vault:{target_name}
 | 误删 | 清理默认走 `meta/trash/` 软删除，保留 7 天 |
 | 中途失败 | Job 幂等：每次重试重新列出仍存在的差异盘；`parent_condition` 保持 `MAINTENANCE` 直到用户显式退出维护 |
 
+### 5.4.1 差异盘工具：合并更新母盘 / 从目录增量创建
+
+入口统一放在**存储库详情 → 设置 → 差异盘工具**，两项能力都只处理差异部分。
+**只在维护态可用**：执行期间整库锁定（禁止退出维护、编辑母盘文件、清理/扩容、复制/迁移/删除、
+再次发起操作），但界面可以离开——任务在后台继续，回到详情页会从代理任务列表 /
+`GET /v1/repos/{id}/diff-operation` 恢复进度。后端另有 active job + `creating` 差异盘闸门，
+不依赖前端是否停在页面上。
+
+**① 合并差异盘更新母盘（仅维护态）**
+
+```
+POST /v1/repos/{id}/parent/merge-diff {diff_disk_id}
+  → 202 JobMergeDiff（异步、可重试、持 lock.RepoKey）
+
+前置：parent_condition = MAINTENANCE；选中的盘属于该库/该母盘、kind=diff、
+      parent_version 与当前母盘一致、状态 ready/published。
+
+任务顺序：
+  ① 卸载母盘的服务端本地挂载 → 撤销全部在线租约 → 拆除全部差异盘的 iSCSI 目标
+  ② 删除**未选中**的差异盘（记录 + 分配 + 文件）；母盘一变，它们全部基于旧基线
+  ③ 把选中的差异盘离线合并进母盘：
+       Windows = Merge-VHD -Path <diff> -DestinationPath <parent>（需要 Hyper-V 模块）
+       Linux   = lvchange -an 两张 LV → lvconvert --merge <snap> → 激活原点并轮询快照消失
+  ④ 删除选中盘的记录/分配；重算母盘物理占用
+  ⑤ 复用退出维护的统一收尾：parent_version += 1、重算指纹、parent_condition = IDLE
+```
+
+⚠️ 破坏性：未选中的差异盘及选中盘的分配记录都会消失；界面必须列出数量并二次确认。
+平台能力不足（Windows 无 Hyper-V）时任务失败并返回 `platform.merge_unavailable`，入口保留但给出明确提示。
+
+**② 从目录创建差异盘（仅维护态）**
+
+```
+POST /v1/repos/{id}/diffs/from-dir {source_dir, mode, delete_extra}
+  → 202 JobCreateDiffFromDir（ref_id = 新差异盘 ID）
+
+前置：共享库、state=active、parent_condition=idle 或 maintenance；
+      source_dir 必须落在 storage.source_roots 白名单内。
+      - 维护态专属：期间整个存储库禁止分配/挂载，工具内操作会长时间占用母盘；
+      - 不受 max_diff_disks 限制（通常随即合并回母盘）；
+      - 开始前卸载母盘的服务端本地挂载，避免与差异盘独占打开冲突；
+      - 同一存储库同时只允许一个差异盘/合并操作（后端 active job 闸门 + RepoKey 串行）。
+
+任务：
+  ① 从母盘派生一块**未分配**的差异盘（与普通差异盘同一套 CreateDiff / 池选择规则）
+  ② 挂载该差异盘（此时可看到母盘全部内容）
+  ③ 扫描源目录与盘内内容，生成 add / modify / delete 清单：
+       auto（默认）= 大小 + 修改时间；hash = 大小 + SHA-256；size = 只比大小
+     `delete_extra=false` 时只增改、不删除盘内多余文件
+  ④ 在差异盘上执行清单：先删后写，写文件时保留修改时间；空目录自动回收
+  ⑤ 结果（计数 + 最多 5000 条清单 + 警告）写入临时 JSON，
+     GET /v1/repos/{id}/diffs/from-dir/result?job=... 读取
+```
+
+**客户端目录（本地目录）**
+
+客户端目录走两阶段，**diff 各自算各自的，不传文件内容**：
+
+```
+① 代理扫描本地目录（路径/大小/mtime，可选 SHA-256），把清单交给服务端：
+   POST /v1/repos/{id}/diffs/from-dir/client-plan  → 202 JobPlanClientDiff
+   服务端建差异盘、挂载并扫描母盘内容，与服务端自己的清单比对；
+   执行删除，记录 Needed（新增/修改）到 plan.json。
+   GET  /v1/repos/{id}/diffs/from-dir/client-plan/result?job=...
+
+② 代理只按 Needed 上传文件内容（流式 multipart，每个文件前有 path 字段）：
+   POST /v1/repos/{id}/diffs/from-dir/client-upload?job=...
+   服务端挂载差异盘、逐文件写入并校验大小，收尾后置 ready 并返回最终结果。
+
+取消：POST /v1/repos/{id}/diffs/from-dir/client-abort?job=...
+      （仅删除仍处于 creating 的盘；上传已成功但响应丢失时不会误删。）
+```
+
+代理侧入口 `POST /agent/diffs/from-dir`（异步任务，`GET /agent/diffs/{id}` 轮询），
+由代理完成扫描、哈希、调用服务端 plan、轮询任务与上传 Needed 文件；界面不接触文件内容。
+
+母盘全程只读、不变；创建出的差异盘在**池化库**中可被分配（任务结束时会预建目标），
+其他场景可在维护态用①合并回母盘。
+`auto` 模式对"大小与时间都没变但内容变了"的文件会漏判；需要绝对准确时选 `hash`。
+
 ### 5.5 客户端挂载流程
 
 ```
@@ -1591,8 +1671,13 @@ Optimize-VHD -Path $vhdx -Mode Full     # 或 -Mode Retrim（需先只读挂载�
 Dismount-VHD -Path $vhdx
 ```
 
+> 当前实现：不再提供手动「回收空间」按钮，改为存储库设置中的「自动回收空间」
+> （`RepoMeta.AutoCompact`，未配置按**开启**处理）。后台任务每小时扫描一次，
+> 只处理启用该开关、状态为 active 且没有未结束租约（active/expired）的库；
+> 同一块盘 24 小时内最多自动压缩一次。租约释放后下一轮即可能入队。
+
 调度约束：
-- 只处理 `state == 'ready' && !mounted && 无 active lease` 的盘；
+- 只处理 `state == 'ready' && !mounted && 无未结束租约（active/expired）` 的盘；
 - 每卷同一时刻只跑一个 compact 任务（磁盘 IO 密集）；
 - 记录 compact 前后的 `FileSize`，用于统计回收效果；
 - 若目标环境无 Hyper-V 角色（`Optimize-VHD` 属 Hyper-V 模块），回退方案：

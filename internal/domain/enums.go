@@ -324,9 +324,18 @@ const (
 	JobCreateVHDXFromDir JobType = "create_vhdx_from_dir"
 	JobCopyVHDX          JobType = "copy_vhdx"
 	JobCreateDiff        JobType = "create_diff"
-	JobPublish           JobType = "publish"
-	JobUnpublish         JobType = "unpublish"
-	JobReclaim           JobType = "reclaim"
+	// JobCreateDiffFromDir 从服务端目录创建一块差异盘：先对比源目录与母盘现有内容，
+	// 生成新增/修改/删除清单，再在差异盘里只执行这些改动（见 app/diffsync.go）。
+	JobCreateDiffFromDir JobType = "create_diff_from_dir"
+	// JobPlanClientDiff 客户端目录创建差异盘的第一阶段：服务端建盘、比对客户端清单、
+	// 删除多余项，并记录"客户端还需要上传哪些文件"（见 app/clientdiff.go）。
+	JobPlanClientDiff JobType = "plan_client_diff"
+	// JobMergeDiff 维护态下把选中的差异盘合并进母盘：先清除其它差异盘，
+	// 再执行离线合并、自增母盘版本并退出维护（见 DiskService.runMergeDiff）。
+	JobMergeDiff JobType = "merge_diff"
+	JobPublish   JobType = "publish"
+	JobUnpublish JobType = "unpublish"
+	JobReclaim   JobType = "reclaim"
 	// JobCleanupDiffs 维护态下清理全部差异盘：先通知在线客户端断开（撤销租约），
 	// 再逐个拆除 iSCSI 目标并删除差异盘。异步且可重试，见 RepoService.CleanupDiffs。
 	JobCleanupDiffs JobType = "cleanup_diffs"

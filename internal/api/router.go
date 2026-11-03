@@ -183,6 +183,11 @@ func (r *Router) routes() {
 		g.Post("/v1/repos/{id}/parent/actions", r.handleParentAction)
 		g.Post("/v1/repos/{id}/parent/cleanup-diffs", r.handleCleanupDiffs)
 		g.Post("/v1/repos/{id}/parent/resize", r.handleResizeParent)
+		// 维护态：选择一个差异盘合并进母盘（其它差异盘会被删除）。
+		g.Post("/v1/repos/{id}/parent/merge-diff", r.handleMergeDiff)
+		// 差异盘工具正在执行的任务（界面刷新/重进页面后恢复进度与锁定态）。
+		g.Get("/v1/repos/{id}/diff-operation", r.handleActiveDiffOperation)
+		g.Post("/v1/repos/{id}/diff-operation/cancel", r.handleCancelActiveDiffOperation)
 		// 维护态下的母盘文件管理（服务端本地挂载，不再把母盘挂到客户端）。
 		g.Get("/v1/repos/{id}/parent/files", r.handleListParentFiles)
 		g.Get("/v1/repos/{id}/parent/files/content", r.handleDownloadParentFile)
@@ -193,6 +198,15 @@ func (r *Router) routes() {
 		g.Post("/v1/repos/{id}/parent/files/dir", r.handleMkdirParent)
 		g.Post("/v1/repos/{id}/parent/files/move", r.handleMoveParentEntry)
 		g.Post("/v1/repos/{id}/parent/files/copy", r.handleCopyParentEntry)
+		// 从服务端目录创建差异盘（只把新增/修改/删除写进差异盘）。
+		g.Post("/v1/repos/{id}/diffs/from-dir", r.handleStartDiffFromDir)
+		g.Get("/v1/repos/{id}/diffs/from-dir/result", r.handleDiffFromDirResult)
+		// 客户端目录：清单比对（各自算各自的）→ 只上传新增/修改文件。
+		g.Post("/v1/repos/{id}/diffs/from-dir/client-plan", r.handleClientDiffPlan)
+		g.Get("/v1/repos/{id}/diffs/from-dir/client-plan/result", r.handleClientDiffPlanResult)
+		g.Post("/v1/repos/{id}/diffs/from-dir/client-upload", r.handleClientDiffUpload)
+		g.Get("/v1/repos/{id}/diffs/from-dir/client-upload/result", r.handleClientDiffResult)
+		g.Post("/v1/repos/{id}/diffs/from-dir/client-abort", r.handleClientDiffAbort)
 		// 上传核对：临时差异盘 + 与客户端清单逐文件对比。
 		g.Post("/v1/repos/{id}/diff", r.handleStartVerifyDiff)
 		g.Get("/v1/repos/{id}/diff/progress", r.handleVerifyDiffProgress)

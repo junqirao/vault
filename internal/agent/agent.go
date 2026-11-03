@@ -100,6 +100,8 @@ type Agent struct {
 	uploads *uploadManager
 	// manifests 管理"上传核对"的本地清单任务（内存态，见 manifest.go）。
 	manifests *manifestManager
+	// diffsync 管理"客户端目录 → 差异盘"任务（内存态，见 clientdiff.go）。
+	diffsync *diffSyncManager
 	// usage 缓存"本机挂载卷用量"快照（客户端存储库页面展示，见 volusage.go）。
 	usage *volumeUsageCache
 	// manualUnmounts 是"本次运行被用户手动卸载过"的库（内存态，进程重启即清空）：
@@ -218,6 +220,7 @@ func New(opt Options) (*Agent, error) {
 		downloads: newDownloadManager(),
 		uploads:   newUploadManager(filepath.Join(filepath.Dir(state.Path()), uploadsFileName)),
 		manifests: newManifestManager(),
+		diffsync:  newDiffSyncManager(),
 
 		subRunning:        make(map[string]bool),
 		eventsUnsupported: make(map[string]bool),

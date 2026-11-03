@@ -87,6 +87,8 @@ func (r TransitionRequest) Validate() error {
 // CanDerive 判断当前母盘条件下是否允许再派生一个差异盘。
 //
 // 正常状态（idle）即可派生，**不要求当前没有差异盘**；临时共享与维护态禁止派生。
+// 维护态的"从目录创建差异盘/合并"是差异盘工具的另一条受控路径（见 app/diffsync.go），
+// 它不作为普通分配派生，且会锁住整个存储库。
 // limit 为该库配置的 max_diff_disks（0 表示不限制）。
 func CanDerive(cond ParentCondition, diffCount, limit int) error {
 	if cond != ParentIdle {

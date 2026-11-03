@@ -125,15 +125,17 @@ type repoDTO struct {
 	// 与 UsedBytes 不同：后者是"已分配出去的差异盘按标称容量计费"，母盘不在其中。
 	ParentUsedBytes int64          `json:"parent_used_bytes"`
 	UsedBytes       int64          `json:"used_bytes"`
-	State         string         `json:"state"`
-	Group         string         `json:"group,omitempty"`
-	ClientConfig  map[string]any `json:"client_config,omitempty"`
+	State           string         `json:"state"`
+	Group           string         `json:"group,omitempty"`
+	ClientConfig    map[string]any `json:"client_config,omitempty"`
 	// Note 说明备注（自由文本）。
 	//
 	// 主要用途是**迁移**：它会写进母盘的元数据 sidecar 跟着文件走，换一台服务端后
 	// 「导入磁盘」能看到"这是财务的 Win10 母盘，别删"。库还在本机时它也就是一条备注，
 	// 因此**不设独立列**，随 Meta JSON 一起存（见 domain.RepoMeta.Note）。
 	Note string `json:"note,omitempty"`
+	// AutoCompact 是否自动回收磁盘空间。未配置的老库按默认开启下发。
+	AutoCompact bool `json:"auto_compact"`
 	// Pool 是否为池化共享库：建库时已把差异盘池建好并发布，分配即用（挂载免等）。
 	Pool bool `json:"pool"`
 	// Permission 是**调用者自己**对这个库的有效权限等级（read | mount | manage）。
@@ -165,10 +167,10 @@ type repoPrepareDTO struct {
 	Total int    `json:"total"`
 	// 母盘拷入阶段的字节进度与速率（见 domain.RepoPrepare）：卡片据此复用
 	// "用量"那一格的进度条，详情页据此显示已写入 / 总量、速度与预计剩余。
-	BytesDone        int64 `json:"bytes_done,omitempty"`
-	BytesTotal       int64 `json:"bytes_total,omitempty"`
-	SpeedBytesPerSec int64 `json:"speed_bytes_per_sec,omitempty"`
-	EtaSeconds       int64 `json:"eta_seconds,omitempty"`
+	BytesDone        int64  `json:"bytes_done,omitempty"`
+	BytesTotal       int64  `json:"bytes_total,omitempty"`
+	SpeedBytesPerSec int64  `json:"speed_bytes_per_sec,omitempty"`
+	EtaSeconds       int64  `json:"eta_seconds,omitempty"`
 	Error            string `json:"error,omitempty"`
 }
 
@@ -195,7 +197,7 @@ func toRepoDTO(r *domain.Repository) repoDTO {
 		ParentUsedBytes: r.ParentUsedBytes,
 		UsedBytes:       r.UsedBytes, State: string(r.State),
 		Group: r.Meta.Group, ClientConfig: r.Meta.ClientConfig,
-		Note: r.Meta.Note, Pool: r.Meta.Pool,
+		Note: r.Meta.Note, AutoCompact: r.Meta.AutoCompactEnabled(), Pool: r.Meta.Pool,
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt,
 	}
 	if r.ParentDiskID != nil {

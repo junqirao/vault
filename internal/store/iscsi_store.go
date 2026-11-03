@@ -432,6 +432,22 @@ func (s *Store) CountActiveLeasesByRepo(ctx context.Context, repoID string) (int
 	return n, nil
 }
 
+// CountOpenLeasesByRepo 统计某存储库下仍可能占用磁盘的租约（active / expired）。
+//
+// released / revoked 是终态；expired 虽然当前离线，但客户端下一次心跳会把它续回
+// active（见 TouchLease），因此自动维护不能把它当作"盘已空闲"——否则可能在一块
+// 仍被远端挂载的盘上做压缩。
+func (s *Store) CountOpenLeasesByRepo(ctx context.Context, repoID string) (int, error) {
+	var n int
+	query := `SELECT COUNT(*) FROM leases l JOIN allocations a ON a.id = l.allocation_id
+	          WHERE a.repo_id = ? AND l.state IN (?, ?)`
+	if err := s.q.GetContext(ctx, &n, s.q.Rebind(query), repoID,
+		string(domain.LeaseStateActive), string(domain.LeaseStateExpired)); err != nil {
+		return 0, fmt.Errorf("store: 统计未结束租约失败: %w", err)
+	}
+	return n, nil
+}
+
 // ListExpiredLeases 列出已过期的活跃租约，供 Reaper 处理。
 func (s *Store) ListExpiredLeases(ctx context.Context, now int64, limit int) ([]domain.Lease, error) {
 	if limit <= 0 || limit > 1000 {

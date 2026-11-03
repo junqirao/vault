@@ -89,6 +89,11 @@ func (a *Agent) localMux() http.Handler {
 	mux.HandleFunc("GET /agent/fs/manifest/status", a.handleManifestStatus)
 	mux.HandleFunc("GET /agent/fs/manifest/result", a.handleManifestResult)
 	mux.HandleFunc("POST /agent/uploads/start", a.handleUploadStart)
+	// 客户端目录 → 差异盘：本地扫描、服务端清单比对、只上传新增/修改文件。
+	mux.HandleFunc("POST /agent/diffs/from-dir", a.handleStartDiffSync)
+	mux.HandleFunc("GET /agent/diffs", a.handleListDiffSync)
+	mux.HandleFunc("GET /agent/diffs/{id}", a.handleGetDiffSync)
+	mux.HandleFunc("DELETE /agent/diffs/{id}", a.handleCancelDiffSync)
 	mux.HandleFunc("GET /agent/uploads", a.handleListUploads)
 	mux.HandleFunc("DELETE /agent/uploads/{upload_id}", a.handleCancelUpload)
 	// 暂停 / 恢复上传：用 POST 而不是 PUT（主进程按方法放行，PUT 会被挡下，见上面 repo-mounts

@@ -187,12 +187,29 @@ function RepoMeter({
   style?: CSSProperties
 }): JSX.Element {
   return (
-    <div style={style}>
+    <div style={{ ...style, minWidth: 0 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', gap: spacing.xs }}>
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
+        <Typography.Text
+          type="secondary"
+          style={{ fontSize: fontSize.sm, whiteSpace: 'nowrap', flex: '0 0 auto' }}
+        >
           {label}
         </Typography.Text>
-        <Typography.Text style={{ fontSize: fontSize.sm }}>{value}</Typography.Text>
+        {/* 数值再长也不换行：窄列里"2.04 GB / 10.0 GB"换行会把下面的进度条挤下去，
+            整行高度跟着跳。优先省略号，完整值仍可从悬浮说明看。 */}
+        <Typography.Text
+          style={{
+            fontSize: fontSize.sm,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            textAlign: 'right',
+            flex: '1 1 auto',
+            minWidth: 0
+          }}
+        >
+          {value}
+        </Typography.Text>
       </div>
       <UsageBar percent={percent} muted={muted} loading={loading} color={color} />
     </div>
@@ -415,7 +432,7 @@ function RepoCacheStatus({
   )
 }
 
-/** 次要信息行：缓存状态 / 已预创建 / 挂载状态。 */
+/** 次要信息行：缓存状态 / 挂载状态。 */
 function RepoMetaLine({
   repo,
   controller,
@@ -425,16 +442,9 @@ function RepoMetaLine({
   controller: RepoMountController
   style?: CSSProperties
 }): JSX.Element {
-  const { t } = useI18n()
   return (
     <Space size={spacing.md} wrap style={style}>
       <RepoCacheStatus repoId={repo.id} controller={controller} />
-      {/* 「已预创建」= 差异盘与 iSCSI 目标在建库时就备好：分配到手的盘挂载即用，不必现场下发 */}
-      {repo.pool ? (
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.card.pool')}
-        </Typography.Text>
-      ) : null}
       <RepoMountStatus controller={controller} />
     </Space>
   )
@@ -1018,14 +1028,16 @@ function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onCon
         {/* 用量固定宽度：多行之间进度条与数值才能对齐着扫。这个宽度同时就是条的长度
             （窄了条短得像条线、填充比例看不出来），且容得下「已用」+ 最宽的一条文案
             （"- / 1000 MB" 这样的"已用 / 上限"）；上传进度复用同一格，所以两条数值也
-            落在同一条竖线上。 */}
+            落在同一条竖线上。
+            原 240px；加长 15%（240 × 1.15 = 276），给"2.04 GB / 10.0 GB"这类长数值
+            留出空间，避免换行把下面的进度条挤到下一行。 */}
         <RepoUsage
           repo={repo}
           currentUserId={currentUserId}
           usage={mountController.usage}
           loading={mountController.usageLoading}
           upload={upload}
-          style={{ flex: '0 0 auto', width: 240 }}
+          style={{ flex: '0 0 auto', width: 276 }}
         />
 
         <RepoActions

@@ -112,6 +112,11 @@ func (b *Backend) CreateDiff(ctx context.Context, childRef, parentRef string) er
 	return b.VHD.CreateDifferencing(ctx, childRef, parentRef)
 }
 
+// MergeDiff 把差异盘合并进母盘（需要 Hyper-V 模块，离线操作）。
+func (b *Backend) MergeDiff(ctx context.Context, childRef, parentRef string) error {
+	return b.VHD.MergeDiff(ctx, childRef, parentRef)
+}
+
 // Clone 全量复制 VHDX。
 //
 // 不再单独调用 ResetDiskIdentifier：winvhd.Copy 内部已在复制末尾重置磁盘标识，

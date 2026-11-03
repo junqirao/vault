@@ -70,6 +70,9 @@ type moveRepoPayload struct {
 
 // Move 发起存储库迁移：复制全部磁盘到目标存储，复制完成后删除源文件。
 func (s *RepoService) Move(ctx context.Context, repoID, toStorageID, operatorID string) (*domain.Job, error) {
+	if err := s.ensureNoActiveDiffOperation(ctx, repoID); err != nil {
+		return nil, err
+	}
 	repo, err := s.Store.GetRepository(ctx, repoID)
 	if err != nil {
 		return nil, err

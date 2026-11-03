@@ -34,6 +34,8 @@ const DISK_JOB_TYPES = new Set([
   'create_vhdx_from_dir',
   'copy_vhdx',
   'create_diff',
+  'create_diff_from_dir',
+  'plan_client_diff',
   'compact',
   'delete_disk',
   'prepare_repo',
@@ -44,6 +46,7 @@ const DISK_JOB_TYPES = new Set([
 const REPO_JOB_TYPES = new Set([
   'move_repo',
   'cleanup_diffs',
+  'merge_diff',
   'parent_teardown',
   'verify_diff',
   'reconcile',

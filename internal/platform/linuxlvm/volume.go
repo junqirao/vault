@@ -123,8 +123,15 @@ func (m *Manager) MountVolume(ctx context.Context, ref, fileSystem string) (stri
 }
 
 // UnmountVolume 卸载 MountVolume 的临时挂载点（幂等）。
-func (m *Manager) UnmountVolume(ctx context.Context, _ string, root string) error {
+func (m *Manager) UnmountVolume(ctx context.Context, ref string, root string) error {
 	root = strings.TrimSpace(root)
+	if root == "" && strings.TrimSpace(ref) != "" {
+		// 进程重启后 parentMounts 内存表会丢，但内核里的挂载还在：
+		// 调用方只拿得到 ref 时按 ref 反查实际挂载点，避免"卸载成功"其实没卸。
+		if mp, err := mountPointOf(ref); err == nil {
+			root = strings.TrimSpace(mp)
+		}
+	}
 	if root == "" {
 		return nil
 	}

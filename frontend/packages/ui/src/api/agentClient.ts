@@ -13,6 +13,8 @@ import type {
   AgentCacheHistory,
   AgentCacheStatus,
   AgentConfig,
+  AgentDiffSyncStartResult,
+  AgentDiffSyncStatus,
   AgentEvent,
   AgentHealth,
   AgentIdentity,
@@ -739,6 +741,55 @@ export const agentApi = {
       method: 'GET',
       path: `/agent/fs/manifest/result?id=${encodeURIComponent(id)}`,
       timeoutMs: 120000
+    })
+  },
+
+  /**
+   * 启动"客户端目录 → 差异盘"任务。
+   *
+   * 代理先扫描本地目录、把清单发给服务端比对（不传文件内容），再只上传新增/修改的文件。
+   * 立即返回任务 ID；进度用 getDiffSync 轮询（服务端 plan 阶段可能持续数分钟）。
+   */
+  startDiffSync(input: {
+    repo_id: string
+    local_dir: string
+    mode: 'auto' | 'hash' | 'size'
+    delete_extra: boolean
+    server_key?: string
+  }): Promise<AgentDiffSyncStartResult> {
+    return request<AgentDiffSyncStartResult>({
+      method: 'POST',
+      path: '/agent/diffs/from-dir',
+      body: input,
+      timeoutMs: 30000
+    })
+  },
+
+  /** 列出本机保存的差异任务（按开始时间倒序；repoID 留空返回全部）。 */
+  listDiffSync(repoID?: string): Promise<{ items: AgentDiffSyncStatus[] }> {
+    const query = repoID ? `?repo_id=${encodeURIComponent(repoID)}` : ''
+    return request<{ items: AgentDiffSyncStatus[] }>({
+      method: 'GET',
+      path: `/agent/diffs${query}`,
+      timeoutMs: 30000
+    })
+  },
+
+  /** 查询客户端目录差异任务的状态（含最终结果）。 */
+  getDiffSync(id: string): Promise<AgentDiffSyncStatus> {
+    return request<AgentDiffSyncStatus>({
+      method: 'GET',
+      path: `/agent/diffs/${encodeURIComponent(id)}`,
+      timeoutMs: 30000
+    })
+  },
+
+  /** 取消客户端目录差异任务（尽力清理服务端未完成的差异盘）。 */
+  cancelDiffSync(id: string): Promise<{ ok: true }> {
+    return request<{ ok: true }>({
+      method: 'DELETE',
+      path: `/agent/diffs/${encodeURIComponent(id)}`,
+      timeoutMs: 30000
     })
   },
 

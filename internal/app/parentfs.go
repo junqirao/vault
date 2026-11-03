@@ -59,6 +59,10 @@ func (s *RepoService) ParentMount(ctx context.Context, repoID string) (string, e
 	if repo.ParentDiskID == nil {
 		return "", apperr.New("repo.disk_missing", http.StatusInternalServerError)
 	}
+	// 差异盘创建/合并会独占母盘：期间禁止再挂载母盘文件页。
+	if err := s.ensureNoActiveDiffOperation(ctx, repo.ID); err != nil {
+		return "", err
+	}
 	parent, err := s.Store.GetDisk(ctx, *repo.ParentDiskID)
 	if err != nil {
 		return "", err
