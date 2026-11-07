@@ -248,6 +248,10 @@ MountState = {
   allocation_id, lease_id,
   target_iqn, portal, mount_mode:"letter"|"directory",
   mount_path,                 # letter 模式为 "E:"；directory 模式为 "C:\\Vault\\home\\game-x"
+  # shortcut_path：本次挂载自动创建的快捷方式完整路径（可选，空 = 没有自动创建）。
+  #   仅当该库开启了 shortcut_enabled 时创建；卸载时按这个路径精确删除，
+  #   用户后来改了快捷方式目录/库名也不会漏删或删错用户自己的 .lnk。
+  shortcut_path,
   disk_number,                # 可选，Windows 磁盘号
   state:"mounting"|"mounted"|"unmounting"|"error"|"revoked",
   # phase：state="mounting" 期间的**细粒度阶段**（取值见下），非挂载中时缺省。
@@ -468,7 +472,7 @@ CacheTargetStatus = {
   target_iqn,                   # 本地门户为该库公示的 IQN（挂载链路上实际连接的）
   cache_enabled,                # 该目标是否真的带读缓存；false = 纯透传，下面的缓存计数恒为 0
   # 卡片上的「已缓存 / 命中率 / 峰值速度」直接读这里：
-  peak_read_bytes_per_sec, peak_write_bytes_per_sec,   # 近 5 分钟窗口内的读写峰值吞吐（字节/秒）
+  peak_read_bytes_per_sec, peak_write_bytes_per_sec,   # 近 10 分钟窗口内的读写峰值吞吐（字节/秒）
   l1_used_bytes, l1_limit_bytes,   # 内存缓存占用与配额（占用只算块数据 blocks×blockSize）
   l1_resident_bytes,            # 上面这份索引**实际**占的堆（估算，含 entry 头/map 桶/队列槽位）
   l2_used_bytes, l2_limit_bytes,   # L2 文件占用与配额（未启用 L2 时均为 0）
@@ -508,11 +512,12 @@ GET /agent/performance            # 我的存储库首页「性能指标」
   ↑ {
     interval_sec,                 # 采样间隔（当前 5 秒）
     l1_limit_bytes, l2_limit_bytes,   # 当前客户端缓存预算
-    points: [{                     # 近 5 分钟，按时间升序
+    points: [{                     # 近 10 分钟，按时间升序
       t,
       read_iops, write_iops,       # 经过代理的读/写命令数每秒
       read_bytes_per_sec, write_bytes_per_sec,
       hit_rate,                    # 本采样区间的缓存命中率（0..1）
+      random_4k_rate,              # 4 KiB 随机读命令占全部读命令的比例（0..1）
       l1_used_bytes, l2_used_bytes, cache_used_bytes
     }]
   }
@@ -820,18 +825,21 @@ GET   /agent/config
   ↑ {auto_mount:bool, default_mount_mode, default_mount_dir, default_download_dir, shortcut_dir,
      download_connections, language, start_at_login:bool, update_channel, server_alias,
      cache_l1_bytes:int, cache_l2_bytes:int, cache_l2_dir:string,
-     repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}},
+     repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool,
+                             direct_mode:bool, shortcut_enabled:bool}},
      group_mounts:{<group>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool,
+                            direct_mode:bool, shortcut_enabled:bool,
                             use_for_repos:bool, use_repos:[<repo_id>]}}}
 PATCH /agent/config
   ↓ 上述字段的任意子集（不含 repo_mounts / group_mounts / default_mount_mode / default_mount_dir）
   ↑ {config:{...}}
 POST  /agent/repo-mounts/{repo_id}
-  ↓ {mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool}
+  ↓ {mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool, direct_mode:bool,
+     shortcut_enabled:bool}
   ↑ {config:{...}}
 POST  /agent/group-mounts
-  ↓ {group, mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool,
-     use_for_repos:bool, use_repos:[<repo_id>]}
+  ↓ {group, mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool, direct_mode:bool,
+     shortcut_enabled:bool, use_for_repos:bool, use_repos:[<repo_id>]}
   ↑ {config:{...}}
 ```
 
@@ -861,6 +869,10 @@ POST  /agent/group-mounts
   （只接受 GET/POST/PATCH/DELETE），PUT 会被挡在代理之外并向上报成 `network.error`。
 - `mount_mode` 为空串表示跟随 `default_mount_mode`；非法值返回
   `system.invalid_param`（args.field=mount_mode），空 `repo_id` 返回 args.field=repo_id。
+- `shortcut_enabled` 是"是否为该库在挂载后自动创建快捷方式"（默认 **false**）。
+  创建位置由全局 `shortcut_dir` 决定（空串 = 系统桌面）；挂载成功时创建/覆盖同名 `.lnk`，
+  卸载（挂载点已移除）时按挂载记录里的 `shortcut_path` 删除。快捷方式创建失败**不影响挂载**，
+  只记 WARN 日志。用户自己放在同一目录的 `.lnk` 不会被动到。
 - `cache_enabled` 是"是否为该库启用本地 iSCSI 读缓存代理"（默认 **true**，用户可在
   「存储库 → 挂载设置」关闭；旧配置缺少这个键时同样按开启处理）。它与
   `mount_mode` / `mount_dir` / `auto_mount` 同属**整条偏好**：

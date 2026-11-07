@@ -45,6 +45,25 @@ type pending struct {
 	invGen uint64
 }
 
+// readPattern tracks where the previous read on one session ended. It is only
+// touched by the initiator pump goroutine, so it needs no lock; the zero value
+// is not used directly (newSession starts lastEnd at -1 so the first read is
+// classified as random rather than as a continuation of offset 0).
+type readPattern struct {
+	lastEnd int64
+}
+
+// observe classifies one read and reports whether it is a 4 KiB random read:
+// a 4 KiB transfer that does not start where the previous read ended. It is
+// two integer comparisons and one store, so it adds nothing measurable to the
+// read path; only 4 KiB reads are counted, which is the size random I/O is
+// judged by.
+func (p *readPattern) observe(off, length int64) bool {
+	random := length == 4096 && off != p.lastEnd
+	p.lastEnd = off + length
+	return random
+}
+
 // session is one initiator TCP connection spliced to one backend connection.
 //
 // The proxy is transparent: it never terminates the iSCSI session, so the
@@ -96,6 +115,9 @@ type session struct {
 	// 紧随其后的 Data-Out 载荷里。命令与载荷都只在 I→T 泵（pumpIT）里出现，所以
 	// 这张表不需要锁，也不能被其他 goroutine 碰。
 	unmapPending map[uint32]*unmapPending
+
+	// readPattern 只由 pumpIT 读写（READ 命令都在那里解析），因此无需加锁。
+	readPattern readPattern
 }
 
 func newSession(t *target, it, bt net.Conn) *session {
@@ -108,6 +130,7 @@ func newSession(t *target, it, bt net.Conn) *session {
 		tgtMRDSL: defaultMRDSL,
 		pending:  make(map[uint32]*pending),
 	}
+	s.readPattern.lastEnd = -1
 	s.initMRDSL.Store(defaultMRDSL)
 	s.tiBatch = newFrameBatch(it)
 	return s
@@ -384,15 +407,19 @@ func (s *session) handleRead(f *frame) bool {
 	if bs == 0 || err != nil {
 		return false
 	}
+	length := int64(p.Blocks) * int64(bs)
+	off := int64(p.LBA) * int64(bs)
+	// 顺序/随机分类放在缓存分支之前：纯透传目标（NoCache）也要有读数。
+	if s.readPattern.observe(off, length) {
+		t.stats.random4k.Add(1)
+	}
 	c := t.getCache()
 	if c == nil {
 		return false
 	}
-	length := int64(p.Blocks) * int64(bs)
 	if length <= 0 || length > maxTeeBytes {
 		return false
 	}
-	off := int64(p.LBA) * int64(bs)
 	// 扫描准入先于分配：被判定为顺序扫描的读既不回填也不该白分配一个大缓冲区。
 	scanned := t.scan.scan(off, length)
 	buf := readBufGet(int(length))

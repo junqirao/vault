@@ -23,9 +23,23 @@ export type StartupPhase =
   | { kind: 'select-server' }
   | { kind: 'ready' }
 
+/**
+ * 自动连接服务端连接失败后的自动重连退避（毫秒）。
+ *
+ * 最后一档持续循环：开启自动连接意味着用户希望"服务端恢复后自己连上"，
+ * 而不是停在"无法连接"页等下一个人来点重试。退避只为避免服务端长时间不可达时刷日志/打满连接。
+ */
+const AUTO_RECONNECT_DELAYS_MS = [3000, 5000, 10000, 20000, 30000]
+
 export interface StartupFlow {
   phase: StartupPhase
   checking: boolean
+  /**
+   * 活动服务端开启了自动连接、且当前处于"无法连接"阶段时，是否正在自动重连。
+   *
+   * 界面据此告诉用户"还在连"而不是"已经放弃"（两者都停在 offline 页，但观感完全不同）。
+   */
+  autoReconnecting: boolean
   /** 重新执行检查（重试 / 保存地址后）。 */
   recheck: () => void
   setPhase: (phase: StartupPhase) => void
@@ -33,6 +47,22 @@ export interface StartupFlow {
   selectServer: (key: string) => void
   /** 光标处于不兼容提示页时，允许"仍然继续（只读查看）"。 */
   continueAfterCompat: (check: ClientCheckResponse) => void
+  /**
+   * 暂停自动重连：用户打开"修改地址"表单时调用，避免后台自动连上后把表单顶掉。
+   *
+   * 与 resumeAutoReconnect 成对使用；新的检查（保存地址 / 手动重试 / 切换服务端）
+   * 也会自动恢复，不会让自动重连一直停着。
+   */
+  pauseAutoReconnect: () => void
+  resumeAutoReconnect: () => void
+}
+
+interface RunOptions {
+  /**
+   * 后台重试：不进入 loading 页（避免每次自动重连都把"无法连接"页闪成整屏加载），
+   * 失败后仍停留在 offline 页并继续退避。
+   */
+  background?: boolean
 }
 
 function isOfflineError(error: unknown): boolean {
@@ -41,16 +71,62 @@ function isOfflineError(error: unknown): boolean {
 
 /** 启动流程：读取配置 → client-check → bootstrap 状态 → token 校验 → 登录/主界面。 */
 export function useStartupFlow(api: VaultApi): StartupFlow {
-  const [phase, setPhase] = useState<StartupPhase>({ kind: 'loading' })
+  const [phase, setPhaseState] = useState<StartupPhase>({ kind: 'loading' })
   const [checking, setChecking] = useState(false)
+  const [autoReconnecting, setAutoReconnecting] = useState(false)
+  const [autoReconnectPaused, setAutoReconnectPaused] = useState(false)
   const activeKey = useAppStore((state) => state.activeKey)
   const hydrated = useAppStore((state) => state.hydrated)
+  // 只订阅"活动服务端是否开启自动连接"这个布尔量：设置页改了开关也要立即生效。
+  const autoConnectActive = useAppStore((state) => {
+    const active = selectActiveServer(state)
+    return Boolean(active && active.autoConnect !== false)
+  })
   const runTokenRef = useRef(0)
+  /** 自动重连已经排到第几次（用于选退避档位；离开 offline 或手动检查时清零）。 */
+  const autoReconnectAttemptRef = useRef(0)
+  /** 待触发的自动重连定时器；显式检查 / 暂停时先取消，避免和手动操作抢跑。 */
+  const autoReconnectTimerRef = useRef<number | null>(null)
+  /** 指向最新的 run，避免自动重连定时器闭包里拿到旧实现。 */
+  const runRef = useRef<(forceContinue: boolean, options?: RunOptions) => Promise<void>>(async () => undefined)
+
+  const setPhase = useCallback((next: StartupPhase): void => {
+    setPhaseState(next)
+  }, [])
+
+  const pauseAutoReconnect = useCallback((): void => {
+    setAutoReconnectPaused(true)
+    // 用户在改地址期间如果恰好有一次后台重连在途，作废它的结果：
+    // 否则它稍后连上会把正在编辑的表单直接顶掉。
+    if (autoReconnectTimerRef.current !== null) {
+      window.clearTimeout(autoReconnectTimerRef.current)
+      autoReconnectTimerRef.current = null
+    }
+    runTokenRef.current += 1
+    setChecking(false)
+    setAutoReconnecting(false)
+  }, [])
+
+  const resumeAutoReconnect = useCallback((): void => {
+    setAutoReconnectPaused(false)
+  }, [])
 
   const run = useCallback(
-    async (forceContinue: boolean): Promise<void> => {
+    async (forceContinue: boolean, options: RunOptions = {}): Promise<void> => {
       const token = ++runTokenRef.current
-      setPhase({ kind: 'loading' })
+      const background = options.background === true
+      if (!background) {
+        // 任何一次"显式"检查都从第一档退避重新开始，并恢复被表单暂停的自动重连。
+        // 先取消已排队的自动重连，避免它和本次检查同时打服务端。
+        if (autoReconnectTimerRef.current !== null) {
+          window.clearTimeout(autoReconnectTimerRef.current)
+          autoReconnectTimerRef.current = null
+        }
+        autoReconnectAttemptRef.current = 0
+        setAutoReconnectPaused(false)
+        setAutoReconnecting(false)
+        setPhase({ kind: 'loading' })
+      }
       setChecking(true)
 
       const state = useAppStore.getState()
@@ -138,13 +214,51 @@ export function useStartupFlow(api: VaultApi): StartupFlow {
         if (runTokenRef.current === token) setChecking(false)
       }
     },
-    [api]
+    [api, setPhase]
   )
+
+  useEffect(() => {
+    runRef.current = run
+  }, [run])
 
   useEffect(() => {
     if (!hydrated) return
     void run(false)
   }, [hydrated, activeKey, run])
+
+  /**
+   * 自动重连循环：只有"活动服务端开启了自动连接"才自动重试。
+   *
+   * 依赖 phase 对象而不是 phase.kind：后台重试失败会重新 setPhase(offline)（detail 可能变化），
+   * 必须据此安排下一次退避；一旦离开 offline（连上、进入登录/兼容/初始化页），清理定时器并重置档位。
+   * 用户打开"修改地址"表单时暂停，避免后台连上后把正在输入的表单顶掉。
+   */
+  useEffect(() => {
+    if (phase.kind !== 'offline' || autoReconnectPaused) {
+      setAutoReconnecting(false)
+      if (phase.kind !== 'offline') autoReconnectAttemptRef.current = 0
+      return
+    }
+    if (!autoConnectActive) {
+      // 手动选择了一台"不自动连接"的服务端：失败就停在这里，由用户决定下一步。
+      setAutoReconnecting(false)
+      return
+    }
+
+    const attempt = autoReconnectAttemptRef.current
+    autoReconnectAttemptRef.current = attempt + 1
+    const delay = AUTO_RECONNECT_DELAYS_MS[Math.min(attempt, AUTO_RECONNECT_DELAYS_MS.length - 1)]
+    setAutoReconnecting(true)
+    const timer = window.setTimeout(() => {
+      if (autoReconnectTimerRef.current === timer) autoReconnectTimerRef.current = null
+      void runRef.current(false, { background: true })
+    }, delay)
+    autoReconnectTimerRef.current = timer
+    return () => {
+      window.clearTimeout(timer)
+      if (autoReconnectTimerRef.current === timer) autoReconnectTimerRef.current = null
+    }
+  }, [phase, activeKey, autoConnectActive, autoReconnectPaused])
 
   const recheck = useCallback(() => {
     void run(false)
@@ -164,7 +278,17 @@ export function useStartupFlow(api: VaultApi): StartupFlow {
     useAppStore.getState().setActive(key)
   }, [])
 
-  return { phase, checking, recheck, setPhase, selectServer, continueAfterCompat }
+  return {
+    phase,
+    checking,
+    autoReconnecting,
+    recheck,
+    setPhase,
+    selectServer,
+    continueAfterCompat,
+    pauseAutoReconnect,
+    resumeAutoReconnect
+  }
 }
 
 function errorMessage(error: unknown): string {

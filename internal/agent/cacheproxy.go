@@ -119,7 +119,7 @@ type cacheManager struct {
 
 	// historyMu 保护 history：采样 goroutine 写、HTTP 读。
 	historyMu sync.Mutex
-	// history 按库（分配）保留近 5 分钟的采样点，见 CacheHistory。
+	// history 按库（分配）保留近 10 分钟的采样点，见 CacheHistory。
 	history map[string][]CacheSample
 	// perf 是**已算好**的全局性能曲线（IOPS / 吞吐 / 缓存占用 / 命中率），
 	// 由 sampleLoop 每 5 秒写一次；GET /agent/performance 只做复制，不在请求里计算。
@@ -172,12 +172,15 @@ type cacheQuota struct {
 	L2 int64
 }
 
-// 缓存指标历史：近 5 分钟的滑动窗口（60 点 × 5s），供客户端"缓存指标曲线"弹窗展示。
+// 缓存指标历史：近 10 分钟的滑动窗口（120 点 × 5s），供性能详情的逐库视图展示。
+// 全局性能曲线与逐库历史使用同一保留时长。
 const (
 	// cacheHistoryInterval 相邻两个采样点的间隔。
 	cacheHistoryInterval = 5 * time.Second
-	// cacheHistoryPoints 是每个库保留的采样点数。
-	cacheHistoryPoints = 60
+	// cacheHistoryPoints 是每个库保留的采样点数（120 × 5s = 10 分钟）。
+	cacheHistoryPoints = 120
+	// perfHistoryPoints 是全局性能曲线保留的采样点数（120 × 5s = 10 分钟）。
+	perfHistoryPoints = 120
 )
 
 // CacheSample 是单个库在某一刻的计数快照。速率与命中率由前端按相邻点差分计算，
@@ -193,6 +196,8 @@ type CacheSample struct {
 	ReadBytes    int64 `json:"read_bytes"`
 	WriteBytes   int64 `json:"write_bytes"`
 	BackendReads int64 `json:"backend_reads"`
+	// Random4K 是 4 KiB 随机读命令的累计值（定义见 iscsiproxy.StatsSnapshot.Random4K）。
+	Random4K int64 `json:"random_4k"`
 	// L1UsedBytes/L2UsedBytes 是采样时刻的缓存占用（瞬时值，不做差分）。
 	L1UsedBytes int64 `json:"l1_used_bytes"`
 	L2UsedBytes int64 `json:"l2_used_bytes"`
@@ -206,7 +211,7 @@ type CacheHistory struct {
 	Targets map[string][]CacheSample `json:"targets"`
 }
 
-// PerfPoint 是一条**已在代理侧算好**的全局性能点（每 5 秒一个，保留 5 分钟）。
+// PerfPoint 是一条**已在代理侧算好**的全局性能点（每 5 秒一个，保留 10 分钟）。
 //
 // 前端只读它，不再对累计计数做差分；所有速率都来自 sampleLoop 的定时采样。
 type PerfPoint struct {
@@ -219,17 +224,22 @@ type PerfPoint struct {
 	WriteBytesPerSec float64 `json:"write_bytes_per_sec"`
 	// HitRate 本采样区间的缓存命中率（0..1）。
 	HitRate float64 `json:"hit_rate"`
+	// Random4KRate 是 4 KiB 随机读命令占全部读命令的比例（0..1），
+	// 与 HitRate 一样按当前 10 分钟窗口滚动计算。
+	Random4KRate float64 `json:"random_4k_rate"`
 	// L1UsedBytes / L2UsedBytes / CacheUsedBytes 当前缓存占用。
 	L1UsedBytes    int64 `json:"l1_used_bytes"`
 	L2UsedBytes    int64 `json:"l2_used_bytes"`
 	CacheUsedBytes int64 `json:"cache_used_bytes"`
 
-	// hits / reads 是本采样区间的增量，只用于在代理侧计算 5 分钟滚动命中率，不对外输出。
-	hits  float64
-	reads float64
+	// hits / reads / rand4k 是本采样区间的增量，只用于在代理侧计算 10 分钟滚动
+	// 命中率与随机读占比，不对外输出。
+	hits   float64
+	reads  float64
+	rand4k float64
 }
 
-// PerformanceHistory 是 GET /agent/performance 的响应：近 5 分钟的全局性能曲线。
+// PerformanceHistory 是 GET /agent/performance 的响应：近 10 分钟的全局性能曲线。
 type PerformanceHistory struct {
 	// IntervalSec 采样间隔（当前固定 5 秒）。
 	IntervalSec int64 `json:"interval_sec"`
@@ -375,7 +385,7 @@ func (m *cacheManager) clearCacheTargets() {
 }
 
 // Start 记录缓存代理的生命周期 context（门户在首次使用时才真正打开），
-// 并启动指标采样：近 5 分钟滑动窗口，供"缓存指标曲线"弹窗使用。
+// 并启动指标采样：缓存指标与全局性能曲线都保留 10 分钟。
 func (m *cacheManager) Start(ctx context.Context) {
 	if ctx == nil {
 		return
@@ -424,7 +434,7 @@ func (m *cacheManager) updateHistory(now time.Time, p *iscsiproxy.Portal) {
 	defer m.historyMu.Unlock()
 	alive := map[string]bool{}
 	// 全局性能点：按目标分别差分后求和（不同目标的上一采样时间可能不同）。
-	var readIOPS, writeIOPS, readBPS, writeBPS, reads, hits float64
+	var readIOPS, writeIOPS, readBPS, writeBPS, reads, hits, rand4k float64
 	var l1Used, l2Used int64
 	for _, key := range p.Keys() {
 		stats, ok := p.Stats(key)
@@ -443,6 +453,7 @@ func (m *cacheManager) updateHistory(now time.Time, p *iscsiproxy.Portal) {
 			ReadBytes:    stats.Proxy.ReadBytes,
 			WriteBytes:   stats.Proxy.WriteBytes,
 			BackendReads: cs.BackendReads,
+			Random4K:     stats.Proxy.Random4K,
 			L1UsedBytes:  cs.L1UsedBytes,
 		}
 		if stats.BlockSize > 0 {
@@ -460,13 +471,15 @@ func (m *cacheManager) updateHistory(now time.Time, p *iscsiproxy.Portal) {
 				drb := stats.Proxy.ReadBytes - prev.ReadBytes
 				dwb := stats.Proxy.WriteBytes - prev.WriteBytes
 				dh := cs.RequestHits - prev.Hits
-				if dr >= 0 && dw >= 0 && drb >= 0 && dwb >= 0 && dh >= 0 {
+				d4k := stats.Proxy.Random4K - prev.Random4K
+				if dr >= 0 && dw >= 0 && drb >= 0 && dwb >= 0 && dh >= 0 && d4k >= 0 {
 					readIOPS += float64(dr) / float64(dt)
 					writeIOPS += float64(dw) / float64(dt)
 					readBPS += float64(drb) / float64(dt)
 					writeBPS += float64(dwb) / float64(dt)
 					reads += float64(dr)
 					hits += float64(dh)
+					rand4k += float64(d4k)
 				}
 			}
 		}
@@ -499,20 +512,25 @@ func (m *cacheManager) updateHistory(now time.Time, p *iscsiproxy.Portal) {
 		CacheUsedBytes:   l1Used + l2Used,
 		hits:             hits,
 		reads:            reads,
+		rand4k:           rand4k,
 	})
-	if len(m.perf) > cacheHistoryPoints {
-		m.perf = m.perf[len(m.perf)-cacheHistoryPoints:]
+	if len(m.perf) > perfHistoryPoints {
+		m.perf = m.perf[len(m.perf)-perfHistoryPoints:]
 	}
-	// 命中率显示"近 5 分钟窗口"的滚动值，比单个 5 秒区间稳定（单个区间很容易 0/100% 跳）。
-	var windowHits, windowReads float64
+	// 命中率与 4K 随机读占比都显示"当前 10 分钟窗口"的滚动值，比单个 5 秒区间稳定
+	// （单个区间很容易 0/100% 跳）。
+	var windowHits, windowReads, windowRand4K float64
 	for i := range m.perf {
 		windowHits += m.perf[i].hits
 		windowReads += m.perf[i].reads
+		windowRand4K += m.perf[i].rand4k
 	}
 	if windowReads > 0 {
 		m.perf[len(m.perf)-1].HitRate = windowHits / windowReads
+		m.perf[len(m.perf)-1].Random4KRate = windowRand4K / windowReads
 	} else {
 		m.perf[len(m.perf)-1].HitRate = 0
+		m.perf[len(m.perf)-1].Random4KRate = 0
 	}
 }
 
@@ -545,7 +563,7 @@ func (m *cacheManager) peakThroughput(key string) (read, write float64) {
 	return read, write
 }
 
-// History 返回近 5 分钟的采样窗口（GET /agent/cache/history）。
+// History 返回近 10 分钟的采样窗口（GET /agent/cache/history）。
 func (m *cacheManager) History() CacheHistory {
 	m.historyMu.Lock()
 	defer m.historyMu.Unlock()
@@ -558,7 +576,7 @@ func (m *cacheManager) History() CacheHistory {
 	return CacheHistory{IntervalSec: int64(cacheHistoryInterval / time.Second), Targets: out}
 }
 
-// Performance 返回代理侧已经算好的近 5 分钟全局性能曲线（GET /agent/performance）。
+// Performance 返回代理侧已经算好的近 10 分钟全局性能曲线（GET /agent/performance）。
 //
 // 这里只做复制，不做任何差分/聚合：采样与计算全部在 sampleLoop 完成，
 // 前端定时读取缓存即可（避免每个页面请求都重新扫一遍目标）。
@@ -1343,7 +1361,7 @@ type CacheTargetStatus struct {
 	Writes       int64 `json:"writes"`
 	// HitRate 是 RequestHits/Reads（0..1）；Reads 为 0 时为 0。
 	HitRate float64 `json:"hit_rate"`
-	// PeakReadBytesPerSec / PeakWriteBytesPerSec 是**近 5 分钟采样窗口内**的读写峰值
+	// PeakReadBytesPerSec / PeakWriteBytesPerSec 是**近 10 分钟采样窗口内**的读写峰值
 	// 吞吐（字节/秒）：界面卡片上的"峰值速度"直接读它，不必再单独拉历史。
 	//
 	// 峰值按相邻采样点差分算，窗口滑出后自动下降，不会留下一次压测的历史高水位。

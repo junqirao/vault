@@ -14,6 +14,12 @@ type StatsSnapshot struct {
 	// up, so before binding (or after a degraded session) it would read 0 even
 	// though the proxy is forwarding traffic.
 	Reads int64
+	// Random4K counts 4 KiB reads that did not continue the previous read on the
+	// same session (start != previous end). Sampling divides its delta by the
+	// Reads delta to show the 4K random share of the read workload. The check is
+	// two integer comparisons on the command path plus one atomic add, and only
+	// 4 KiB reads are classified; larger random reads are not counted.
+	Random4K int64
 	// Writes counts write commands observed on the wire (WRITE/WRITE SAME/UNMAP).
 	Writes int64
 	// ReadBytes / WriteBytes count the bytes those commands moved (CDB-declared

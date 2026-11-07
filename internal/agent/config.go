@@ -65,6 +65,12 @@ type RepoMountPref struct {
 	// 从而都能被监控。只有用户显式打开直连才绕过代理 —— 此时该库没有监控数据
 	// （界面上的「监控」入口置灰）。改动需要**重新挂载**该库才生效。
 	DirectMode bool `json:"direct_mode,omitempty"`
+	// ShortcutEnabled 是否在挂载该库后自动创建桌面快捷方式（指向挂载点）。
+	//
+	// **默认关闭**：快捷方式是用户显式打开的便利功能；开启后每次挂载成功都会创建/覆盖
+	// 同名 .lnk，卸载时按挂载记录里的 ShortcutPath 自动删除。存放目录见全局 ShortcutDir
+	// （空串 = 系统桌面）。老配置没有这个键时按关闭处理。
+	ShortcutEnabled bool `json:"shortcut_enabled,omitempty"`
 	// UseForRepos 只在**分组配置**里有意义：为 true 时，该分组的这套配置覆盖组内
 	// 每个存储库自己的配置去挂载；为 false 时组内库各用各的配置（分组配置仅作默认值保留）。
 	//

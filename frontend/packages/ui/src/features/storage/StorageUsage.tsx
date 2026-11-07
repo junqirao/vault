@@ -1,10 +1,9 @@
 import { ArrowLeftOutlined, RightOutlined } from '@ant-design/icons'
-import { Button, Card, Progress, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
+import { Button, Card, Col, Progress, Row, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
 import { useQuery } from '@tanstack/react-query'
 
 import { EmptyState } from '../../components/EmptyState'
 import { PageShell } from '../../components/PageShell'
-import { SectionCard } from '../../components/SectionCard'
 import { usageColor } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { StorageDTO } from '../../api/types'
@@ -45,22 +44,27 @@ function aggregateStorageUsage(storages: StorageDTO[]): { used: number; total: n
 }
 
 /**
- * 存储用量行：名称 + 进度条 + 已用/总量。
+ * 存储详情卡：每块存储一张小卡片（详情页一行两张）。
  *
- * 颜色统一走 usageColor（与库卡片、配额条同一套分档）：占用越高越偏橙/红，用户不需要
- * 逐个读数字也能看出哪块存储快满了。
+ * 排版与首页「存储」卡片保持一致：标题行右侧报已用/总量，下面是同一条进度条；
+ * 进度条的颜色统一走 usageColor（与库卡片、配额条同一套分档），占用越高越偏橙/红。
+ * 这里只比首页多一行挂载路径，方便管理员核对是哪块盘。
  */
-function StorageUsageRow({
-  storage,
-  detailed = false
-}: {
-  storage: StorageDTO
-  detailed?: boolean
-}): JSX.Element {
+function StorageUsageTile({ storage }: { storage: StorageDTO }): JSX.Element {
   const { t } = useI18n()
   const { used, total, percent } = storageUsage(storage)
   return (
-    <div style={{ width: '100%' }}>
+    <Card
+      style={{ height: '100%' }}
+      styles={{
+        body: {
+          padding: spacing.md,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: spacing.xs
+        }
+      }}
+    >
       <div
         style={{
           display: 'flex',
@@ -75,8 +79,8 @@ function StorageUsageRow({
             {storage.name}
           </Typography.Text>
           {!storage.enabled ? <Tag>{t('storage.usage.disabled')}</Tag> : null}
-          {detailed ? <Tag>{t(`storage.kind.${storage.kind || 'dir'}`)}</Tag> : null}
-          {detailed && storage.media_type && storage.media_type !== 'unknown' ? (
+          <Tag>{t(`storage.kind.${storage.kind || 'dir'}`)}</Tag>
+          {storage.media_type && storage.media_type !== 'unknown' ? (
             <Tag color={storage.media_type === 'ssd' ? 'green' : 'orange'}>
               {t(`storage.media.${storage.media_type}`)}
             </Tag>
@@ -84,29 +88,27 @@ function StorageUsageRow({
         </Space>
         <Typography.Text
           type="secondary"
-          style={{ fontSize: detailed ? fontSize.sm : fontSize.xs, fontVariantNumeric: 'tabular-nums' }}
+          style={{ fontSize: fontSize.sm, fontVariantNumeric: 'tabular-nums' }}
         >
           {`${formatBytes(used)} / ${formatBytes(total)} · ${Math.round(percent)}%`}
         </Typography.Text>
       </div>
-      {detailed ? (
-        <Typography.Text
-          type="secondary"
-          ellipsis={{ tooltip: storage.path }}
-          style={{ display: 'block', fontSize: fontSize.xs, marginTop: spacing.xxs }}
-        >
-          {storage.path}
-        </Typography.Text>
-      ) : null}
       <Progress
         percent={Math.round(percent)}
         showInfo={false}
         size="small"
         strokeColor={usageColor(percent)}
         trailColor={palette.neutralFill}
-        style={{ marginTop: spacing.xs, marginBottom: 0 }}
+        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
       />
-    </div>
+      <Typography.Text
+        type="secondary"
+        ellipsis={{ tooltip: storage.path }}
+        style={{ display: 'block', fontSize: fontSize.xs }}
+      >
+        {storage.path}
+      </Typography.Text>
+    </Card>
   )
 }
 
@@ -157,7 +159,7 @@ export function StorageUsageCard({
             type="text"
             size="small"
             aria-label={t('storage.usage.detail')}
-            icon={<RightOutlined />}
+            icon={<RightOutlined style={{ fontSize: 10 }} />}
             iconPosition="end"
             onClick={onOpen}
             style={{ paddingInline: 0, height: 'auto', fontWeight: 600 }}
@@ -248,21 +250,27 @@ export function StorageUsagePage({
         </Tooltip>
       }
     >
-      <SectionCard title={t('storage.usage.title')}>
-        {storagesQuery.isLoading ? (
-          <Skeleton active paragraph={{ rows: 4 }} />
-        ) : storagesQuery.error ? (
-          <Typography.Text type="danger">{t('storage.loadFailed')}</Typography.Text>
-        ) : storages.length === 0 ? (
-          <EmptyState title={t('storage.empty')} />
-        ) : (
-          <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
+      {storagesQuery.isLoading ? (
+        <Skeleton active paragraph={{ rows: 4 }} />
+      ) : storagesQuery.error ? (
+        <Typography.Text type="danger">{t('storage.loadFailed')}</Typography.Text>
+      ) : storages.length === 0 ? (
+        <EmptyState title={t('storage.empty')} />
+      ) : (
+        <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
+          <Typography.Title level={5} style={{ margin: 0 }}>
+            {t('storage.usage.title')}
+          </Typography.Title>
+          {/* 每块存储一张小卡片，一行两个：信息量比原来的单行更大，扫一眼仍能横向对比。 */}
+          <Row gutter={[spacing.md, spacing.md]}>
             {storages.map((storage) => (
-              <StorageUsageRow key={storage.id} storage={storage} detailed />
+              <Col key={storage.id} span={12}>
+                <StorageUsageTile storage={storage} />
+              </Col>
             ))}
-          </Space>
-        )}
-      </SectionCard>
+          </Row>
+        </Space>
+      )}
     </PageShell>
   )
 }

@@ -1,12 +1,12 @@
 import type { CSSProperties, MouseEvent, ReactNode } from 'react'
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef } from 'react'
 import { Badge, Button, Card, Progress, Space, Tag, Tooltip, Typography, message } from 'antd'
-import { InfoCircleOutlined, LinkOutlined, SettingOutlined, FundOutlined } from '@ant-design/icons'
+import { SettingOutlined } from '@ant-design/icons'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 import { StatusTag } from '../../components/StatusTag'
 import { UsageBar, UsageValueText } from '../../components/UsageBar'
-import { agentApi, createShortcut } from '../../api/agentClient'
+import { agentApi } from '../../api/agentClient'
 import type { AgentMountVolumeUsage, UploadState } from '../../api/agentTypes'
 import { translateError } from '../../api/errors'
 import { useApi } from '../../api/provider'
@@ -16,8 +16,6 @@ import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime, repoUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
-import { openTargetOf } from '../mount/MountControls'
-import { CacheMetricsDialog } from './CacheMetricsDialog'
 import {
   RepoMountActions,
   RepoMountStateTag,
@@ -303,71 +301,6 @@ function RepoUsage({
   )
 }
 
-/**
- * 「监控」入口：动作区里一个心电图图标按钮（与「设置」按钮同款），点击打开近 5 分钟的
- * 指标曲线弹窗。
- *
- * 变更（按真实反馈）：
- *   - 只保留**心电图图标**，不再带文字，和右侧「设置」按钮外观一致；
- *   - **所有已挂载的库**都显示这个入口（不再只限开了缓存的库）：未开缓存的库也经本机代理
- *     （纯透传），同样能看读写 IOPS（弹窗按 cache_enabled 分两态，见 CacheMetricsDialog）；
- *   - **直连模式**（direct_mode）下该库不经过代理、没有数据，入口**置灰**并说明原因；
- *   - 入口**始终占位**（未挂载也画，只是置灰）：它是动作区里的固定一档，跟着挂载状态出现/
- *     消失会让各库的按钮排长短不一，卡片之间对不齐（真实反馈："会导致 UI 不整齐"）。
- *     看不了就置灰，不隐藏 —— 顺便也告诉用户"挂上之后这里能看指标"。
- *
- * 整卡点击 = 打开挂载目录，所以按钮自己拦住冒泡，只负责打开弹窗。
- */
-function RepoMonitorTag({
-  controller,
-  repoName
-}: {
-  controller: RepoMountController
-  repoName: string
-}): JSX.Element {
-  const { t } = useI18n()
-  const [metricsOpen, setMetricsOpen] = useState(false)
-  const mount = controller.mount
-  // 看不了的两态：本机没挂载这个库（压根没有这块盘）/ 直连模式（不过代理，没数据）。
-  const cannotView = mount === undefined || Boolean(mount?.direct_mode)
-  const tip =
-    mount === undefined
-      ? t('repo.monitor.unmountedHint')
-      : mount.direct_mode
-        ? t('repo.monitor.directHint')
-        : mount.cache_enabled && !mount.cache_active
-          ? `${t('repo.cache.inactive')}${mount.cache_error ? `（${mount.cache_error}）` : ''}`
-          : t('repo.monitor.hint')
-
-  return (
-    <>
-      <Tooltip title={tip}>
-        <Button
-          type="text"
-          size="small"
-          icon={<FundOutlined />}
-          aria-label={t('repo.monitor.title')}
-          disabled={cannotView}
-          onClick={(event) => {
-            event.stopPropagation()
-            setMetricsOpen(true)
-          }}
-        />
-      </Tooltip>
-      {/* 弹窗只在能看的时候挂：没挂载时连 allocation_id 都没有，直连模式进去也只会是空图。 */}
-      {mount && !mount.direct_mode ? (
-        <CacheMetricsDialog
-          open={metricsOpen}
-          allocationId={mount.allocation_id}
-          repoName={repoName}
-          cacheEnabled={Boolean(mount.cache_enabled)}
-          onClose={() => setMetricsOpen(false)}
-        />
-      ) : null}
-    </>
-  )
-}
-
 /** 峰值速度统一按 MB/s 展示（保留一位小数，0 也如实报 0.0 而不是 "-"）。 */
 function formatPeakSpeed(bytesPerSecond: number | undefined): string {
   return `${((bytesPerSecond ?? 0) / (1024 * 1024)).toFixed(1)} MB/s`
@@ -548,16 +481,15 @@ function RepoMoveActions({ repo }: { repo: RepoDTO }): JSX.Element {
 }
 
 /**
- * 右侧动作区：「详情」（列表形态才有）/「配置」/ 挂载按钮。
+ * 右侧动作区：「配置」/ 挂载按钮。
  *
  * 按钮一律靠右（marginLeft: auto），不被内容挤到左边；容器可点打开挂载目录，
  * 因此整块动作区都要拦住冒泡。
  *
  * 上传中的**占位库**（服务端还没有这条记录，见 uploadPlaceholderRepo）没有可用的 id：
- * 「详情」会导航到一个不存在的库、「配置」保存时会把补丁打到不存在的库上。但这两个入口
- * **照样画、只是置灰** —— 少画两个按钮会让这一行的动作区短一截，跟别的行对不齐
- * （真实反馈："详情和挂载设置按钮不要不展示，这样会导致对不齐"）。做法与「监控」入口
- * 未挂载时一致：看不了就置灰，位置留着，顺手也告诉用户"这东西存在，只是现在还点不了"。
+ * 「配置」保存时会把补丁打到不存在的库上，因此入口**照样画、只是置灰** —— 少画一个按钮
+ * 会让这一行的动作区短一截，跟别的行对不齐：看不了就置灰，位置留着，
+ * 顺手也告诉用户"这东西存在，只是现在还点不了"。
  *
  * 挂载按钮那一位则换成「暂停 / 继续」+「取消」（见 RepoUploadActions）——upstream 的库此刻
  * 挂不了，但两个动作的**尺寸与位置**照旧占着原来那一档。
@@ -566,13 +498,13 @@ function RepoActions({
   repo,
   upload,
   controller,
-  onOpen,
   onConfigure,
-  showDetail,
   style
-}: RepoCardProps & {
+}: {
+  repo: RepoDTO
+  upload?: UploadState
   controller: RepoMountController
-  showDetail?: boolean
+  onConfigure: (repo: RepoDTO) => void
   style?: CSSProperties
 }): JSX.Element {
   const { t } = useI18n()
@@ -590,21 +522,6 @@ function RepoActions({
         ...style
       }}
     >
-      {showDetail ? (
-        <Tooltip title={placeholder ? t('repo.uploadNotReady') : t('repo.card.detail')}>
-          {/* 置灰的按钮不派发鼠标事件，Tooltip 得靠外层这层 span 才挂得住。 */}
-          <span style={{ display: 'inline-block' }}>
-            <Button
-              type="text"
-              size="small"
-              icon={<InfoCircleOutlined />}
-              aria-label={t('repo.card.detail')}
-              disabled={placeholder}
-              onClick={() => onOpen(repo.id)}
-            />
-          </span>
-        </Tooltip>
-      ) : null}
       <Tooltip title={placeholder ? t('repo.uploadNotReady') : t('repo.settings.title')}>
         <span style={{ display: 'inline-block' }}>
           <Button
@@ -617,12 +534,6 @@ function RepoActions({
           />
         </span>
       </Tooltip>
-      {/* 监控入口放在「设置」右侧：它开的是一个普通指标弹窗。
-          必须留在动作区里 —— antd Modal 走 React portal，但合成事件仍沿 React 组件树冒泡，
-          若把弹窗挂在标题行（Card 子树内），点弹窗里任何位置都会冒泡到整卡的
-          onClick（打开挂载目录）。动作区外层已拦截冒泡，弹窗才不会被当成"点卡片"。 */}
-      <RepoShortcutButton repoName={repo.name} controller={controller} />
-      <RepoMonitorTag controller={controller} repoName={repo.name} />
       {/* 上传中的条目：挂载按钮换成「暂停 / 继续」+「取消」（见 RepoUploadActions）。 */}
       {repo.state === 'moving' ? (
         <RepoMoveActions repo={repo} />
@@ -632,61 +543,6 @@ function RepoActions({
         <RepoMountActions controller={controller} />
       )}
     </div>
-  )
-}
-
-/**
- * 创建快捷方式：把当前挂载点做成一个系统快捷方式，放到配置的目录（默认桌面）。
- *
- * 未挂载时没有可指向的路径，按钮置灰并说明原因。
- */
-function RepoShortcutButton({
-  repoName,
-  controller
-}: {
-  repoName: string
-  controller: RepoMountController
-}): JSX.Element {
-  const { t } = useI18n()
-  const agent = useAgent()
-  const [busy, setBusy] = useState(false)
-  const mount = controller.mount
-  const disabled = !controller.mounted || !mount
-
-  const create = async (event: MouseEvent): Promise<void> => {
-    event.stopPropagation()
-    if (!mount) return
-    setBusy(true)
-    try {
-      const result = await createShortcut({
-        target: openTargetOf(mount),
-        name: repoName,
-        dir: agent.config?.shortcut_dir
-      })
-      if (result.ok) message.success(t('repo.shortcut.created', { path: result.path ?? '' }))
-      else message.error(t('repo.shortcut.failed'))
-    } catch {
-      message.error(t('repo.shortcut.failed'))
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <Tooltip title={disabled ? t('repo.shortcut.unmounted') : t('repo.shortcut.create')}>
-      {/* 置灰按钮不派发鼠标事件，Tooltip 靠外层 span 才挂得住。 */}
-      <span style={{ display: 'inline-block' }}>
-        <Button
-          type="text"
-          size="small"
-          icon={<LinkOutlined />}
-          aria-label={t('repo.shortcut.create')}
-          loading={busy}
-          disabled={disabled}
-          onClick={(event) => void create(event)}
-        />
-      </span>
-    </Tooltip>
   )
 }
 
@@ -834,7 +690,7 @@ function useOpenMountDir(controller: RepoMountController): () => void {
  * 双击会先触发两次 click，所以单击动作要延迟一小段再执行；双击到达时取消那次单击。
  * 上传中的库没有挂载目录（点下去只会得到一句"未挂载"），单击仍去「上传任务」页。
  *
- * 详情仍保留一个显式的「详情」图标按钮（见 RepoMountCard），不依赖单击。
+ * 详情只靠整卡单击进入，不再额外画一个「详情」按钮。
  */
 function useRepoCardInteractions(
   upload: UploadState | undefined,
@@ -888,22 +744,22 @@ function useRepoCardInteractions(
  * 卡片上的动作分工（都能在这一张卡上完成，不必先进详情页）：
  *   - 整卡单击 = 进入详情；双击 = 打开文件（未挂载时如实提示；上传中的库进「上传任务」页）；
  *   - 库名前的状态圆点 = 本机挂载状态一眼可辨；
- *   - 「详情」图标 = 进详情页（默认停在「设置」tab）；
  *   - 「配置」图标 + 挂载按钮 = 这个库在本机怎么挂 / 挂上或卸下。
  *
  * 上传中的库**就用这套渲染**，不另起一套（真实反馈："上传中状态的存储库的卡片或列表不要
  * 展示那么多东西，和原有展示逻辑一样，只是状态标签不同"、"我所有的设计就是想让这个上传中的
  * 状态和其他保持一致的展示，但是复用元素"）—— 标签行多出「上传中」（暂停时再加「已暂停」），
  * 「已用」那一格改报上传进度（见 RepoProgress），挂载按钮那一档换成「暂停 / 继续」+「取消」
- * （见 RepoUploadActions）；其余零件（圆点 / 模式标签 / 发布时间信息 / 详情与配置图标）照旧。
+ * （见 RepoUploadActions）；其余零件（圆点 / 模式标签 / 发布时间信息 / 配置图标）照旧。
+ *
+ * 详情入口只保留整卡单击：不再单独画「详情」按钮。
  */
 export function RepoCard(props: RepoCardProps): JSX.Element {
   return <RepoMountCard {...props} />
 }
 
-/** 库卡片：本机挂载这条链路（状态圆点 / 用量 / 挂载按钮 / 监控）只在这一支里。 */
+/** 库卡片：本机挂载这条链路（状态圆点 / 用量 / 挂载按钮）只在这一支里。 */
 function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onConfigure }: RepoCardProps): JSX.Element {
-  const { t } = useI18n()
   const mountController = useRepoMount(repo, currentUserId)
   const openMountDir = useOpenMountDir(mountController)
   const interactions = useRepoCardInteractions(upload, onOpenUpload, openMountDir, () => onOpen(repo.id))
@@ -916,7 +772,7 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
       style={{ height: '100%' }}
       styles={{ body: { padding: spacing.md } }}
     >
-      {/* 标题行：状态圆点紧贴库名（8px 间距），右侧「详情」图标固定靠右 */}
+      {/* 标题行：状态圆点紧贴库名（8px 间距）。详情入口就是整卡单击，不再单独画「详情」按钮。 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, flex: 1, minWidth: 0 }}>
           <RepoMountDot controller={mountController} />
@@ -924,24 +780,6 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
             {repo.name}
           </Typography.Text>
         </div>
-        {/* 占位库（服务端还没有这条记录）没有服务端 id，进详情页只会 404（见 RepoActions
-            同一处理）—— 但入口**照样占位、只是置灰**：不画它，这张卡的标题行就比别人少一个
-            图标，与其它的卡长得不一样（见 RepoActions 里同一处说明）。 */}
-        <Tooltip title={isPlaceholderRepoId(repo.id) ? t('repo.uploadNotReady') : t('repo.card.detail')}>
-          <span style={{ display: 'inline-block', flexShrink: 0 }}>
-            <Button
-              type="text"
-              size="small"
-              icon={<InfoCircleOutlined />}
-              aria-label={t('repo.card.detail')}
-              disabled={isPlaceholderRepoId(repo.id)}
-              onClick={(event) => {
-                event.stopPropagation()
-                onOpen(repo.id)
-              }}
-            />
-          </span>
-        </Tooltip>
       </div>
 
       <RepoTagRow
@@ -970,9 +808,8 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
       {/* 底部一行只留动作：按钮一律靠右，不被内容挤到左边 */}
       <RepoActions
         repo={repo}
-        currentUserId={currentUserId}
+        upload={upload}
         controller={mountController}
-        onOpen={onOpen}
         onConfigure={onConfigure}
         style={{ marginTop: spacing.sm }}
       />
@@ -989,7 +826,7 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
  *
  * 上传中的库同样走这一套：标签行多一个「上传中」（暂停时再加「已暂停」），**用量那一格**改报
  * 上传进度（原地换数据源，左栏不会多出一条进度、行高与别的行一致），挂载按钮那一档换成
- * 「暂停 / 继续」+「取消」；详情与配置两个入口照画、只是在占位库上置灰（见 RepoActions）。
+ * 「暂停 / 继续」+「取消」；配置入口照画、只是在占位库上置灰（见 RepoActions）。
  */
 export function RepoRow(props: RepoCardProps): JSX.Element {
   return <RepoMountRow {...props} />
@@ -1042,11 +879,9 @@ function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onCon
 
         <RepoActions
           repo={repo}
-          currentUserId={currentUserId}
+          upload={upload}
           controller={mountController}
-          onOpen={onOpen}
           onConfigure={onConfigure}
-          showDetail
         />
       </div>
     </Card>

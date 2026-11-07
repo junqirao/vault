@@ -97,6 +97,8 @@ const (
 	ScriptVHDMerge = "vhd_merge.ps1"
 	// ScriptTLSCertFingerprint 查询本机证书指纹（可选能力）。
 	ScriptTLSCertFingerprint = "tls_cert_fingerprint.ps1"
+	// ScriptShortcut 创建/删除存储库挂载点快捷方式（Windows .lnk）。
+	ScriptShortcut = "shortcut.ps1"
 )
 
 var (

@@ -558,6 +558,8 @@ POST /v1/system/bootstrap      匿名（仅未初始化时可用）← {username
  │    └─ needs_client_upgrade / needs_server_upgrade → 提示页 + 允许"仍然继续（只读查看）"
  ├─ GET  /v1/system/bootstrap
  │    ├─ 网络失败 → "无法连接服务端" + 重试/修改地址/选择服务器（有其他已保存服务端时才出现）
+ │    │   └─ 该服务端开启了自动连接 → 页面保持可见并按退避自动重连（3s/5s/10s/20s/30s…），
+ │    │      直到连上、用户改地址或切换到其他服务端；关闭自动连接的条目仍只手动重试
  │    ├─ needs_bootstrap = true → 【初始化向导】
  │    ├─ blocked_reason = bootstrap_disabled / bootstrap_window_expired → 对应提示页
  │    └─ 否则 → 有本地有效 token 则校验后进主界面，无 token 则进【登录页】

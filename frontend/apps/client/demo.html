@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vault Demo</title>
+    <style>
+      html,
+      body,
+      #root {
+        height: 100%;
+        margin: 0;
+      }
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+      #root > .ant-app {
+        height: 100%;
+      }
+      body {
+        background: #f5f5f7;
+        color: rgba(0, 0, 0, 0.88);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+          'Microsoft YaHei', Helvetica, Arial, sans-serif;
+        transition: none !important;
+      }
+      * {
+        transition: none !important;
+      }
+      .ant-card-hoverable {
+        transition:
+          box-shadow 200ms cubic-bezier(0.22, 0.61, 0.36, 1),
+          border-color 200ms cubic-bezier(0.22, 0.61, 0.36, 1),
+          transform 200ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+      }
+      .ant-card-hoverable:hover {
+        transform: translateY(-2px);
+        box-shadow:
+          0 1px 2px rgba(0, 0, 0, 0.04),
+          0 12px 28px -8px rgba(0, 0, 0, 0.16) !important;
+      }
+      .ant-progress-line .ant-progress-bg,
+      .ant-progress-line .ant-progress-success-bg,
+      .vault-progress-fill {
+        transition: width 450ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
+      }
+      body {
+        user-select: none;
+        -webkit-user-select: none;
+      }
+      input,
+      textarea,
+      [contenteditable='true'],
+      .ant-input,
+      .ant-input-affix-wrapper,
+      pre,
+      code,
+      kbd,
+      .selectable,
+      .selectable * {
+        user-select: text;
+        -webkit-user-select: text;
+      }
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: rgba(0, 0, 0, 0.2) transparent;
+      }
+      ::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+      ::-webkit-scrollbar-track,
+      ::-webkit-scrollbar-corner {
+        background: transparent;
+      }
+      ::-webkit-scrollbar-thumb {
+        background-color: rgba(0, 0, 0, 0.18);
+        border: 2px solid transparent;
+        border-radius: 999px;
+        background-clip: content-box;
+      }
+      ::-webkit-scrollbar-thumb:hover {
+        background-color: rgba(0, 0, 0, 0.34);
+      }
+      ::-webkit-scrollbar-button {
+        display: none;
+        width: 0;
+        height: 0;
+      }
+      .ant-table-wrapper .ant-table-container,
+      .ant-table-wrapper .ant-table-title,
+      .ant-table-wrapper .ant-table-header {
+        border-start-start-radius: 0 !important;
+        border-start-end-radius: 0 !important;
+      }
+      .ant-table-wrapper .ant-table-container > table > thead > tr:first-child > *:first-child,
+      .ant-table-wrapper .ant-table-container > table > thead > tr:first-child > *:last-child {
+        border-start-start-radius: 0 !important;
+        border-start-end-radius: 0 !important;
+      }
+      .ant-table-wrapper .ant-table-pagination.ant-pagination {
+        margin: 16px !important;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/demo/main.tsx"></script>
+  </body>
+</html>

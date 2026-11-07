@@ -86,7 +86,16 @@ export function PhaseView({
   onCertificateLogin
 }: PhaseViewProps): JSX.Element {
   const { t } = useI18n()
-  const { phase, checking, setPhase, recheck, continueAfterCompat } = flow
+  const {
+    phase,
+    checking,
+    autoReconnecting,
+    setPhase,
+    recheck,
+    continueAfterCompat,
+    pauseAutoReconnect,
+    resumeAutoReconnect
+  } = flow
   const [configuring, setConfiguring] = useState(false)
   // 服务端注册表来自 <ServerConfigProvider>（与顶栏切换器同一份数据）。
   const { servers, activeKey, active, setActive } = useServerConfig()
@@ -112,7 +121,15 @@ export function PhaseView({
           setConfiguring(false)
         }}
         submitting={checking}
-        onCancel={activeBaseUrl || phase.kind === 'select-server' ? () => setConfiguring(false) : undefined}
+        onCancel={
+          activeBaseUrl || phase.kind === 'select-server'
+            ? () => {
+                setConfiguring(false)
+                // 从"无法连接"页进来时自动重连被暂停了，取消后要继续尝试。
+                resumeAutoReconnect()
+              }
+            : undefined
+        }
       />
     )
   }
@@ -144,8 +161,13 @@ export function PhaseView({
       <OfflineNotice
         detail={phase.detail}
         loading={checking}
+        autoReconnecting={autoReconnecting}
         onRetry={recheck}
-        onChangeAddress={() => setConfiguring(true)}
+        onChangeAddress={() => {
+          // 改地址期间先别自动重连：后台连上会把正在输入的表单顶掉。
+          pauseAutoReconnect()
+          setConfiguring(true)
+        }}
         // 有其他服务端时多一个"选择服务器"入口：连不上当前这台时，切到另一台已配好的
         // 服务端比重新填地址快得多（详见 OfflineNotice 的说明）。
         alternatives={serverChoices}

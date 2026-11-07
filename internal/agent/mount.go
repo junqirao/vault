@@ -558,10 +558,25 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		e.a.logger.Warn("回写挂载点失败（本地已挂载）", "allocation_id", allocationID, "error", err)
 	}
 
+	// 自动快捷方式：只在用户为该库显式开启时创建。失败不影响挂载本身
+	// （快捷方式只是便利入口，盘已经可用）；成功时把完整路径记进挂载记录，
+	// 卸载时按它精确删除，避免用户后来改了快捷方式目录/库名就漏删或删错。
+	shortcutPath := ""
+	if hasPref && pref.ShortcutEnabled {
+		path, shortcutErr := e.a.createRepoShortcut(ctx, mode, mountPath, repoNameOf(req, spec))
+		if shortcutErr != nil {
+			e.a.logger.Warn("创建存储库快捷方式失败（挂载已完成）",
+				"allocation_id", allocationID, "mount_path", mountPath, "error", shortcutErr)
+		} else {
+			shortcutPath = path
+		}
+	}
+
 	now := time.Now().UnixMilli()
 	var out MountState
 	e.a.store.UpdateMount(allocationID, func(m *MountState, r *mountRuntime) {
 		m.MountPath = mountPath
+		m.ShortcutPath = shortcutPath
 		m.State = MountStateMounted
 		// 挂载完成：清掉阶段（阶段只在 mounting 期间有含义）。
 		m.Phase = ""
@@ -995,6 +1010,15 @@ func (e *mountEngine) finishUnmount(parent context.Context, tail *unmountTail) {
 
 	ms, rt, allocationID := tail.ms, tail.rt, tail.allocationID
 	start := time.Now()
+
+	// ①b 删除本次挂载自动创建的快捷方式。
+	//
+	// 放在"挂载点已经移除"之后：卸载失败、盘还挂着时不能删，否则用户桌面上的入口先没了。
+	// 只删挂载记录里记下的路径（用户自己放的 .lnk 不受影响）。
+	if err := e.a.removeRepoShortcut(ctx, ms.ShortcutPath); err != nil {
+		e.a.logger.Warn("删除存储库快捷方式失败（本地已卸载）",
+			"allocation_id", allocationID, "shortcut_path", ms.ShortcutPath, "error", err)
+	}
 
 	// ② 磁盘 Offline —— Disconnect 的前置条件（否则 Disconnect-IscsiTarget 报 0xefff0040）。
 	//

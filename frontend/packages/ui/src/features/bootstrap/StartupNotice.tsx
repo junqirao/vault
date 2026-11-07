@@ -34,6 +34,13 @@ export interface ServerChoice {
 export interface OfflineNoticeProps {
   detail?: string
   loading?: boolean
+  /**
+   * 活动服务端开启了自动连接：失败后仍会按退避自动重试。
+   *
+   * 页面仍停在"无法连接"，但必须把这句告诉用户 —— 否则看起来和"已经放弃、
+   * 只能手动重试"完全一样。
+   */
+  autoReconnecting?: boolean
   onRetry: () => void
   onChangeAddress: () => void
   /**
@@ -61,6 +68,7 @@ export interface OfflineNoticeProps {
 export function OfflineNotice({
   detail,
   loading,
+  autoReconnecting,
   onRetry,
   onChangeAddress,
   alternatives = [],
@@ -79,6 +87,11 @@ export function OfflineNotice({
             {detail ? (
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 {detail}
+              </Typography.Text>
+            ) : null}
+            {autoReconnecting ? (
+              <Typography.Text type="warning" style={{ fontSize: 12 }}>
+                {t('boot.offline.autoReconnecting')}
               </Typography.Text>
             ) : null}
           </Space>

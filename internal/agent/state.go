@@ -248,8 +248,14 @@ type MountState struct {
 	ServerName string `json:"server_name,omitempty"`
 	MountMode  string `json:"mount_mode"`
 	MountPath  string `json:"mount_path"`
-	DiskNumber int    `json:"disk_number,omitempty"`
-	State      string `json:"state"`
+	// ShortcutPath 是本次挂载自动创建的快捷方式完整路径（为空表示没有自动创建）。
+	//
+	// 落盘是为了**卸载时能准确删掉那一个 .lnk**：快捷方式目录之后可能被用户改掉，
+	// 只按当前配置重新拼路径会删错或不删。只有本代理自动创建的快捷方式才会写这里，
+	// 用户自己放的 .lnk 永远不受影响。
+	ShortcutPath string `json:"shortcut_path,omitempty"`
+	DiskNumber   int    `json:"disk_number,omitempty"`
+	State        string `json:"state"`
 	// Phase 是 state=mounting 期间的细粒度阶段（见 MountPhase* 常量）；非挂载中为空。
 	// 界面据此显示"服务端正在创建 iSCSI 目标"这类即时反馈。
 	Phase           string `json:"phase,omitempty"`

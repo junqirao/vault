@@ -80,6 +80,8 @@ export interface AgentMountState {
   mount_mode: AgentMountMode
   /** letter 模式为 "E:"；directory 模式为绝对目录。 */
   mount_path: string
+  /** 本次挂载自动创建的快捷方式完整路径；没有自动创建时为空。 */
+  shortcut_path?: string
   disk_number?: number
   state: AgentMountStatus
   /** 挂载中的细粒度阶段（见 AgentMountPhase）；非 mounting 时缺省。 */
@@ -412,10 +414,16 @@ export interface AgentRepoMountPref {
    */
   direct_mode?: boolean
   /**
+   * 是否在挂载该库后自动创建桌面快捷方式（指向挂载点），卸载后自动删除。
+   *
+   * 默认关闭。存放目录见全局 `shortcut_dir`（空串 = 系统桌面）。
+   */
+  shortcut_enabled?: boolean
+  /**
    * 仅分组配置有意义：为 true 时用这套分组配置覆盖组内每个库自己的挂载配置；
    * 为 false（默认）时组内库各用各的配置，分组配置只作为默认值保留。
    *
-   * 勾选后，组内库的配置弹窗会置灰并如实显示这套值（生效的就是这里）。
+   * 勾选后，组内库的设置页会置灰并如实显示这套值（生效的就是这里）。
    */
   use_for_repos?: boolean
   /**
@@ -527,7 +535,7 @@ export interface AgentCacheTargetStatus {
   /** request_hits / reads（0..1）；reads 为 0 时为 0。 */
   hit_rate: number
   /**
-   * 近 5 分钟采样窗口内的读写**峰值吞吐**（字节/秒），卡片上的"峰值速度"直接读它。
+   * 近 10 分钟采样窗口内的读写**峰值吞吐**（字节/秒），卡片上的"峰值速度"直接读它。
    * 按相邻采样点差分取最大；目标重建计数归零的区间跳过。
    */
   peak_read_bytes_per_sec?: number
@@ -617,11 +625,13 @@ export interface AgentCacheSample {
   read_bytes?: number
   write_bytes?: number
   backend_reads: number
+  /** 累计 4 KiB 随机读命令数（旧代理没有该字段）。 */
+  random_4k?: number
   l1_used_bytes: number
   l2_used_bytes: number
 }
 
-/** 近 5 分钟的缓存指标滑动窗口（GET /agent/cache/history）。 */
+/** 近 10 分钟的缓存指标滑动窗口（GET /agent/cache/history）。 */
 export interface AgentCacheHistory {
   /** 采样间隔（秒）：换算速率以它为准，不要硬编码。 */
   interval_sec: number
@@ -641,13 +651,15 @@ export interface AgentPerformancePoint {
   write_bytes_per_sec: number
   /** 本区间缓存命中率（0..1）。 */
   hit_rate: number
+  /** 4 KiB 随机读命令占全部读命令的比例（0..1），按 10 分钟窗口滚动计算。 */
+  random_4k_rate: number
   /** 当前 L1 / L2 / 合计缓存占用（字节）。 */
   l1_used_bytes: number
   l2_used_bytes: number
   cache_used_bytes: number
 }
 
-/** GET /agent/performance 的响应：近 5 分钟全局性能曲线。 */
+/** GET /agent/performance 的响应：近 10 分钟全局性能曲线。 */
 export interface AgentPerformanceHistory {
   /** 采样间隔（秒）。 */
   interval_sec: number

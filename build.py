@@ -1319,233 +1319,6 @@ SERVER_PKG_DIRNAME_LINUX = "vault-server-{version}-linux-amd64"
 # Linux 包内的可执行文件名（不带 .exe，小写便于命令行使用）。
 LINUX_PKG_BIN_NAME = "vault-server"
 
-DEPLOY_README = """Vault 服务端部署说明
-============================================================
-版本：{version}
-构建时间：{built_at}
-目标平台：Windows Server 2016+ / Windows 10+（64 位）
-
-------------------------------------------------------------
-一、这个包是什么
-------------------------------------------------------------
-本包只需要**一个可执行文件**即可运行服务端：
-
-    Vault-Server.exe      服务端主程序（同时内含发布签名工具 sign 子命令）
-
-它负责：VHDX 管理、iSCSI 目标管理、存储库与用户管理、REST API 与 SSE。
-服务端**不承载任何网页**（管理界面已合并进客户端应用），因此：
-
-    ★ 首次使用必须先取得客户端，用客户端完成初始化设置。
-      （没有客户端时将无法初始化，这是刻意的设计取舍）
-
-------------------------------------------------------------
-二、环境要求
-------------------------------------------------------------
-1. 操作系统：Windows Server 2016 或更高（64 位）
-2. 必须安装的 Windows 功能：
-     - iSCSI 目标服务器（FS-iSCSITarget-Server）
-     - iSCSI 目标存储提供程序（VDS 与 VSS 硬件提供程序）
-       ------------------------------
-       PowerShell（管理员）执行：
-         Install-WindowsFeature FS-iSCSITarget-Server
-       或用服务器管理器 → 添加角色和功能 → 文件和存储服务 →
-       iSCSI 目标服务器
-       ------------------------------
-3. 启动服务的账号必须是**本机管理员**（创建/挂载 VHDX、管理 iSCSI 目标需要）。
-4. 准备一块数据盘用于存放 VHDX，例如 D:\\VaultData（建议独立磁盘，不要用系统盘）。
-
-------------------------------------------------------------
-三、部署步骤
-------------------------------------------------------------
-1) 把本目录整体复制到服务器上，例如 C:\\Vault\\
-
-2) 创建数据目录（与下面配置里的 storage.whitelist_root 保持一致）：
-      New-Item -ItemType Directory -Force D:\\VaultData
-
-3) 生成并确认配置：
-   本包**故意只带配置模板 config.example.yaml，不带 config.yaml**，
-   这样以后升级解压不会覆盖你已经改好的配置文件。
-
-   方式一（推荐，先改好再启动）：
-        copy config.example.yaml config.yaml
-      然后编辑 config.yaml，重点改 storage.whitelist_root。
-
-   方式二（直接启动，自动生成）：
-        .\\Vault-Server.exe -config .\\config.yaml
-      → 检测到没有 config.yaml 时，会自动从同目录的 config.example.yaml
-        生成一份并**继续启动**（生成后会提示你去确认 whitelist_root）。
-
-   需要关注的配置项：
-      storage.whitelist_root     "D:\\\\VaultData"   ← 必须改成你的数据目录
-      http.listen                "0.0.0.0:8443"      ← 默认即可；只本机访问写 127.0.0.1:8443
-      http.tls.enabled           true                ← 证书无需准备，首次启动自动签发
-      database.driver            sqlite              ← 单机推荐；要 MySQL 改 mysql 并填 dsn
-      security.bootstrap_enabled true                ← 允许用客户端一次性初始化，完成后自动关闭
-      security.super_admin_enabled true              ← 设 false 可让超管立即无法登录（锁定恢复用）
-      update.artifacts_dir       updates             ← 客户端更新分发目录（不用可忽略）
-      log.dir                    logs                ← 按天切分
-
-4) 首次试运行（可跳过，直接用第 5 步的启动器）：
-   想看到启动日志时可临时在命令行里跑：
-      .\\Vault-Server.exe -config .\\config.yaml
-   正常会看到：
-      "HTTP 服务已启动（TLS）" listen=0.0.0.0:8443
-   首次启动会自动补写 server.instance_id 与 security.master_key，并生成 pki\\ 证书。
-   ⚠️ security.master_key 用于加密 CHAP 密钥，**丢失后已配置的 iSCSI 鉴权将无法解密**，
-      请务必备份 config.yaml（该文件请勿随升级包一起覆盖）。
-
-5) 日常启动（推荐）：**双击【Vault-Server.exe】即为启动器**
-   它会：检查服务端是否已在运行 → 若已在运行则提示"已经在运行中"后退出
-   （不会重复启动第二个实例）→ 否则以**无控制台的后台进程**方式启动服务端 →
-   探测监听端口直到就绪 → 打印启动摘要（含后台进程 PID）并提示"已在后台启动"。
-
-   看完提示后**按回车键关闭该窗口即可，服务端在后台继续运行**，
-   **不会留下任何控制台黑框**。
-
-   停止服务（优雅停机，与 Ctrl+C 等价）：
-   在本目录打开命令行执行：
-      .\\Vault-Server.exe stop
-
-   ★ 两种启动方式都可用，但行为不同（按需选择）：
-     - 直接双击 Vault-Server.exe ：走上面的启动器路径，服务端在**后台**运行；
-     - 命令行   Vault-Server.exe -config .\\config.yaml  ：**前台**运行，
-       不派生任何后台进程，启动横幅与排障日志直接可见，按 Ctrl+C 停止。
-       （排查启动问题时推荐这种方式）
-
-6) 注册为开机自启（可选，见第五节），然后客户端连上来做初始化。
-
-------------------------------------------------------------
-四、目录说明（首次启动后）
-------------------------------------------------------------
-    Vault-Server.exe      主程序（★ 双击即为启动器；`Vault-Server stop` 优雅停机）
-    config.example.yaml   配置模板（随包提供，不要改它）
-    config.yaml           实际配置（首次启动自动生成，含自动生成的密钥，注意备份权限）
-    pki\\                  自建 CA 与服务端证书（自动生成）
-    data\\                 SQLite 数据库
-    logs\\                 日志（按天切分）
-    scripts\\              开机自启脚本（计划任务方式）
-    updates\\              客户端更新分发目录（可选）
-    D:\\VaultData\\          VHDX 存储（disks\\ / staging\\ / meta\\）
-
-------------------------------------------------------------
-五、开机自启 / 后台运行
-------------------------------------------------------------
-注意：**服务端程序未实现 Windows 服务（SCM）接口**，
-      因此不能用 sc.exe create 注册为"服务"（会报 1053 错误）。
-      请用随包提供的计划任务脚本（等价效果，且无需登录即可运行）：
-
-    # 管理员 PowerShell，在本目录下执行：
-    powershell -ExecutionPolicy Bypass -File .\\scripts\\install-autostart.ps1
-
-    取消自启：
-    powershell -ExecutionPolicy Bypass -File .\\scripts\\uninstall-autostart.ps1
-
-查看/管理：
-    Get-ScheduledTask -TaskName VaultServer
-    Stop-ScheduledTask -TaskName VaultServer
-    Start-ScheduledTask -TaskName VaultServer
-
-------------------------------------------------------------
-六、客户端更新分发（本包已内置）
-------------------------------------------------------------
-服务端不参与更新包签名，只做"存储 + 分发"。
-★ 本包已在 updates\\ 目录内**内置本次构建的更新包**
-  （updates\\manifest.json、updates\\manifest.json.sig、updates\\artifacts\\...），
-  服务端开箱即可对外分发，**无需任何手工拷贝**。
-  只要 config.yaml 中 update.artifacts_dir 指向包内 updates\\（默认即为 "updates"，
-  相对路径按**配置文件所在目录**解析），客户端即可检查并下载更新。
-
-若要替换为新的发布内容（在发布方机器上操作，随后整体覆盖服务器的 updates\\ 目录）：
-  1) 用本 exe 的 sign 子命令生成已签名的发布目录：
-       Vault-Server.exe sign keygen  -out-dir .\\keys
-       Vault-Server.exe sign release -dir .\\release -channel stable ^
-           -version {version} -key .\\keys\\update-private.pem ^
-           -artifact agent=.\\dist\\Vault-Agent.exe ^
-           -artifact client_web=.\\dist\\Vault-Web-{version}.zip
-       Vault-Server.exe sign verify  -dir .\\release -pub .\\keys\\update-public.txt
-  2) 把 release 目录的**内容**（manifest.json、manifest.json.sig、artifacts\\）
-     **整体覆盖**到本目录的 updates\\ 下（保持结构，不要只替换其中一部分）。
-     ⚠️ 覆盖后不要做任何编辑/格式化/改行尾，否则签名会失效。
-  ⚠️ 私钥（update-private.pem）**绝不能**放到服务器上。
-
-------------------------------------------------------------
-七、排障
-------------------------------------------------------------
-Q: 启动报"单实例锁获取失败"
-A: 已有一个 Vault-Server 在运行。查：Get-Process Vault-Server
-
-Q: 客户端提示"该服务端已关闭版本检查" / 版本不兼容
-A: 看 config.yaml 的 client_compat 段。enabled:false 表示关闭了客户端版本区间检查
-   （协议版本仍强制校验）；min/max 显式写错会导致启动失败（这是刻意的 fail-fast）。
-
-Q: 客户端连不上
-A: 1) 确认服务端在跑：Get-Process Vault-Server
-   2) 确认监听：netstat -ano | findstr :8443
-   3) 确认防火墙放行 8443：New-NetFirewallRule -DisplayName "Vault" -Direction Inbound -LocalPort 8443 -Protocol TCP -Action Allow
-   4) 客户端首次连接需要核对证书指纹（自建 CA，属正常流程）
-
-Q: 日志在哪
-A: logs\\ 目录，按天切分。
-
-------------------------------------------------------------
-八、卸载
-------------------------------------------------------------
-1) 停止：先取消自启（第五节），再优雅停止服务端（.\\Vault-Server.exe stop）；
-   若确认无响应可强制结束：Stop-Process -Name Vault-Server
-2) 删除本目录
-3) 按需删除数据目录（D:\\VaultData）
-⚠️ 删除数据目录会**永久丢失所有 VHDX 与用户数据**。
-"""
-
-UPDATES_DIR_README = """此目录用于存放"客户端更新包"，供服务端对外分发。
-
-★ 本包已内置本次构建的更新包（manifest.json / manifest.json.sig / artifacts/），
-  服务端开箱即可对外分发，**无需手工拷贝**。
-
-服务端对更新包只做原样镜像（不解析、不改写、不重算摘要），
-更新包的信任链完全由发布方签名保证。
-
-如需替换为新的发布内容：
-  1) 用**新的发布目录内容整体覆盖本目录**（保持下列结构，不要只替换其中一部分）：
-         updates\\manifest.json
-         updates\\manifest.json.sig
-         updates\\artifacts\\Vault-Agent.exe
-         updates\\artifacts\\Vault-Web-<版本>.zip
-  2) 确认 config.yaml 中：
-         update.artifacts_dir: "updates"      ← 相对路径按**配置文件所在目录**解析
-         update.channel: "stable"             ← 必须与 manifest.json 里的 channel 一致
-  3) 重启服务端（或保存 config.yaml 触发热重载）。
-
-⚠️ 不要手工编辑 manifest.json，也不要做格式化/行尾转换，否则签名会失效，所有客户端都会更新失败。
-⚠️ 不要把发布方私钥（update-private.pem）复制到服务器上。
-
-客户端随后即可检查并下载更新；更新包会经过四重校验（发布方签名 → SHA256 →
-版本单调性 → 兼容区间），任一失败都会拒绝安装。
-"""
-
-# 未内置更新包时的说明（避免写出"已内置"的误导文案）。
-UPDATES_DIR_README_EMPTY = """此目录用于存放"客户端更新包"，供服务端对外分发。
-
-⚠️ 本次打包**未内置**更新包（未生成/未找到已签名的发布目录），因此服务端此刻无法对外分发更新。
-   取得已签名的发布目录后，把其**内容整体**放到本目录（保持下列结构），
-   再重启服务端（或保存 config.yaml 触发热重载）：
-         updates\\manifest.json
-         updates\\manifest.json.sig
-         updates\\artifacts\\Vault-Agent.exe
-         updates\\artifacts\\Vault-Web-<版本>.zip
-
-手动生成发布目录（在发布方机器上，需要发布方私钥）：
-  Vault-Server sign keygen  -out-dir .\\keys
-  Vault-Server sign release -dir .\\release -channel stable -version <版本> ^
-      -key .\\keys\\update-private.pem ^
-      -artifact agent=.\\dist\\Vault-Agent.exe ^
-      -artifact client_web=.\\dist\\Vault-Web-<版本>.zip
-  Vault-Server sign verify  -dir .\\release -pub .\\keys\\update-public.txt
-
-⚠️ 不要手工编辑 manifest.json，也不要做格式化/行尾转换，否则签名会失效。
-⚠️ 不要把发布方私钥（update-private.pem）复制到服务器上。
-"""
-
 INSTALL_AUTOSTART = """# 注册 Vault 服务端为开机自启的计划任务。
 #
 # 为什么不注册成 Windows"服务"？
@@ -1650,216 +1423,13 @@ Write-Host "  Get-Process Vault-Server | Stop-Process"
 """
 
 # ---------------------------------------------------------------------------
-# Linux 部署包内文本（说明 / systemd unit / 安装脚本）
+# Linux 部署包内文本（systemd unit / 安装脚本）
 # ---------------------------------------------------------------------------
 # ⚠️ 这些文件一律用 **UTF-8 无 BOM + LF** 写出（见 _write_text_unix）：
 #    shell 脚本带 BOM 会直接执行失败，CRLF 会让 #!/bin/sh 找不到解释器。
 
-DEPLOY_README_LINUX = """Vault 服务端部署说明（Linux）
-============================================================
-版本：{version}
-构建时间：{built_at}
-目标平台：Linux x86_64（64 位）
-
-------------------------------------------------------------
-一、这个包是什么
-------------------------------------------------------------
-本包只需要**一个可执行文件**即可运行服务端：
-
-    vault-server      服务端主程序（同时内含发布签名工具 sign 子命令）
-
-它负责：LVM thin 卷管理、LIO iSCSI 目标管理、存储库与用户管理、REST API 与 SSE。
-服务端**不承载任何网页**（管理界面已合并进客户端应用），因此：
-
-    ★ 首次使用必须先取得客户端，用客户端完成初始化设置。
-
-本包是 Windows 包的**对等产物**：同一版本、同一套 API，只是平台后端不同——
-    · Windows：VHDX 文件 + IscsiTarget 角色
-    · Linux  ：LVM thin LV（差异盘 = thin snapshot）+ LIO（写经 targetcli、读直读 configfs）
-
-------------------------------------------------------------
-二、环境要求
-------------------------------------------------------------
-1. 必须以 **root** 运行（LVM、configfs、挂载都需要）。
-2. 内核需支持 LIO（target_core_mod / iscsi_target_mod / target_core_iblock），并挂载 configfs：
-       modprobe target_core_mod
-       modprobe iscsi_target_mod
-       modprobe target_core_iblock                    # 缺它建盘必失败（backstore 插件）
-       mount -t configfs none /sys/kernel/config      # 多数发行版已默认挂载
-   需要 targetcli —— 它是 iSCSI 目标的**执行体**（写操作全部经它下发到 configfs），不是可选包装；
-  读与复验则直读 configfs。targetcli 自身依赖 Python3，装好发行版包即可，服务端不复用 rtslib。
-   ⚠️ 注意 lsmod 里有 iscsi_target_mod ≠ configfs 里已注册成功，
-      要看 /sys/kernel/config/target/iscsi 是否存在——两者 doctor 会分别检查。
-3. 需要 LVM2 工具链（lvm2 包）：pvcreate / vgcreate / lvcreate / lvs / thin 相关命令。
-4. 需要文件系统工具：e2fsprogs（mkfs.ext4）或 xfsprogs（mkfs.xfs）。
-5. 准备一块 **独立的数据盘** 用作 LVM PV（不要用系统盘），例如 /dev/sdb。
-
-★ 上面第 2~4 项**服务端会自己检测**，默认还会自动补齐：
-     · 自动修复：挂载 configfs、加载/重载 LIO 内核模块、写 /etc/modules-load.d/vault-lio.conf；
-     · 自动安装：缺 lvm2/e2fsprogs 等工具时按发行版调 apt-get/dnf/yum/zypper/apk/pacman 装。
-  想让 Ansible/镜像构建等外部工具接管依赖，或处在离线环境，
-  把 config.yaml 里 platform.auto_repair / platform.auto_install 设为 false（只告警不改动）。
-  无论开关如何，随时可手工自检（这才是部署新机器的第一步）：
-       ./vault-server doctor                  # 探测 + 自动修复，逐项给出结果与处置命令
-       ./vault-server doctor -json            # JSON 输出，供脚本/CMDB 消费
-       ./vault-server doctor -install=false   # 只探测不装包（报告里给人工安装命令）
-
-  ⚠️ doctor 修不了"内核根本没提供模块文件"这类问题（模块文件不存在时 modprobe 只会报
-    Module not found）：Debian/Ubuntu 需要 linux-modules-extra-$(uname -r)，RHEL 系需要
-    kernel-modules-extra，Alpine 需要与运行内核匹配的 linux-lts 等。也修不了"连包管理器
-    都没有"的最小化系统。这两种情况用包内的依赖安装脚本兜底（幂等，可反复执行）：
-       sudo ./scripts/setup.sh                # 装齐全部依赖（apt/dnf/yum/zypper/apk/pacman 通用）
-       sudo ./scripts/setup.sh --dry-run      # 只打印它将要执行的命令，不改动系统
-
-------------------------------------------------------------
-三、部署步骤
-------------------------------------------------------------
-1) 解压到部署目录，例如 /opt/vault/：
-       tar -xzf vault-server-{version}-linux-amd64.tar.gz
-       cd vault-server-{version}-linux-amd64
-       chmod +x vault-server                    # 若解压后丢失了可执行权限
-
-   ★ 解压后先装依赖（一条命令，任何发行版通用；已装过的项会跳过）：
-       sudo ./scripts/setup.sh
-     它做三件事：装齐软件包（lvm2/e2fsprogs/…）、必要时补装内核模块包并加载 LIO 三个模块、
-     挂载 configfs；末尾复检并打印"仍未就绪"与诊断（退出码 0 = 必需项全部就绪）。
-
-   ★ 再跑一次服务端自检（十秒钟）——它会挂载 configfs、加载 LIO 三个内核模块、
-     按需安装缺的命令行工具，并逐项打印结果（退出码 0 = 必需项全部就绪）：
-       ./vault-server doctor
-     机器不允许自动改动时（离线 / 由配置管理工具接管）用：
-       ./vault-server doctor -fix=false -install=false      # 只探测，给出人工处置命令
-     其中"缺内核模块"类问题 doctor 修不了，交给上面的 setup.sh（它只管装，不做探测之外的改动）。
-
-2) 准备 LVM 卷组（两种方式，选其一）：
-   方式一（推荐，在管理端做）：先按第 3、4 步起服务，然后在客户端
-        「系统设置 → LVM 存储池」里用块设备选择器初始化 VG + thin pool。
-   方式二（命令行预建）：
-       pvcreate /dev/sdb
-       vgcreate vg0 /dev/sdb
-
-3) 生成配置：
-   本包**故意只带配置模板 config.example.yaml，不带 config.yaml**，
-   这样以后升级解压不会覆盖你已经改好的配置文件。
-
-       # 直接启动即可（推荐）：检测不到 config.yaml 时会自动从模板生成一份并继续启动，
-       # 且会按 Linux 改写模板里的存储相关默认值（storage.whitelist_root → /var/lib/vault）。
-       ./vault-server
-
-   ⚠️ 若你更想"先改好再启动"，也可以 `cp config.example.yaml config.yaml`，
-      但**必须**把 storage.whitelist_root / whitelist_roots 改成 Linux 绝对路径：
-      模板是两个平台共用的一份，里面写的是 Windows 的 D:\\VaultData，
-      它在 Linux 上不是绝对路径，服务端会直接拒绝启动（报"每个根都必须是绝对路径"）。
-
-4) Linux 侧需要关注的配置项（与 Windows 包差异最大之处）：
-      platform.kind              "auto"            ← 跑在 Linux 上即为 linux
-      platform.lvm.vg            "vg0"             ← 卷组名，**不得含 '-'**
-      platform.lvm.thin_pool     "vault"           ← thin pool 名，**不得含 '-'**
-      platform.iscsi.backend     "lio"
-      platform.iscsi.configfs_root  "/sys/kernel/config/target"
-      platform.auto_repair       true              ← 启动时自动修复依赖缺项（挂载/模块/持久化）
-      platform.auto_install      true              ← 缺失 lvm2 等工具时自动装包（离线环境设 false）
-      http.listen                "0.0.0.0:8443"
-      http.tls.enabled           true              ← 证书无需准备，首次启动自动签发
-      database.driver            sqlite
-      security.bootstrap_enabled true              ← 允许用客户端一次性初始化
-
-   ★「存储」在 Linux 上不是普通目录，而是**受管的 thin LV**：
-       config.yaml 的 storage.whitelist_root(s) 在 Linux 上**不会**被种成存储
-       （宿主机普通目录会让落盘绕过 thin pool）。
-       请在管理端「存储」模块创建：服务端会自动 lvcreate → mkfs → 挂载
-       （默认挂载点 /var/lib/vault/storages/<名称>-<短 ID>）。
-
-5) 首次试运行（推荐，日志直接可见）：
-       ./vault-server -config ./config.yaml
-   正常会看到 "HTTP 服务已启动（TLS）" listen=0.0.0.0:8443。
-   首次启动会自动补写 server.instance_id 与 security.master_key，并生成 pki/ 证书。
-   ⚠️ security.master_key 用于加密 CHAP 密钥，**丢失后已配置的 iSCSI 鉴权将无法解密**，
-      请务必备份 config.yaml（该文件请勿随升级包一起覆盖）。
-   按 Ctrl+C 停止（等价于 SIGTERM，走优雅停机）。
-
-------------------------------------------------------------
-四、目录说明（首次启动后）
-------------------------------------------------------------
-    vault-server          主程序
-    config.example.yaml   配置模板（不要改它）
-    config.yaml           实际配置（首次启动自动生成，含自动生成的密钥，注意备份）
-    pki/                  自建 CA 与服务端证书（自动生成）
-    data/                 SQLite 数据库
-    logs/                 日志（按天切分；另有固定文件 logs/vault-server.log）
-    scripts/              依赖安装脚本（setup.sh）与 systemd 托管脚本
-    updates/              客户端更新分发目录（可选）
-
-------------------------------------------------------------
-五、交给 systemd 托管（推荐的生产用法）
-------------------------------------------------------------
-    sudo ./scripts/install-systemd.sh            # 默认装在 /opt/vault
-
-安装后：
-    systemctl status  vault-server
-    systemctl restart vault-server
-    systemctl stop    vault-server               # SIGTERM，优雅停机
-    journalctl -u vault-server -f
-
-卸载：
-    sudo systemctl disable --now vault-server
-    sudo rm -f /etc/systemd/system/vault-server.service
-    sudo systemctl daemon-reload
-
-⚠️ 服务端**不支持**在 Linux 上自行 daemonize 成"传统守护进程"：
-   默认就是**前台运行**（日志直接可见，便于排障），后台由 systemd 负责。
-   命令行下也可用 nohup/setsid 自行后台化，但推荐用上面的 unit。
-
-------------------------------------------------------------
-六、客户端更新分发（本包已内置）
-------------------------------------------------------------
-服务端不参与更新包签名，只做"存储 + 分发"。
-★ 本包已在 updates/ 目录内**内置本次构建的更新包**
-  （updates/manifest.json、updates/manifest.json.sig、updates/artifacts/...），
-  服务端开箱即可对外分发，**无需任何手工拷贝**。
-只要 config.yaml 中 update.artifacts_dir 指向包内 updates/（默认即为 "updates"），
-客户端即可检查并下载更新。
-
-替换更新内容时，把**新的发布目录内容整体覆盖** updates/（保持结构，不要只替换一部分），
-然后重启服务端（或保存 config.yaml 触发热重载）。
-⚠️ 不要手工编辑 manifest.json，也不要做格式化/行尾转换，否则签名会失效。
-⚠️ 私钥（update-private.pem）**绝不能**放到服务器上。
-
-------------------------------------------------------------
-七、排障
-------------------------------------------------------------
-Q: 启动报"单实例锁获取失败"
-A: 已有一个 vault-server 在运行：pgrep -af vault-server
-
-Q: 日志报 "LVM 工具链不可用" / "LIO configfs 不可用" / "系统依赖自检未通过"
-A: 先跑 ./vault-server doctor —— 它会逐项说明缺什么、能自动修的当场修掉
-   （mount configfs、modprobe/重载内核模块、按需装包），修不了的把「处置」命令打出来照做即可。
-   注意：lsmod 里有 iscsi_target_mod 不等于 configfs 里已注册成功
-   （判据是 /sys/kernel/config/target/iscsi 与 /sys/kernel/config/target/core/iblock_0 是否存在），
-   doctor 会把"模块未加载""模块在但 fabric 未注册""缺 backstore 插件"分开报。
-   这些项只做启动期告警、不阻断启动，但对应功能不可用。
-
-Q: 客户端连不上
-A: 1) ss -lntp | grep 8443      确认监听
-   2) 放通防火墙：firewall-cmd --add-port=8443/tcp --permanent && firewall-cmd --reload
-      （iSCSI 还需放通 3260）
-   3) 客户端首次连接需要核对证书指纹（自建 CA，属正常流程）
-
-Q: 日志在哪
-A: logs/ 目录（按天切分）；崩溃现场另在 logs/vault-server.log。
-
-------------------------------------------------------------
-八、卸载
-------------------------------------------------------------
-1) systemctl disable --now vault-server（或 pkill -TERM vault-server）
-2) 删除本目录
-3) 按需清理 LVM：lvremove / vgremove / pvremove
-⚠️ 清理 LVM 会**永久丢失所有虚拟磁盘与用户数据**。
-"""
-
 LINUX_SYSTEMD_UNIT = """[Unit]
 Description=Vault 存储服务端
-Documentation=file:///opt/vault/部署说明.txt
 After=network-online.target
 Wants=network-online.target
 
@@ -2005,8 +1575,8 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
     linux=False → Windows zip（dist/package/vault-server-<版本>-win64.zip）
     linux=True  → Linux tar.gz（dist/package/vault-server-<版本>-linux-amd64.tar.gz）
 
-    两个包**同版本、同结构**：主程序 + 配置模板 + 部署说明 + scripts/ + updates/，
-    只有"平台专属的三件套"（可执行文件名、部署说明、托管脚本）不同。
+    两个包**同版本、同结构**：主程序 + 配置模板 + scripts/ + updates/，
+    只有"平台专属的两件套"（可执行文件名、托管脚本）不同。
     这样发布时两个平台一并产出，不会出现"只有 Windows 包"的漏发。
 
     包内**绝不包含**：发布方私钥、pki 证书（服务端自动生成）、数据库、日志、虚拟磁盘。
@@ -2047,13 +1617,9 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
     else:
         warn("未找到配置模板，包内将不含 config.example.yaml")
 
-    # 3) 部署说明与平台脚本
+    # 3) 平台脚本（包内不再携带任何部署/使用说明文档）
     if linux:
-        # 说明文档用无 BOM + LF 写：否则 shell 脚本在 Linux 上无法执行。
-        _write_text_unix(pkg_dir / "部署说明.txt", DEPLOY_README_LINUX.format(
-            version=version,
-            built_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-        ))
+        # 脚本用无 BOM + LF 写：否则 shell 脚本在 Linux 上无法执行。
         _write_text_unix(pkg_dir / "scripts" / "vault-server.service", LINUX_SYSTEMD_UNIT)
         _write_text_unix(pkg_dir / "scripts" / "install-systemd.sh", LINUX_INSTALL_SYSTEMD)
         (pkg_dir / "scripts" / "install-systemd.sh").chmod(0o755)
@@ -2070,10 +1636,6 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
         else:
             warn("未找到 scripts/setup.sh，包内将不含依赖安装脚本")
     else:
-        _write_text(pkg_dir / "部署说明.txt", DEPLOY_README.format(
-            version=version,
-            built_at=time.strftime("%Y-%m-%d %H:%M:%S"),
-        ))
         _write_text(pkg_dir / "scripts" / "install-autostart.ps1", INSTALL_AUTOSTART)
         _write_text(pkg_dir / "scripts" / "uninstall-autostart.ps1", UNINSTALL_AUTOSTART)
 
@@ -2094,14 +1656,9 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
             ok(f"已内置本次构建的更新包（version={manifest.get('version')} "
                f"channel={manifest.get('channel')}，产物 {len(included)} 个）")
         else:
-            warn(f"{src} 下没有已签名的 manifest.json，包内 updates/ 将只含说明（服务端无法分发更新）")
+            warn(f"{src} 下没有已签名的 manifest.json，包内 updates/ 将为空（服务端无法分发更新）")
     else:
-        warn("已跳过更新包（--skip-update）；包内 updates/ 只含说明")
-    # 说明文档始终写入：即便已内置更新包，也要说明替换方式与安全红线。
-    # Linux 包统一走无 BOM + LF 的写法，避免包内混用两种编码/换行。
-    writer = _write_text_unix if linux else _write_text
-    writer(updates_dir / "说明.txt",
-           UPDATES_DIR_README if included else UPDATES_DIR_README_EMPTY)
+        warn("已跳过更新包（--skip-update）；包内 updates/ 将为空")
 
     # 5) 打包
     PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -2118,7 +1675,7 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
     ok(f"服务端部署包（{plat}）：{archive_path}")
     info(f"  大小 {size:,} 字节（解压后目录 {pkg_dir.name}{sep}）")
     info(f"  内容：{bin_name} / config.example.yaml")
-    info(f"        / 部署说明.txt / scripts{sep} / updates{sep}")
+    info(f"        / scripts{sep} / updates{sep}")
     if included:
         info("  updates/ 内置本次构建的更新产物（服务端开箱即可分发）：")
         info(f"    updates{sep}manifest.json")
@@ -2126,7 +1683,7 @@ def package_server(version: str, include_updates: bool, linux: bool = False) -> 
         for url, art_size in included:
             info(f"    updates/{url:<42} {art_size:>12,} 字节")
     else:
-        info("  updates/ 未内置更新产物（仅 说明.txt）")
+        info("  updates/ 未内置更新产物（目录为空）")
     info("  ★ 不含 config.yaml（避免覆盖你已改好的配置；服务端首次启动会自动生成）")
     info("  ★ 不含私钥、不含证书（证书由服务端首次启动自动生成）")
     return archive_path
@@ -2200,84 +1757,6 @@ def package_client(version: str, args=None) -> Path | None:
     # 若缺失（例如复用了旧的产物目录），补一份，保证客户端能找到代理。
     if not (pkg_dir / "Vault-Agent.exe").is_file() and agent.is_file():
         shutil.copy2(agent, pkg_dir / "Vault-Agent.exe")
-
-    lines = [
-        "Vault 客户端使用说明",
-        "=" * 60,
-        f"版本：{version}",
-        "",
-        "-" * 60,
-        "一、怎么启动（重要）",
-        "-" * 60,
-    ]
-    if app_dir:
-        lines += [
-            "  解压本目录后，**双击 Vault.exe** 即打开客户端界面。",
-            "  无需安装，也不会有安装程序。",
-            "",
-            "  ⚠️ 不要双击 Vault-Agent.exe —— 它是后台代理（负责 iSCSI 连接与磁盘挂载），",
-            "     不是界面，由客户端自动在后台拉起，无需手工启动。",
-        ]
-    else:
-        lines += [
-            "  ⚠️ 本包内**没有**客户端界面程序（Vault.exe）—— 缺少它服务端将无法完成首次初始化",
-            "     （服务端不提供网页初始化入口）。",
-            "",
-            "     构建方式（在发布方机器上执行，需要联网下载 Electron 运行时）：",
-            "         python build.py --package-all",
-            "     或手工：",
-            "         cd frontend",
-            "         pnpm install",
-            "         pnpm --filter @vault/client run package",
-            "     产物位于 frontend/apps/client/release/win-unpacked/，再重新打包即可带上。",
-        ]
-    lines += [
-        "",
-        "-" * 60,
-        "二、包含什么",
-        "-" * 60,
-        "  Vault.exe           客户端界面（双击启动的就是它）",
-        "  Vault-Agent.exe     本地代理：iSCSI 连接、磁盘挂载、租约心跳、自更新",
-        "  其余 dll / locales / resources   Electron 运行时，请勿删除",
-        "",
-        "  说明：locales 目录只保留界面支持的 4 种语言（简体中文 / English / 日本語 /",
-        "  韓国語）——这是刻意的精简，删掉其余语言包不影响界面文案（界面文字由程序自带，",
-        "  与 locales 无关），只是让系统语言不在这 4 种之内的机器上、Chromium 原生控件",
-        "  文案回退英文。请勿再手工删减目录里的其他文件。",
-        "",
-        "-" * 60,
-        "三、首次连接服务端",
-        "-" * 60,
-        "  1) 在客户端中填入服务端地址（例如 https://<服务器IP>:8443）",
-        "  2) 首次连接会要求核对服务端证书指纹 —— 这是自建 CA 的正常流程，",
-        "     请与服务器上 pki\\server.crt 的指纹比对后确认",
-        "  3) 若服务端尚未初始化，客户端会引导你创建超级管理员并完成初始化设置",
-        "",
-        "-" * 60,
-        "四、挂载要求",
-        "-" * 60,
-        "  · 客户端代理需要**管理员权限**才能连接 iSCSI 磁盘并分配盘符/挂载点：",
-        "     如需挂载，请以管理员身份运行 Vault.exe",
-        "  · 客户端需能访问服务端的 iSCSI 端口（默认 3260）与 API 端口（默认 8443）",
-        "  · 若挂载到目录，目标目录必须已存在且为空",
-        "",
-        "-" * 60,
-        "五、自更新",
-        "-" * 60,
-        "  · 客户端会向服务端检查更新；更新包由发布方签名，客户端内置公钥验签",
-        "  · 有活跃挂载时会拒绝更新（返回 agent.busy_mounts），需先卸载",
-        "  · 更新失败连续 3 次会自动回滚到上一版本",
-        "",
-        "-" * 60,
-        "六、开源许可",
-        "-" * 60,
-        "  · Electron 许可（MIT）全文随包提供：LICENSE.electron.txt",
-        "  · Chromium 及其第三方组件的完整许可清单约 9 MB，为控制分发包体积未随包分发；",
-        "     获取方式与在线地址见同目录的 THIRD-PARTY-NOTICES.txt，",
-        "     也可以从客户端托盘右键菜单的「开源许可」直接打开。",
-        "",
-    ]
-    _write_text(pkg_dir / "使用说明.txt", "\n".join(lines))
 
     PACKAGE_DIR.mkdir(parents=True, exist_ok=True)
     zip_base = PACKAGE_DIR / pkg_name
@@ -2525,8 +2004,8 @@ def main(argv: list[str] | None = None) -> int:
     # ---- 5) 部署打包 ----
     packages: list[Path] = []
     if args.package or args.package_all:
-        # 服务端包默认内联"当前已签名的发布目录内容"：否则开箱部署的服务端只有 updates/说明.txt，
-        # 永远无法对外分发更新（客户端报 update.no_manifest）。仅当发布目录确无 manifest 时才退化为只带说明。
+        # 服务端包默认内联"当前已签名的发布目录内容"：否则开箱部署的服务端 updates/ 为空，
+        # 永远无法对外分发更新（客户端报 update.no_manifest）。仅当发布目录确无 manifest 时才退化为空目录。
         updates_ready = (out_dir / "manifest.json").is_file()
         packages = run_package(
             version,
@@ -2554,8 +2033,8 @@ def main(argv: list[str] | None = None) -> int:
         for z in packages:
             info(f"  {z}")
             info(f"    大小 {z.stat().st_size:,} 字节")
-        info("Windows：把 zip 传到服务器解压，按包内《部署说明.txt》操作即可")
-        info("Linux  ：把 tar.gz 传到服务器解压（保留可执行权限），同样按《部署说明.txt》操作")
+        info("Windows：把 zip 传到服务器解压即可（scripts/ 内提供开机自启脚本）")
+        info("Linux  ：把 tar.gz 传到服务器解压并保留可执行权限（scripts/ 内提供 systemd 安装脚本）")
 
     info(f"耗时 {time.time() - started:.1f}s")
     return 0

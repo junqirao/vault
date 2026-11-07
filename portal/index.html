@@ -1,0 +1,2654 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Vault · 存储共享与端侧加速</title>
+    <meta
+      name="description"
+      content="Vault 是一个自托管的虚拟磁盘与 iSCSI 存储平台：安全的块级存储分发，以及不终止会话的端侧 iSCSI 旁路缓存加速。"
+    />
+    <style>
+      :root {
+        --bg: #f4f6fa;
+        --bg-2: #e9eef7;
+        --surface: rgba(255, 255, 255, 0.72);
+        --surface-2: rgba(255, 255, 255, 0.9);
+        --ink: #0b1220;
+        --ink-2: #263044;
+        --muted: #5f6878;
+        --muted-2: #8a93a3;
+        --line: rgba(11, 18, 32, 0.1);
+        --line-2: rgba(11, 18, 32, 0.18);
+        --accent: #0a6cff;
+        --accent-dark: #0053cc;
+        --accent-soft: rgba(10, 108, 255, 0.1);
+        --warm: #d97706;
+        --warn-soft: rgba(217, 119, 6, 0.1);
+        --navy: #0b1424;
+        --mono: ui-monospace, SFMono-Regular, "SF Mono", Consolas, "Liberation Mono", monospace;
+        --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei", "Noto Sans SC", Helvetica, Arial, sans-serif;
+      }
+
+      *,
+      *::before,
+      *::after {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+      }
+
+      body {
+        background: var(--bg);
+        color: var(--ink);
+        font-family: var(--sans);
+        line-height: 1.65;
+        overflow: hidden;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      img {
+        max-width: 100%;
+        height: auto;
+        display: block;
+      }
+
+      a {
+        color: var(--accent);
+        text-decoration: none;
+      }
+
+      a:hover {
+        color: #0053cc;
+      }
+
+      code,
+      pre {
+        font-family: var(--mono);
+      }
+
+      /* background graphics */
+
+      .bg {
+        position: fixed;
+        inset: 0;
+        z-index: -1;
+        overflow: hidden;
+        background:
+          radial-gradient(circle at 78% -8%, rgba(10, 108, 255, 0.13), transparent 30%),
+          radial-gradient(circle at 8% 92%, rgba(56, 189, 248, 0.12), transparent 32%),
+          linear-gradient(160deg, #f8faff 0%, #eff4fb 48%, #e7eef8 100%);
+      }
+
+      .bg::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image:
+          linear-gradient(rgba(11, 18, 32, 0.045) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(11, 18, 32, 0.045) 1px, transparent 1px);
+        background-size: 64px 64px;
+        -webkit-mask-image: radial-gradient(circle at 55% 18%, #000 0%, transparent 78%);
+        mask-image: radial-gradient(circle at 55% 18%, #000 0%, transparent 78%);
+      }
+
+      .bg::after {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image: radial-gradient(rgba(10, 108, 255, 0.22) 1px, transparent 1px);
+        background-size: 96px 96px;
+        opacity: 0.16;
+        -webkit-mask-image: radial-gradient(circle at 72% 28%, #000 0%, transparent 68%);
+        mask-image: radial-gradient(circle at 72% 28%, #000 0%, transparent 68%);
+      }
+
+      .orb {
+        position: absolute;
+        border-radius: 50%;
+        filter: blur(88px);
+        pointer-events: none;
+      }
+
+      .orb-a {
+        width: 560px;
+        height: 560px;
+        right: -120px;
+        top: -150px;
+        background: radial-gradient(circle, rgba(10, 108, 255, 0.85), transparent 66%);
+        opacity: 0.18;
+      }
+
+      .orb-b {
+        width: 520px;
+        height: 520px;
+        left: -190px;
+        bottom: -190px;
+        background: radial-gradient(circle, rgba(56, 189, 248, 0.7), transparent 66%);
+        opacity: 0.12;
+      }
+
+      .ring {
+        position: absolute;
+        border: 1px solid rgba(10, 108, 255, 0.14);
+        border-radius: 50%;
+        pointer-events: none;
+      }
+
+      .ring-a {
+        width: 540px;
+        height: 540px;
+        right: 5%;
+        bottom: 2%;
+      }
+
+      .ring-b {
+        width: 820px;
+        height: 820px;
+        right: -1%;
+        bottom: -12%;
+        border-color: rgba(10, 108, 255, 0.08);
+      }
+
+      .bg-line {
+        position: absolute;
+        left: -10%;
+        top: 28%;
+        width: 72vw;
+        height: 1px;
+        background: linear-gradient(90deg, transparent, rgba(10, 108, 255, 0.22), transparent);
+        transform: rotate(-24deg);
+        pointer-events: none;
+      }
+
+      /* top bar */
+
+      .topbar {
+        position: fixed;
+        inset: 0 0 auto;
+        z-index: 100;
+        height: 62px;
+        border-bottom: 1px solid rgba(11, 18, 32, 0.08);
+        background: rgba(247, 249, 253, 0.86);
+        backdrop-filter: blur(14px);
+      }
+
+      .topbar-inner {
+        width: min(1320px, calc(100% - 64px));
+        height: 100%;
+        margin: 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 22px;
+      }
+
+      .brand {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--ink);
+        font-weight: 700;
+        letter-spacing: -0.01em;
+      }
+
+      .brand-mark {
+        width: 29px;
+        height: 29px;
+        border-radius: 8px;
+        background: var(--accent);
+        color: #fff;
+        display: grid;
+        place-items: center;
+        font-size: 16px;
+        font-weight: 900;
+        line-height: 1;
+      }
+
+      .brand small {
+        display: block;
+        margin-top: -2px;
+        color: var(--muted-2);
+        font-size: 10.5px;
+        font-weight: 500;
+        letter-spacing: 0;
+      }
+
+      .nav-links {
+        display: flex;
+        align-items: center;
+        gap: 1px;
+        margin-left: auto;
+      }
+
+      .nav-links a {
+        padding: 7px 10px;
+        border-radius: 7px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .nav-links a:hover {
+        color: var(--ink);
+        background: rgba(11, 18, 32, 0.05);
+      }
+
+      .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        height: 40px;
+        padding: 0 16px;
+        border: 1px solid transparent;
+        border-radius: 9px;
+        font-size: 13px;
+        font-weight: 600;
+        white-space: nowrap;
+        cursor: pointer;
+        transition: 160ms ease;
+      }
+
+      .btn svg {
+        width: 16px;
+        height: 16px;
+        flex: 0 0 auto;
+      }
+
+      .btn-accent {
+        color: #fff;
+        background: var(--accent);
+        border-color: var(--accent);
+      }
+
+      .btn-accent:hover {
+        color: #fff;
+        background: #3b87ff;
+        border-color: #3b87ff;
+      }
+
+      .btn-ghost {
+        color: var(--ink);
+        background: transparent;
+        border-color: var(--line-2);
+      }
+
+      .btn-ghost:hover {
+        color: var(--ink);
+        background: rgba(11, 18, 32, 0.04);
+        border-color: rgba(11, 18, 32, 0.34);
+      }
+
+      .btn-sm {
+        height: 32px;
+        padding: 0 11px;
+        font-size: 12px;
+      }
+
+      .lang-switch {
+        display: inline-flex;
+        align-items: center;
+        height: 32px;
+        margin-left: 6px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.5);
+      }
+
+      .lang-switch button {
+        height: 100%;
+        padding: 0 9px;
+        border: 0;
+        background: transparent;
+        color: var(--muted);
+        font-size: 10.5px;
+        font-family: var(--mono);
+        cursor: pointer;
+        transition: 160ms ease;
+      }
+
+      .lang-switch button:hover {
+        color: var(--ink);
+      }
+
+      .lang-switch button.active {
+        background: var(--accent);
+        color: #fff;
+      }
+
+      /* deck */
+
+      .deck {
+        height: 100vh;
+        overflow-y: auto;
+        scroll-snap-type: y mandatory;
+        scroll-behavior: smooth;
+        scrollbar-width: none;
+      }
+
+      .deck::-webkit-scrollbar {
+        display: none;
+      }
+
+      .slide {
+        position: relative;
+        min-height: 100vh;
+        scroll-snap-align: start;
+        scroll-snap-stop: always;
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        align-items: center;
+        padding: 100px 0 64px;
+      }
+
+      .slide-inner {
+        width: min(1180px, calc(100% - 64px));
+        margin: 0 auto;
+      }
+
+      .slide-index {
+        position: absolute;
+        top: 82px;
+        right: max(26px, calc((100vw - 1180px) / 2));
+        color: var(--muted-2);
+        font-family: var(--mono);
+        font-size: 9.5px;
+        letter-spacing: 0.08em;
+      }
+
+      .kicker {
+        margin: 0 0 11px;
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+
+      .slide-title {
+        margin: 0;
+        font-size: clamp(30px, 3.3vw, 44px);
+        line-height: 1.12;
+        letter-spacing: -0.035em;
+        font-weight: 740;
+      }
+
+      .slide-lead {
+        max-width: 720px;
+        margin: 13px 0 0;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.8;
+      }
+
+      .shot {
+        overflow: hidden;
+        border: 1px solid rgba(11, 18, 32, 0.16);
+        border-radius: 13px;
+        background: #fff;
+        box-shadow:
+          0 28px 60px -38px rgba(15, 23, 42, 0.22),
+          0 0 0 1px rgba(10, 108, 255, 0.06);
+      }
+
+      .shot img {
+        width: 100%;
+        display: block;
+      }
+
+      .shot-caption {
+        display: flex;
+        justify-content: space-between;
+        gap: 14px;
+        margin-top: 9px;
+        color: var(--muted-2);
+        font-size: 9.5px;
+        font-family: var(--mono);
+      }
+
+      .tag-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        margin-top: 14px;
+      }
+
+      .tag {
+        display: inline-flex;
+        align-items: center;
+        height: 23px;
+        padding: 0 8px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: var(--muted);
+        background: #fff;
+        font-size: 10.5px;
+        font-family: var(--mono);
+      }
+
+      .tag.hi {
+        color: var(--accent);
+        border-color: rgba(10, 108, 255, 0.28);
+        background: var(--accent-soft);
+      }
+
+      /* hero */
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+        gap: 50px;
+        align-items: center;
+      }
+
+      .hero-grid > *,
+      .perf-grid > *,
+      .storage-grid > *,
+      .bypass-grid > *,
+      .last-grid > * {
+        min-width: 0;
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 16px;
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 10px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow .dot {
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 0 4px rgba(10, 108, 255, 0.12);
+      }
+
+      .hero-title {
+        margin: 0;
+        font-size: clamp(40px, 4.35vw, 62px);
+        line-height: 1.02;
+        letter-spacing: -0.052em;
+        font-weight: 780;
+        white-space: nowrap;
+      }
+
+      .hero-title em {
+        color: var(--accent);
+        font-style: normal;
+      }
+
+      html[lang="en-US"] .hero-title {
+        font-size: clamp(34px, 3.6vw, 50px);
+        letter-spacing: -0.045em;
+      }
+
+      .hero-lead {
+        max-width: 570px;
+        margin: 21px 0 0;
+        color: var(--ink-2);
+        font-size: 15px;
+        line-height: 1.82;
+      }
+
+      .hero-pills {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-top: 18px;
+      }
+
+      .hero-pills span {
+        padding: 6px 10px;
+        border: 1px solid rgba(10, 108, 255, 0.22);
+        border-radius: 7px;
+        background: rgba(10, 108, 255, 0.07);
+        color: var(--accent);
+        font-size: 11.5px;
+        font-family: var(--mono);
+      }
+
+      .hero-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 24px;
+      }
+
+      .hero-meta {
+        margin-top: 18px;
+        color: var(--muted-2);
+        font-family: var(--mono);
+        font-size: 10.5px;
+      }
+
+      .hero-collage {
+        position: relative;
+        padding: 0 0 38px 38px;
+      }
+
+      .hero-main {
+        width: 100%;
+      }
+
+      .hero-small {
+        position: absolute;
+        left: 0;
+        bottom: 0;
+        width: 52%;
+        border-color: rgba(11, 18, 32, 0.16);
+        box-shadow: 0 24px 50px -30px rgba(15, 23, 42, 0.22);
+      }
+
+      .hero-facts {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        margin-top: 24px;
+        border-top: 1px solid var(--line);
+      }
+
+      .hero-fact {
+        display: flex;
+        gap: 10px;
+        padding: 14px 18px 0 0;
+        border-right: 1px solid var(--line);
+      }
+
+      .hero-fact:last-child {
+        border-right: 0;
+      }
+
+      .hero-fact .n {
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 9px;
+        padding-top: 2px;
+      }
+
+      .hero-fact b {
+        display: block;
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .hero-fact small {
+        display: block;
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 10.5px;
+        line-height: 1.5;
+      }
+
+      /* performance */
+
+      .perf-head {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-end;
+        gap: 26px;
+      }
+
+      .perf-warning {
+        display: flex;
+        align-items: flex-start;
+        gap: 7px;
+        max-width: 680px;
+        margin-top: 9px;
+        color: var(--muted);
+        font-size: 10.5px;
+        line-height: 1.6;
+      }
+
+      .perf-warning svg {
+        flex: 0 0 auto;
+        width: 13px;
+        height: 13px;
+        margin-top: 1px;
+        color: var(--warm);
+      }
+
+      .perf-warning b {
+        color: var(--ink-2);
+        font-weight: 600;
+      }
+
+      .caveat {
+        max-width: 370px;
+        padding: 9px 11px;
+        border-left: 2px solid var(--warm);
+        background: var(--warn-soft);
+        color: #7c4a03;
+        font-size: 10.5px;
+        line-height: 1.65;
+      }
+
+      .caveat b {
+        color: #8a5606;
+      }
+
+      .perf-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.12fr) minmax(0, 0.88fr);
+        gap: 26px;
+        align-items: start;
+        margin-top: 22px;
+      }
+
+      .perf-shot {
+        height: clamp(210px, 34vh, 330px);
+        background: #fff;
+      }
+
+      .perf-shot img {
+        height: 100%;
+        object-fit: contain;
+        object-position: top center;
+      }
+
+      .perf-table {
+        width: 100%;
+        margin-top: 12px;
+        border-collapse: collapse;
+        font-size: 11.5px;
+        font-variant-numeric: tabular-nums;
+      }
+
+      .perf-table th {
+        padding: 6px 0;
+        border-bottom: 1px solid var(--line-2);
+        color: var(--muted-2);
+        font-size: 9px;
+        font-weight: 600;
+        letter-spacing: 0.07em;
+        text-align: right;
+        text-transform: uppercase;
+      }
+
+      .perf-table th:first-child,
+      .perf-table td:first-child {
+        text-align: left;
+      }
+
+      .perf-table td {
+        padding: 6px 0;
+        border-bottom: 1px solid var(--line);
+        text-align: right;
+        color: #1b2434;
+        font-weight: 500;
+      }
+
+      .perf-table td:first-child {
+        color: #0b1220;
+        font-weight: 600;
+      }
+
+      .perf-table tr:last-child td {
+        border-bottom: 0;
+      }
+
+      .perf-side .shot {
+        height: clamp(190px, 31vh, 300px);
+      }
+
+      .perf-side .shot img {
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+      }
+
+      .perf-note {
+        margin: 10px 0 0;
+        color: var(--muted);
+        font-size: 11.5px;
+        line-height: 1.7;
+      }
+
+      .mini-list {
+        display: grid;
+        gap: 6px;
+        margin: 12px 0 0;
+        padding: 0;
+        list-style: none;
+      }
+
+      .mini-list li {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        color: var(--muted);
+        font-size: 10.5px;
+      }
+
+      .mini-list b {
+        color: var(--ink);
+        font-family: var(--mono);
+        font-weight: 600;
+      }
+
+      /* storage */
+
+      .storage-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.04fr) minmax(0, 0.96fr);
+        gap: 36px;
+        align-items: center;
+        margin-top: 22px;
+      }
+
+      .reuse-diagram {
+        display: grid;
+        grid-template-columns: minmax(0, 0.9fr) 30px minmax(0, 1.25fr);
+        align-items: center;
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: rgba(11, 18, 32, 0.045);
+      }
+
+      .reuse-parent {
+        padding: 13px 14px;
+        border: 1px solid rgba(10, 108, 255, 0.28);
+        border-radius: 8px;
+        background: rgba(10, 108, 255, 0.075);
+      }
+
+      .reuse-parent .mono,
+      .reuse-row .mono {
+        display: block;
+        color: var(--muted-2);
+        font-family: var(--mono);
+        font-size: 9px;
+      }
+
+      .reuse-parent strong {
+        display: block;
+        margin-top: 3px;
+        font-size: 13px;
+      }
+
+      .reuse-parent small {
+        display: block;
+        margin-top: 3px;
+        color: var(--muted);
+        font-size: 10px;
+      }
+
+      .reuse-arrow {
+        position: relative;
+        height: 100%;
+        min-height: 45px;
+      }
+
+      .reuse-arrow::before {
+        content: "";
+        position: absolute;
+        top: 50%;
+        left: 5px;
+        right: 5px;
+        border-top: 1px solid rgba(11, 18, 32, 0.22);
+      }
+
+      .reuse-arrow::after {
+        content: "";
+        position: absolute;
+        top: calc(50% - 3px);
+        right: 3px;
+        width: 6px;
+        height: 6px;
+        border-top: 1px solid var(--accent);
+        border-right: 1px solid var(--accent);
+        transform: rotate(45deg);
+      }
+
+      .reuse-list {
+        display: grid;
+        gap: 6px;
+      }
+
+      .reuse-row {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 8px 10px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: #fff;
+      }
+
+      .reuse-row strong {
+        font-size: 10.5px;
+        font-weight: 600;
+      }
+
+      .reuse-row span {
+        color: var(--muted);
+        font-family: var(--mono);
+        font-size: 9px;
+        white-space: nowrap;
+      }
+
+      .caption {
+        margin: 9px 0 0;
+        color: var(--muted-2);
+        font-size: 9.5px;
+        line-height: 1.6;
+      }
+
+      .lifecycle {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0 22px;
+        margin-top: 16px;
+        border-top: 1px solid var(--line);
+      }
+
+      .lifecycle-item {
+        display: grid;
+        grid-template-columns: 22px 1fr;
+        gap: 9px;
+        padding: 10px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .lifecycle-item .n {
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 9px;
+        padding-top: 2px;
+      }
+
+      .lifecycle-item h4 {
+        margin: 0 0 2px;
+        font-size: 12px;
+      }
+
+      .lifecycle-item p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 10.5px;
+        line-height: 1.65;
+      }
+
+      .storage-side {
+        display: grid;
+        gap: 12px;
+      }
+
+      .storage-side .shot:first-child {
+        height: clamp(170px, 24vh, 235px);
+      }
+
+      .storage-side .shot:last-child {
+        height: clamp(150px, 21vh, 210px);
+      }
+
+      .storage-side .shot img {
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+      }
+
+      /* bypass */
+
+      .bypass-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+        gap: 32px;
+        align-items: center;
+        margin-top: 18px;
+      }
+
+      .flow {
+        padding: 16px;
+        border: 1px solid var(--line);
+        border-radius: 11px;
+        background: rgba(11, 18, 32, 0.045);
+      }
+
+      .flow-node {
+        padding: 9px 11px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: rgba(11, 18, 32, 0.045);
+      }
+
+      .flow-node strong {
+        display: block;
+        font-size: 11.5px;
+      }
+
+      .flow-node span {
+        display: block;
+        margin-top: 2px;
+        color: var(--muted-2);
+        font-family: var(--mono);
+        font-size: 9px;
+      }
+
+      .flow-node.hot {
+        border-color: rgba(10, 108, 255, 0.35);
+        background: var(--accent-soft);
+      }
+
+      .flow-node.hot strong {
+        color: var(--accent);
+      }
+
+      .flow-arrow {
+        position: relative;
+        height: 24px;
+        margin-left: 18px;
+        border-left: 1px solid rgba(11, 18, 32, 0.18);
+      }
+
+      .flow-arrow::before {
+        content: "";
+        position: absolute;
+        left: -3px;
+        bottom: 0;
+        width: 5px;
+        height: 5px;
+        border-right: 1px solid var(--accent);
+        border-bottom: 1px solid var(--accent);
+        transform: rotate(45deg);
+      }
+
+      .flow-arrow em {
+        position: absolute;
+        left: 8px;
+        top: 5px;
+        color: var(--muted-2);
+        font-size: 8.5px;
+        font-style: normal;
+        font-family: var(--mono);
+      }
+
+      .bypass-shot {
+        height: clamp(210px, 31vh, 300px);
+      }
+
+      .bypass-shot img {
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+      }
+
+      .details {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 0 26px;
+        margin-top: 20px;
+        border-top: 1px solid var(--line);
+      }
+
+      .detail-item {
+        display: grid;
+        grid-template-columns: 22px 1fr;
+        gap: 9px;
+        padding: 12px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .detail-item .n {
+        color: var(--accent);
+        font-family: var(--mono);
+        font-size: 9px;
+        padding-top: 2px;
+      }
+
+      .detail-item h4 {
+        margin: 0 0 3px;
+        font-size: 12.5px;
+      }
+
+      .detail-item p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 10.5px;
+        line-height: 1.68;
+      }
+
+      /* last slide */
+
+      .last-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 0.95fr) minmax(0, 1.05fr);
+        gap: 30px;
+        align-items: start;
+        margin-top: 20px;
+      }
+
+      .last-shots {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px;
+      }
+
+      .last-shots .shot {
+        height: clamp(170px, 24vh, 230px);
+      }
+
+      .last-shots .shot img {
+        height: 100%;
+        object-fit: cover;
+        object-position: top center;
+      }
+
+      .last-note {
+        grid-column: 1 / -1;
+        margin: 0;
+        color: var(--muted);
+        font-size: 10.5px;
+        line-height: 1.7;
+      }
+
+      .code-block {
+        border: 1px solid rgba(10, 108, 255, 0.16);
+        border-radius: 9px;
+        background: var(--navy);
+        color: #cfe7dd;
+        overflow: hidden;
+      }
+
+      .code-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        height: 29px;
+        padding: 0 9px 0 11px;
+        border-bottom: 1px solid rgba(10, 108, 255, 0.12);
+        color: #6f8b7f;
+        font-size: 9px;
+        font-family: var(--mono);
+      }
+
+      .copy-btn {
+        border: 1px solid rgba(10, 108, 255, 0.2);
+        border-radius: 4px;
+        background: transparent;
+        color: #9db9ad;
+        font-size: 9px;
+        font-family: var(--mono);
+        padding: 2px 6px;
+        cursor: pointer;
+      }
+
+      .copy-btn:hover {
+        color: var(--accent);
+        border-color: rgba(10, 108, 255, 0.45);
+      }
+
+      .code-block pre {
+        margin: 0;
+        padding: 11px 12px 13px;
+        overflow-x: auto;
+        font-size: 10.5px;
+        line-height: 1.7;
+        color: #cfe7dd;
+      }
+
+      .code-block .c {
+        color: #6c887b;
+      }
+
+      .build-note {
+        margin: 9px 0 0;
+        color: var(--muted);
+        font-size: 10.5px;
+        line-height: 1.65;
+      }
+
+      .platform-list {
+        display: grid;
+        gap: 0;
+        margin: 12px 0 0;
+        padding: 0;
+        list-style: none;
+        border-top: 1px solid var(--line);
+      }
+
+      .platform-list li {
+        display: grid;
+        grid-template-columns: 66px 1fr;
+        gap: 10px;
+        padding: 7px 0;
+        border-bottom: 1px solid var(--line);
+        font-size: 10.5px;
+      }
+
+      .platform-list span {
+        color: var(--muted-2);
+        font-family: var(--mono);
+        font-size: 9px;
+      }
+
+      .limits {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0 22px;
+        margin-top: 18px;
+        border-top: 1px solid var(--line);
+      }
+
+      .limit {
+        display: grid;
+        grid-template-columns: 20px 1fr;
+        gap: 8px;
+        padding: 10px 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .limit .n {
+        color: var(--warm);
+        font-family: var(--mono);
+        font-size: 9px;
+        padding-top: 2px;
+      }
+
+      .limit h4 {
+        margin: 0 0 2px;
+        font-size: 11px;
+      }
+
+      .limit p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 10px;
+        line-height: 1.55;
+      }
+
+      .final-cta {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 20px;
+        margin-top: 16px;
+        padding: 16px 20px;
+        border-radius: 10px;
+        background: var(--accent);
+        color: #fff;
+      }
+
+      .final-cta h3 {
+        margin: 0;
+        font-size: 19px;
+        letter-spacing: -0.02em;
+      }
+
+      .final-cta p {
+        margin: 3px 0 0;
+        color: rgba(255, 255, 255, 0.74);
+        font-size: 10.5px;
+      }
+
+      .final-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 7px;
+      }
+
+      .final-cta .btn-accent {
+        background: #0b1424;
+        border-color: #0b1424;
+        color: #fff;
+      }
+
+      .final-cta .btn-accent:hover {
+        background: #1b2740;
+        border-color: #1b2740;
+        color: #fff;
+      }
+
+      .final-cta .btn-ghost {
+        color: #fff;
+        border-color: rgba(255, 255, 255, 0.42);
+      }
+
+      .final-cta .btn-ghost:hover {
+        color: #fff;
+        background: rgba(255, 255, 255, 0.12);
+        border-color: rgba(255, 255, 255, 0.7);
+      }
+
+      .site-footer {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        border-top: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.58);
+        backdrop-filter: blur(10px);
+      }
+
+      .site-footer-inner {
+        width: min(1180px, calc(100% - 64px));
+        margin: 0 auto;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 20px;
+        padding: 14px 0;
+        color: var(--muted-2);
+        font-size: 9.5px;
+      }
+
+      .site-footer a {
+        color: var(--muted-2);
+      }
+
+      .site-footer a:hover {
+        color: var(--ink);
+      }
+
+      /* chapter rail / progress */
+
+      .chapter-rail {
+        position: fixed;
+        right: 22px;
+        top: 50%;
+        z-index: 90;
+        transform: translateY(-50%);
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 11px;
+      }
+
+      .chapter-rail::before {
+        content: "";
+        position: absolute;
+        right: 2px;
+        top: 4px;
+        bottom: 4px;
+        width: 1px;
+        background: linear-gradient(to bottom, transparent, var(--line-2), transparent);
+      }
+
+      .chapter {
+        position: relative;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0;
+        border: 0;
+        background: none;
+        color: var(--muted-2);
+        cursor: pointer;
+      }
+
+      .chapter .num {
+        width: 17px;
+        color: var(--muted-2);
+        font-family: var(--mono);
+        font-size: 8.5px;
+        text-align: right;
+        transition: color 160ms ease;
+      }
+
+      .chapter .label {
+        color: var(--muted);
+        font-size: 10.5px;
+        white-space: nowrap;
+        opacity: 0;
+        transform: translateX(5px);
+        transition: opacity 160ms ease, transform 160ms ease, color 160ms ease;
+      }
+
+      .chapter .dot {
+        width: 5px;
+        height: 5px;
+        border: 1px solid var(--line-2);
+        border-radius: 50%;
+        background: transparent;
+        transition: 160ms ease;
+      }
+
+      .chapter:hover .label,
+      .chapter.active .label {
+        opacity: 1;
+        transform: none;
+      }
+
+      .chapter.active .num {
+        color: var(--accent);
+      }
+
+      .chapter.active .label {
+        color: var(--ink);
+      }
+
+      .chapter.active .dot {
+        background: var(--accent);
+        border-color: var(--accent);
+        transform: scale(1.3);
+      }
+
+      .next-link {
+        position: fixed;
+        right: max(26px, calc((100vw - 1180px) / 2));
+        bottom: 22px;
+        z-index: 90;
+        display: inline-flex;
+        align-items: center;
+        gap: 9px;
+        padding: 7px 10px;
+        border: 1px solid var(--line);
+        border-radius: 7px;
+        background: rgba(255, 255, 255, 0.82);
+        color: var(--muted);
+        font-size: 10px;
+        backdrop-filter: blur(8px);
+        transition: 160ms ease;
+      }
+
+      .next-link:hover {
+        color: var(--ink);
+        border-color: var(--line-2);
+        background: rgba(11, 18, 32, 0.04);
+      }
+
+      .next-link.is-hidden {
+        display: none;
+      }
+
+      .next-link b {
+        color: var(--ink);
+        font-weight: 600;
+      }
+
+      .next-link i {
+        color: var(--accent);
+        font-style: normal;
+        font-size: 11px;
+      }
+
+      .progress {
+        position: fixed;
+        top: 0;
+        left: 0;
+        z-index: 101;
+        width: 100%;
+        height: 2px;
+        background: transparent;
+        pointer-events: none;
+      }
+
+      .progress span {
+        display: block;
+        width: 0;
+        height: 100%;
+        background: var(--accent);
+        transition: width 80ms linear;
+      }
+
+      /* lightbox */
+
+      dialog {
+        width: min(1500px, 94vw);
+        max-width: none;
+        padding: 0;
+        border: 0;
+        border-radius: 11px;
+        background: #0e1523;
+        box-shadow: 0 40px 120px rgba(0, 0, 0, 0.6);
+      }
+
+      dialog::backdrop {
+        background: rgba(3, 8, 6, 0.8);
+        backdrop-filter: blur(3px);
+      }
+
+      dialog img {
+        width: 100%;
+        height: auto;
+        border-radius: 11px;
+      }
+
+      .dialog-close {
+        position: absolute;
+        top: 9px;
+        right: 9px;
+        width: 30px;
+        height: 30px;
+        border: 1px solid rgba(255, 255, 255, 0.22);
+        border-radius: 6px;
+        background: rgba(10, 16, 27, 0.7);
+        color: #fff;
+        font-size: 17px;
+        line-height: 1;
+        cursor: pointer;
+      }
+
+      /* responsive */
+
+      @media (max-width: 1280px) {
+        .chapter-rail {
+          display: none;
+        }
+      }
+
+      @media (max-width: 1020px) {
+        .topbar-inner,
+        .slide-inner {
+          width: calc(100% - 48px);
+        }
+
+        .hero-grid,
+        .perf-grid,
+        .storage-grid,
+        .bypass-grid,
+        .last-grid {
+          gap: 28px;
+        }
+      }
+
+      @media (max-width: 900px) {
+        body {
+          overflow: auto;
+        }
+
+        .deck {
+          height: auto;
+          overflow: visible;
+          scroll-snap-type: none;
+          scroll-behavior: auto;
+        }
+
+        .nav-links {
+          display: none;
+        }
+
+        .site-footer-inner {
+          width: calc(100% - 32px);
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 4px;
+        }
+
+        .site-footer {
+          position: static;
+          margin-top: 24px;
+        }
+
+        .chapter-rail,
+        .next-link,
+        .slide-index {
+          display: none;
+        }
+
+        .slide {
+          min-height: auto;
+          padding: 90px 0 48px;
+        }
+
+        .hero-grid,
+        .perf-grid,
+        .storage-grid,
+        .bypass-grid,
+        .last-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .hero-title {
+          white-space: normal;
+        }
+
+        .hero-collage {
+          padding: 0 0 34px 34px;
+        }
+
+        .hero-facts {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .hero-fact {
+          border-right: 0;
+          border-bottom: 1px solid var(--line);
+          padding: 11px 0;
+        }
+
+        .lifecycle,
+        .details,
+        .limits,
+        .last-shots {
+          grid-template-columns: 1fr;
+        }
+
+        .last-note {
+          grid-column: auto;
+        }
+
+        .reuse-diagram {
+          grid-template-columns: 1fr;
+          gap: 8px;
+        }
+
+        .reuse-arrow {
+          min-height: 20px;
+        }
+
+        .reuse-arrow::before {
+          top: 3px;
+          left: 16px;
+          right: auto;
+          width: 1px;
+          height: 14px;
+          border-top: 0;
+          border-left: 1px solid rgba(11, 18, 32, 0.22);
+        }
+
+        .reuse-arrow::after {
+          top: 12px;
+          left: 13px;
+          right: auto;
+          transform: rotate(135deg);
+        }
+
+        .final-cta {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .caveat {
+          max-width: none;
+        }
+      }
+
+      @media (max-height: 860px) and (min-width: 901px) {
+        .next-link {
+          display: none;
+        }
+
+        .slide {
+          padding: 84px 0 38px;
+        }
+
+        .slide-index {
+          top: 72px;
+        }
+
+        .hero-title {
+          font-size: clamp(36px, 3.9vw, 54px);
+        }
+
+        .hero-lead {
+          font-size: 13.5px;
+          margin-top: 15px;
+        }
+
+        .hero-actions {
+          margin-top: 17px;
+        }
+
+        .hero-facts {
+          margin-top: 16px;
+        }
+
+        .hero-fact {
+          padding-top: 10px;
+        }
+
+        .hero-fact small {
+          font-size: 9.5px;
+        }
+
+        .slide-title {
+          font-size: clamp(27px, 3vw, 38px);
+        }
+
+        .slide-lead {
+          margin-top: 9px;
+          font-size: 12.5px;
+        }
+
+        .perf-grid,
+        .storage-grid,
+        .bypass-grid,
+        .last-grid {
+          margin-top: 14px;
+        }
+
+        .perf-shot {
+          height: clamp(185px, 29vh, 260px);
+        }
+
+        .perf-side .shot {
+          height: clamp(170px, 26vh, 240px);
+        }
+
+        .perf-table td,
+        .perf-table th {
+          padding: 4px 0;
+        }
+
+        .lifecycle-item,
+        .detail-item,
+        .limit {
+          padding: 8px 0;
+        }
+
+        .last-grid {
+          margin-top: 12px;
+        }
+
+        .last-shots {
+          gap: 8px;
+        }
+
+        .last-shots .shot {
+          height: 125px;
+        }
+
+        .last-note {
+          font-size: 9.5px;
+        }
+
+        .code-block pre {
+          padding: 8px 10px;
+          font-size: 9.5px;
+          line-height: 1.55;
+        }
+
+        .code-head {
+          height: 25px;
+          font-size: 8.5px;
+        }
+
+        .build-note {
+          margin-top: 6px;
+          font-size: 9.5px;
+        }
+
+        .platform-list {
+          margin-top: 8px;
+        }
+
+        .platform-list li {
+          padding: 5px 0;
+          font-size: 9.5px;
+        }
+
+        .limits {
+          margin-top: 12px;
+        }
+
+        .limit {
+          padding: 7px 0;
+        }
+
+        .limit h4 {
+          font-size: 10px;
+        }
+
+        .limit p {
+          font-size: 9px;
+          line-height: 1.5;
+        }
+
+        .final-cta {
+          margin-top: 10px;
+          padding: 11px 15px;
+        }
+
+        .final-cta h3 {
+          font-size: 16px;
+        }
+
+        .final-cta p {
+          font-size: 9.5px;
+        }
+
+        .site-footer-inner {
+          padding: 8px 0;
+          font-size: 8.5px;
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        .deck {
+          scroll-behavior: auto;
+        }
+
+        * {
+          transition: none !important;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="bg" aria-hidden="true">
+      <span class="orb orb-a"></span>
+      <span class="orb orb-b"></span>
+      <span class="ring ring-a"></span>
+      <span class="ring ring-b"></span>
+      <span class="bg-line"></span>
+    </div>
+
+    <div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+
+    <header class="topbar">
+      <div class="topbar-inner">
+        <a class="brand" href="#" data-go="hero" aria-label="Vault 首页">
+          <span class="brand-mark">V</span>
+          <span>
+            Vault
+            <small>虚拟磁盘与 iSCSI 存储</small>
+          </span>
+        </a>
+        <nav class="nav-links" aria-label="页面导航">
+          <a href="#performance" data-go="performance">性能</a>
+          <a href="#shared" data-go="shared">存储共享</a>
+          <a href="#cache" data-go="cache">旁路加速</a>
+          <a href="#client" data-go="client">客户端</a>
+        </nav>
+        <div class="lang-switch" role="group" aria-label="Language">
+          <button type="button" data-lang="zh-CN" class="active">中文</button>
+          <button type="button" data-lang="en-US">EN</button>
+        </div>
+        <a class="btn btn-accent btn-sm" href="https://github.com/junqirao/vault" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+            <path
+              d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+            />
+          </svg>
+          GitHub
+        </a>
+      </div>
+    </header>
+
+    <div class="deck" id="deck">
+      <!-- 01 -->
+      <section class="slide hero" id="hero" data-title="首页">
+        <div class="slide-inner hero-grid">
+          <div>
+            <div class="eyebrow"><span class="dot"></span> 自托管 · 虚拟磁盘 · iSCSI</div>
+            <h1 class="hero-title" data-i18n-html="heroTitle">存储共享&nbsp;&nbsp;&nbsp;&nbsp;<em>端侧加速</em></h1>
+            <p class="hero-lead">
+              iSCSI 自动设置分配，端侧 iSCSI 旁路代理加速，支持 L1 内存、L2 本地存储加速；
+              重排缓存结构，随机读转为顺序读，优化读场景。
+            </p>
+            <div class="hero-pills">
+              <span>安全的块级存储分发</span>
+              <span>旁路缓存加速读场景</span>
+            </div>
+            <div class="hero-actions">
+              <a
+                class="btn btn-accent"
+                href="https://github.com/junqirao/vault/releases"
+                target="_blank"
+                rel="noopener"
+              >
+                <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path
+                    d="M8 2v7.5m0 0 2.8-2.8M8 9.5 5.2 6.7M3 13.5h10"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+                下载最新版本
+              </a>
+              <a class="btn btn-ghost" href="https://github.com/junqirao/vault" target="_blank" rel="noopener">
+                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path
+                    d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+                  />
+                </svg>
+                GitHub
+              </a>
+            </div>
+            <div class="hero-meta">Windows / Linux 服务端 · Windows 客户端 · 自托管</div>
+          </div>
+
+          <div class="hero-collage">
+            <figure class="shot hero-main" style="margin: 0">
+              <img
+                src="assets/repositories.png"
+                alt="Vault 客户端我的存储库页面，展示 Game 分组下的共享存储库"
+                width="1600"
+                height="840"
+                data-lightbox
+              />
+            </figure>
+            <figure class="shot hero-small" style="margin: 0">
+              <img
+                src="assets/dashboard.png"
+                alt="Vault 我的存储库首页，性能曲线、用量和分组"
+                width="1600"
+                height="820"
+                loading="lazy"
+                data-lightbox
+              />
+            </figure>
+            <div class="shot-caption">
+              <span>界面来自正式客户端</span>
+              <span>存储库、用户和曲线为模拟数据</span>
+            </div>
+          </div>
+        </div>
+        <div class="slide-inner hero-facts">
+          <div class="hero-fact">
+            <span class="n">01</span>
+            <div>
+              <b>块级隔离</b>
+              <small>基础盘只读，写入落独立盘</small>
+            </div>
+          </div>
+          <div class="hero-fact">
+            <span class="n">02</span>
+            <div>
+              <b>分配即用</b>
+              <small>预创建池，直接占用</small>
+            </div>
+          </div>
+          <div class="hero-fact">
+            <span class="n">03</span>
+            <div>
+              <b>命中代答</b>
+              <small>读命中不经过网络</small>
+            </div>
+          </div>
+          <div class="hero-fact">
+            <span class="n">04</span>
+            <div>
+              <b>写直达后端</b>
+              <small>没有 writeback</small>
+            </div>
+          </div>
+        </div>
+        <span class="slide-index">01 / 05</span>
+      </section>
+
+      <!-- 02 -->
+      <section class="slide" id="performance" data-title="性能">
+        <div class="slide-inner">
+          <div class="perf-head">
+            <div>
+              <p class="kicker">Performance</p>
+              <h2 class="slide-title">性能：端侧加速效果</h2>
+              <div class="perf-warning">
+                <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path d="M8 1.8 15 14H1L8 1.8Z" stroke="currentColor" stroke-width="1.2" stroke-linejoin="round" />
+                  <path d="M8 6v4" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
+                  <circle cx="8" cy="12" r="0.7" fill="currentColor" />
+                </svg>
+                <span>
+                  <b>速度仅供参考。</b>测试数字受服务端磁盘、客户端 SSD、网络、块大小和缓存命中率影响，
+                  不能保证每台机器都能达到。
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div class="perf-grid">
+            <div>
+              <figure class="shot perf-shot" style="margin: 0">
+                <img
+                  src="assets/benchmark.png"
+                  alt="CrystalDiskMark 参考测试：无缓存、开启缓存和本地 SSD 的读写成绩"
+                  width="1920"
+                  height="1022"
+                  data-lightbox
+                />
+              </figure>
+              <table class="perf-table">
+                <thead>
+                  <tr>
+                    <th>测试项</th>
+                    <th>无缓存</th>
+                    <th>开启缓存</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr><td>SEQ1M Q8T1 读</td><td>251.08</td><td>2627.13</td></tr>
+                  <tr><td>SEQ1M Q1T1 读</td><td>238.18</td><td>2443.11</td></tr>
+                  <tr><td>RND4K Q32T1 读</td><td>2.12</td><td>183.79</td></tr>
+                  <tr><td>RND4K Q1T1 读</td><td>1.39</td><td>113.41</td></tr>
+                  <tr><td>SEQ1M Q8T1 写</td><td>242.84</td><td>233.25</td></tr>
+                  <tr><td>RND4K Q32T1 写</td><td>4.74</td><td>4.61</td></tr>
+                </tbody>
+              </table>
+            </div>
+
+            <div class="perf-side">
+              <figure class="shot" style="margin: 0">
+                <img
+                  src="assets/performance-panel.png"
+                  alt="Vault 性能详情页，展示每个已挂载存储库的命中率、IOPS 和缓存占用"
+                  width="1600"
+                  height="1200"
+                  loading="lazy"
+                  data-lightbox
+                />
+              </figure>
+              <p class="perf-note">
+                性能页按库展开：命中率、4K 随机读占比、读/写 IOPS 和 L1/L2 占用都按库对齐。
+              </p>
+              <ul class="mini-list">
+                <li><span>L1 命中 · 4 KiB</span><b>37.55 ns/op</b></li>
+                <li><span>代理命中 · 4 KiB</span><b>24.3 µs/op</b></li>
+                <li><span>代理命中 · 后端读</span><b>0 reads</b></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+        <span class="slide-index">02 / 05</span>
+      </section>
+
+      <!-- 03 -->
+      <section class="slide" id="shared" data-title="存储共享">
+        <div class="slide-inner">
+          <p class="kicker">Storage sharing</p>
+          <h2 class="slide-title">安全的块级存储分发</h2>
+          <p class="slide-lead">
+            基础盘只存一份，每个用户一块独立盘。写入只落在自己的盘里，块级隔离；
+            新用户分配即用，释放后重置回池，基础盘更新一次全员生效。
+          </p>
+
+          <div class="storage-grid">
+            <div>
+              <div class="reuse-diagram" aria-label="共享存储结构示意图">
+                <div class="reuse-parent">
+                  <span class="mono">parent.vhdx · v3</span>
+                  <strong>基础盘</strong>
+                  <small>只读基线，所有用户共享</small>
+                </div>
+                <div class="reuse-arrow" aria-hidden="true"></div>
+                <div class="reuse-list">
+                  <div class="reuse-row">
+                    <strong>diff-zhuzhu.vhdx</strong>
+                    <span>独立盘 · G:</span>
+                  </div>
+                  <div class="reuse-row">
+                    <strong>diff-linyu.vhdx</strong>
+                    <span>独立盘 · H:</span>
+                  </div>
+                  <div class="reuse-row">
+                    <strong>diff-chenxi.vhdx</strong>
+                    <span>独立盘 · I:</span>
+                  </div>
+                </div>
+              </div>
+              <p class="caption">每个独立盘对应一个 iSCSI target 和挂载点。</p>
+
+              <div class="lifecycle">
+                <div class="lifecycle-item">
+                  <span class="n">01</span>
+                  <div>
+                    <h4>建库</h4>
+                    <p>预创建独立盘池和 iSCSI 目标。</p>
+                  </div>
+                </div>
+                <div class="lifecycle-item">
+                  <span class="n">02</span>
+                  <div>
+                    <h4>分配</h4>
+                    <p>从池里直接占用，不现场建盘。</p>
+                  </div>
+                </div>
+                <div class="lifecycle-item">
+                  <span class="n">03</span>
+                  <div>
+                    <h4>释放</h4>
+                    <p>重置回池，下一位用户拿到干净盘。</p>
+                  </div>
+                </div>
+                <div class="lifecycle-item">
+                  <span class="n">04</span>
+                  <div>
+                    <h4>更新</h4>
+                    <p>维护态更新基础盘，退出后版本加一。</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="storage-side">
+              <figure class="shot" style="margin: 0">
+                <img
+                  src="assets/repository-detail.png"
+                  alt="Vault 存储库详情页，展示基础盘版本、独立盘用量和成员"
+                  width="1600"
+                  height="640"
+                  loading="lazy"
+                  data-lightbox
+                />
+              </figure>
+              <figure class="shot" style="margin: 0">
+                <img
+                  src="assets/admin-storage.png"
+                  alt="Vault 管理控制台存储列表，展示容量、介质类型和启用状态"
+                  width="1600"
+                  height="720"
+                  loading="lazy"
+                  data-lightbox
+                />
+              </figure>
+            </div>
+          </div>
+        </div>
+        <span class="slide-index">03 / 05</span>
+      </section>
+
+      <!-- 04 -->
+      <section class="slide" id="cache" data-title="旁路加速">
+        <div class="slide-inner">
+          <p class="kicker">Bypass acceleration</p>
+          <h2 class="slide-title">旁路缓存加速读场景</h2>
+          <p class="slide-lead">
+            不终止 iSCSI 会话。读命中由本机内存或 SSD 代答，不经过网络，也不读后端 HDD；
+            标准 iSCSI / CHAP 端到端保留，写始终直达后端。
+          </p>
+
+          <div class="bypass-grid">
+            <div class="flow" aria-label="Vault 数据路径示意图">
+              <div class="flow-node">
+                <strong>Windows 应用 / 资源管理器</strong>
+                <span>读写一块盘符，例如 G:</span>
+              </div>
+              <div class="flow-arrow"><em>iSCSI → 127.0.0.1:&lt;随机端口&gt;</em></div>
+              <div class="flow-node hot">
+                <strong>Vault-Agent · 本地读缓存</strong>
+                <span>L1 内存 · L2 本地 SSD / NVMe</span>
+              </div>
+              <div class="flow-arrow"><em>iSCSI → 服务端真实 IQN，CHAP 端到端</em></div>
+              <div class="flow-node">
+                <strong>Vault-Server</strong>
+                <span>LIO（Linux）/ Windows iSCSI Target</span>
+              </div>
+              <div class="flow-arrow"><em>块设备</em></div>
+              <div class="flow-node">
+                <strong>thin LV / VHDX → HDD</strong>
+                <span>数据面仍然在原来的目标上</span>
+              </div>
+            </div>
+
+            <figure class="shot bypass-shot" style="margin: 0">
+              <img
+                src="assets/cache-detail.png"
+                alt="Vault 性能详情页，展示磁盘性能和缓存性能曲线"
+                width="1600"
+                height="620"
+                loading="lazy"
+                data-lightbox
+              />
+            </figure>
+          </div>
+
+          <div class="details">
+            <div class="detail-item">
+              <span class="n">01</span>
+              <div>
+                <h4>读命中：本地代答</h4>
+                <p>代理在本地生成 Data-In，并修正 CmdSN / StatSN 偏移；命令不发给后端。</p>
+              </div>
+            </div>
+            <div class="detail-item">
+              <span class="n">02</span>
+              <div>
+                <h4>读未命中：透传 + 回填</h4>
+                <p>命令照常发给后端，代理旁路收集数据回填；不等待缓存，也不产生第二次后端读。</p>
+              </div>
+            </div>
+            <div class="detail-item">
+              <span class="n">03</span>
+              <div>
+                <h4>L1 / L2 两级缓存</h4>
+                <p>L1 内存用 S3-FIFO 淘汰；L2 是本地缓存文件，按 LBA 区域归位布局。</p>
+              </div>
+            </div>
+            <div class="detail-item">
+              <span class="n">04</span>
+              <div>
+                <h4>写路径与回退</h4>
+                <p>写失效缓存后原样转发，没有脏块和 writeback；代理不可用时回退直连。</p>
+              </div>
+            </div>
+          </div>
+        </div>
+        <span class="slide-index">04 / 05</span>
+      </section>
+
+      <!-- 05 -->
+      <section class="slide" id="client" data-title="客户端与部署">
+        <div class="slide-inner">
+          <p class="kicker">Client &amp; deploy</p>
+          <h2 class="slide-title">客户端与部署</h2>
+          <p class="slide-lead">
+            普通用户看到自己的存储库和挂载；超级管理员多一个管理台。服务端和客户端都在同一个仓库里构建。
+          </p>
+
+          <div class="last-grid">
+            <div class="last-shots">
+              <figure class="shot" style="margin: 0">
+                <img
+                  src="assets/admin-users.png"
+                  alt="Vault 管理控制台用户管理页面，展示用户角色、状态、配额和操作"
+                  width="1600"
+                  height="800"
+                  loading="lazy"
+                  data-lightbox
+                />
+              </figure>
+              <figure class="shot" style="margin: 0">
+                <img
+                  src="assets/dashboard.png"
+                  alt="Vault 我的存储库首页，性能曲线、用量、配额和分组"
+                  width="1600"
+                  height="820"
+                  loading="lazy"
+                  data-lightbox
+                />
+              </figure>
+              <p class="last-note">管理台和用户端在同一个客户端里，存储库、用户、证书、租约和挂载不用分两套界面。</p>
+            </div>
+
+            <div>
+              <div class="code-block">
+                <div class="code-head">
+                  <span>Build</span>
+                  <button class="copy-btn" data-copy="python build.py">复制</button>
+                </div>
+                <pre><code>python build.py                 <span class="c"># 前端 + 服务端 + 客户端</span>
+python build.py --package-all   <span class="c"># 服务端包 + 客户端安装包</span></code></pre>
+              </div>
+              <p class="build-note">依赖 Go、Node.js、pnpm、Python，具体版本见仓库 README。</p>
+
+              <div class="code-block" style="margin-top: 10px">
+                <div class="code-head">
+                  <span>Run</span>
+                  <button
+                    class="copy-btn"
+                    data-copy="Vault-Server.exe -config .\config.yaml"
+                  >复制</button>
+                </div>
+                <pre><code>Vault-Server.exe -config .\config.yaml
+
+sudo ./scripts/setup.sh
+./vault-server doctor
+./vault-server -config ./config.yaml</code></pre>
+              </div>
+
+              <ul class="platform-list">
+                <li><span>服务端</span>Windows Server / 主流 Linux，LIO + LVM thin</li>
+                <li><span>客户端</span>Windows 10 / 11，需要 iSCSI Initiator</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="limits">
+            <div class="limit">
+              <span class="n">01</span>
+              <div>
+                <h4>客户端只有 Windows</h4>
+                <p>Linux 服务端已支持，Linux 客户端还没实现。</p>
+              </div>
+            </div>
+            <div class="limit">
+              <span class="n">02</span>
+              <div>
+                <h4>缓存只加速读</h4>
+                <p>写始终直达后端，不提供 writeback。</p>
+              </div>
+            </div>
+            <div class="limit">
+              <span class="n">03</span>
+              <div>
+                <h4>冷数据不会变快</h4>
+                <p>第一次读、冷数据和大顺序扫描仍走原来的链路。</p>
+              </div>
+            </div>
+            <div class="limit">
+              <span class="n">04</span>
+              <div>
+                <h4>一个分配单客户端</h4>
+                <p>多客户端同写同一 LUN 不在缓存一致性范围内。</p>
+              </div>
+            </div>
+          </div>
+
+          <div class="final-cta">
+            <div>
+              <h3>源码和文档</h3>
+              <p>构建脚本、接口文档和基准方法都在 GitHub 上。</p>
+            </div>
+            <div class="final-actions">
+              <a
+                class="btn btn-accent"
+                href="https://github.com/junqirao/vault/releases"
+                target="_blank"
+                rel="noopener"
+              >
+                <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
+                  <path
+                    d="M8 2v7.5m0 0 2.8-2.8M8 9.5 5.2 6.7M3 13.5h10"
+                    stroke="currentColor"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                  />
+                </svg>
+                下载最新版本
+              </a>
+              <a class="btn btn-ghost" href="https://github.com/junqirao/vault" target="_blank" rel="noopener">
+                <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+                  <path
+                    d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"
+                  />
+                </svg>
+                查看源码
+              </a>
+            </div>
+          </div>
+        </div>
+        <footer class="site-footer">
+          <div class="site-footer-inner">
+            <span>Vault · 自托管虚拟磁盘与 iSCSI 存储</span>
+            <span>
+              PolyForm Noncommercial 1.0.0 ·
+              <a href="https://github.com/junqirao/vault/blob/main/LICENSE" target="_blank" rel="noopener">许可证</a>
+            </span>
+          </div>
+        </footer>
+        <span class="slide-index">05 / 05</span>
+      </section>
+    </div>
+
+    <nav class="chapter-rail" aria-label="章节导航">
+      <button class="chapter active" type="button" data-go="hero" aria-label="概览">
+        <span class="num">01</span><span class="label" data-zh="概览" data-en="Overview">概览</span><span class="dot"></span>
+      </button>
+      <button class="chapter" type="button" data-go="performance" aria-label="性能">
+        <span class="num">02</span><span class="label" data-zh="性能" data-en="Perf">性能</span><span class="dot"></span>
+      </button>
+      <button class="chapter" type="button" data-go="shared" aria-label="存储共享">
+        <span class="num">03</span><span class="label" data-zh="存储共享" data-en="Storage">存储共享</span><span class="dot"></span>
+      </button>
+      <button class="chapter" type="button" data-go="cache" aria-label="旁路加速">
+        <span class="num">04</span><span class="label" data-zh="旁路加速" data-en="Bypass">旁路加速</span><span class="dot"></span>
+      </button>
+      <button class="chapter" type="button" data-go="client" aria-label="客户端与部署">
+        <span class="num">05</span><span class="label" data-zh="客户端与部署" data-en="Client">客户端与部署</span><span class="dot"></span>
+      </button>
+    </nav>
+
+    <a class="next-link" id="nextLink" href="#performance" data-go="performance">
+      <span>下一节</span><b id="nextLabel">02 / 性能</b><i>↓</i>
+    </a>
+
+    <dialog id="lightbox" aria-label="截图预览">
+      <button class="dialog-close" type="button" aria-label="关闭">×</button>
+      <img alt="" />
+    </dialog>
+
+    <script>
+      (() => {
+        const deck = document.getElementById("deck")
+        const slides = Array.from(document.querySelectorAll(".slide"))
+        const chapters = Array.from(document.querySelectorAll(".chapter"))
+        const progress = document.getElementById("progressBar")
+        const nextLink = document.getElementById("nextLink")
+        const nextLabel = document.getElementById("nextLabel")
+        const nextPrefix = nextLink?.querySelector("span")
+        const nextArrow = nextLink?.querySelector("i")
+        let current = 0
+        let currentLang = "zh-CN"
+
+        const EN = {
+          "虚拟磁盘与 iSCSI 存储": "Virtual disks & iSCSI storage",
+          "性能": "Performance",
+          "存储共享": "Storage sharing",
+          "旁路加速": "Bypass acceleration",
+          "客户端": "Client",
+          "自托管 · 虚拟磁盘 · iSCSI": "Self-hosted · virtual disks · iSCSI",
+          "iSCSI 自动设置分配，端侧 iSCSI 旁路代理加速，支持 L1 内存、L2 本地存储加速； 重排缓存结构，随机读转为顺序读，优化读场景。": "iSCSI setup and allocation are automatic. The edge-side iSCSI bypass proxy accelerates reads with L1 memory and L2 local storage. The cache layout turns random reads into sequential reads.",
+          "安全的块级存储分发": "Secure block-level storage distribution",
+          "旁路缓存加速读场景": "Bypass cache for read acceleration",
+          "下载最新版本": "Download latest",
+          "Windows / Linux 服务端 · Windows 客户端 · 自托管": "Windows / Linux server · Windows client · self-hosted",
+          "界面来自正式客户端": "UI from the production client",
+          "存储库、用户和曲线为模拟数据": "Repositories, users and charts are mock data",
+          "块级隔离": "Block isolation",
+          "基础盘只读，写入落独立盘": "Base disk is read-only; writes go to per-user disks",
+          "分配即用": "Ready on allocation",
+          "预创建池，直接占用": "Pre-created pool, allocated directly",
+          "命中代答": "Local hit response",
+          "读命中不经过网络": "Read hits stay off the network",
+          "写直达后端": "Writes go straight to the backend",
+          "没有 writeback": "No writeback",
+          "性能：端侧加速效果": "Performance: edge acceleration",
+          "速度仅供参考。": "Speeds are for reference only. ",
+          "测试数字受服务端磁盘、客户端 SSD、网络、块大小和缓存命中率影响， 不能保证每台机器都能达到。": "Test numbers depend on the server disks, client SSD, network, block size and cache hit rate. Not every machine will reach them.",
+          "测试项": "Test",
+          "无缓存": "No cache",
+          "开启缓存": "With cache",
+          "SEQ1M Q8T1 读": "SEQ1M Q8T1 Read",
+          "SEQ1M Q1T1 读": "SEQ1M Q1T1 Read",
+          "RND4K Q32T1 读": "RND4K Q32T1 Read",
+          "RND4K Q1T1 读": "RND4K Q1T1 Read",
+          "SEQ1M Q8T1 写": "SEQ1M Q8T1 Write",
+          "RND4K Q32T1 写": "RND4K Q32T1 Write",
+          "性能页按库展开：命中率、4K 随机读占比、读/写 IOPS 和 L1/L2 占用都按库对齐。": "The performance page expands per repository: hit rate, 4K random read share, read/write IOPS and L1/L2 usage are aligned per repository.",
+          "L1 命中 · 4 KiB": "L1 hit · 4 KiB",
+          "代理命中 · 4 KiB": "Proxy hit · 4 KiB",
+          "代理命中 · 后端读": "Proxy hit · backend reads",
+          "基础盘只存一份，每个用户一块独立盘。写入只落在自己的盘里，块级隔离； 新用户分配即用，释放后重置回池，基础盘更新一次全员生效。": "One base disk is stored once, with one independent disk per user. Writes only go to the user's own disk, with block-level isolation. New users are ready on allocation, released disks are reset to the pool, and a base-disk update applies to everyone.",
+          "基础盘": "Base disk",
+          "只读基线，所有用户共享": "Read-only baseline shared by all users",
+          "独立盘 · G:": "Independent disk · G:",
+          "独立盘 · H:": "Independent disk · H:",
+          "独立盘 · I:": "Independent disk · I:",
+          "每个独立盘对应一个 iSCSI target 和挂载点。": "Each independent disk has its own iSCSI target and mount point.",
+          "建库": "Create",
+          "预创建独立盘池和 iSCSI 目标。": "Pre-create the disk pool and iSCSI targets.",
+          "分配": "Allocate",
+          "从池里直接占用，不现场建盘。": "Allocate directly from the pool; no on-demand disk creation.",
+          "释放": "Release",
+          "重置回池，下一位用户拿到干净盘。": "Reset to the pool; the next user gets a clean disk.",
+          "更新": "Update",
+          "维护态更新基础盘，退出后版本加一。": "Update the base disk in maintenance mode; the version increments on exit.",
+          "不终止 iSCSI 会话。读命中由本机内存或 SSD 代答，不经过网络，也不读后端 HDD； 标准 iSCSI / CHAP 端到端保留，写始终直达后端。": "The iSCSI session is not terminated. Read hits are answered from local memory or SSD, without hitting the network or the backend HDD. Standard iSCSI / CHAP stays end-to-end; writes always go straight to the backend.",
+          "Windows 应用 / 资源管理器": "Windows app / Explorer",
+          "读写一块盘符，例如 G:": "Read/write a drive letter, e.g. G:",
+          "iSCSI → 127.0.0.1:<随机端口>": "iSCSI → 127.0.0.1:<random port>",
+          "Vault-Agent · 本地读缓存": "Vault-Agent · local read cache",
+          "L1 内存 · L2 本地 SSD / NVMe": "L1 memory · L2 local SSD / NVMe",
+          "iSCSI → 服务端真实 IQN，CHAP 端到端": "iSCSI → real server IQN, end-to-end CHAP",
+          "LIO（Linux）/ Windows iSCSI Target": "LIO (Linux) / Windows iSCSI Target",
+          "块设备": "Block device",
+          "数据面仍然在原来的目标上": "The data path still runs through the original target",
+          "读命中：本地代答": "Read hit: local answer",
+          "代理在本地生成 Data-In，并修正 CmdSN / StatSN 偏移；命令不发给后端。": "The proxy generates Data-In locally and corrects the CmdSN / StatSN offsets; the command never reaches the backend.",
+          "读未命中：透传 + 回填": "Read miss: passthrough + fill",
+          "命令照常发给后端，代理旁路收集数据回填；不等待缓存，也不产生第二次后端读。": "The command still goes to the backend; the proxy collects the data on the side and fills the cache. Reads never wait for the cache or cause a second backend read.",
+          "L1 / L2 两级缓存": "L1 / L2 cache",
+          "L1 内存用 S3-FIFO 淘汰；L2 是本地缓存文件，按 LBA 区域归位布局。": "L1 uses S3-FIFO eviction. L2 is a local cache file with LBA-region layout.",
+          "写路径与回退": "Writes and fallback",
+          "写失效缓存后原样转发，没有脏块和 writeback；代理不可用时回退直连。": "Writes invalidate the cache and are forwarded unchanged. There are no dirty blocks or writeback. If the proxy is unavailable, the client falls back to direct.",
+          "客户端与部署": "Client & deploy",
+          "普通用户看到自己的存储库和挂载；超级管理员多一个管理台。服务端和客户端都在同一个仓库里构建。": "Regular users see their repositories and mounts; super admins get an admin console. Server and client are built from the same repository.",
+          "管理台和用户端在同一个客户端里，存储库、用户、证书、租约和挂载不用分两套界面。": "Admin and user views share one client, so repositories, users, certificates, leases and mounts do not need two interfaces.",
+          "复制": "Copy",
+          "# 前端 + 服务端 + 客户端": "# frontend + server + client",
+          "# 服务端包 + 客户端安装包": "# server packages + client installer",
+          "依赖 Go、Node.js、pnpm、Python，具体版本见仓库 README。": "Requires Go, Node.js, pnpm and Python; see the repository README for versions.",
+          "服务端": "Server",
+          "Windows Server / 主流 Linux，LIO + LVM thin": "Windows Server / mainstream Linux, LIO + LVM thin",
+          "Windows 10 / 11，需要 iSCSI Initiator": "Windows 10 / 11 with iSCSI Initiator",
+          "客户端只有 Windows": "Client is Windows-only",
+          "Linux 服务端已支持，Linux 客户端还没实现。": "The Linux server is supported; a Linux client is not implemented yet.",
+          "缓存只加速读": "Cache only accelerates reads",
+          "写始终直达后端，不提供 writeback。": "Writes always go to the backend; no writeback.",
+          "冷数据不会变快": "Cold data stays cold",
+          "第一次读、冷数据和大顺序扫描仍走原来的链路。": "First reads, cold data and large sequential scans still take the original path.",
+          "一个分配单客户端": "One allocation per client",
+          "多客户端同写同一 LUN 不在缓存一致性范围内。": "Multiple clients writing the same LUN are outside the cache consistency scope.",
+          "源码和文档": "Source and docs",
+          "构建脚本、接口文档和基准方法都在 GitHub 上。": "Build scripts, API docs and benchmark methods are on GitHub.",
+          "查看源码": "View source",
+          "Vault · 自托管虚拟磁盘与 iSCSI 存储": "Vault · self-hosted virtual disks & iSCSI storage",
+          "许可证": "License",
+          "概览": "Overview",
+          "下一节": "Next"
+        }
+
+        const HTML_I18N = {
+          "zh-CN": {
+            heroTitle: "存储共享&nbsp;&nbsp;&nbsp;&nbsp;<em>端侧加速</em>"
+          },
+          "en-US": {
+            heroTitle: "Storage sharing<br /><em>edge acceleration</em>"
+          }
+        }
+
+        const SECTION_NAMES = {
+          "zh-CN": {
+            hero: "概览",
+            performance: "性能",
+            shared: "存储共享",
+            cache: "旁路加速",
+            client: "客户端与部署"
+          },
+          "en-US": {
+            hero: "Overview",
+            performance: "Performance",
+            shared: "Storage",
+            cache: "Bypass",
+            client: "Client & deploy"
+          }
+        }
+
+        const COPY_TEXT = {
+          "zh-CN": { copy: "复制", copied: "已复制", failed: "复制失败", next: "下一节", back: "回到顶部", backPrefix: "返回" },
+          "en-US": { copy: "Copy", copied: "Copied", failed: "Copy failed", next: "Next", back: "Back to top", backPrefix: "Back" }
+        }
+
+        const setActive = (index) => {
+          current = index
+          chapters.forEach((chapter, i) => chapter.classList.toggle("active", i === index))
+          if (!nextLink || !nextLabel) return
+          const next = slides[index + 1]
+          const copy = COPY_TEXT[currentLang]
+          if (next) {
+            nextLink.classList.remove("is-hidden")
+            nextLink.dataset.go = next.id
+            nextLink.href = `#${next.id}`
+            nextLabel.textContent = `${String(index + 2).padStart(2, "0")} / ${SECTION_NAMES[currentLang][next.id]}`
+            if (nextPrefix) nextPrefix.textContent = copy.next
+            if (nextArrow) nextArrow.textContent = "↓"
+          } else {
+            nextLink.classList.add("is-hidden")
+            nextLink.dataset.go = slides[0].id
+            nextLink.href = `#${slides[0].id}`
+            nextLabel.textContent = copy.back
+            if (nextPrefix) nextPrefix.textContent = copy.backPrefix
+            if (nextArrow) nextArrow.textContent = "↑"
+          }
+        }
+
+        const applyLanguage = (lang) => {
+          currentLang = lang
+          document.documentElement.lang = lang
+          document.title = lang === "en-US" ? "Vault · Storage sharing & edge acceleration" : "Vault · 存储共享与端侧加速"
+          const map = lang === "en-US" ? EN : null
+
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+          let node
+          while ((node = walker.nextNode())) {
+            const parent = node.parentElement
+            if (!parent) continue
+            if (parent.closest("script,style,svg,[data-i18n-html],.lang-switch,.chapter .label,.copy-btn,.next-link")) continue
+            if (node.__zh === undefined) node.__zh = node.nodeValue
+            const original = node.__zh
+            const key = original.trim().replace(/\s+/g, " ")
+            if (!key) continue
+            const translated = map ? map[key] : undefined
+            const next = map ? (translated !== undefined ? translated : original) : original
+            const leading = original.match(/^\s*/)?.[0] ?? ""
+            const trailing = original.match(/\s*$/)?.[0] ?? ""
+            node.nodeValue = leading + next + trailing
+          }
+
+          document.querySelectorAll("[data-i18n-html]").forEach((el) => {
+            if (el.dataset.zhHtml === undefined) el.dataset.zhHtml = el.innerHTML
+            el.innerHTML = lang === "en-US" ? HTML_I18N["en-US"][el.dataset.i18nHtml] : el.dataset.zhHtml
+          })
+
+          document.querySelectorAll(".chapter .label").forEach((el) => {
+            el.textContent = lang === "en-US" ? el.dataset.en : el.dataset.zh
+          })
+
+          document.querySelectorAll(".copy-btn").forEach((button) => {
+            button.textContent = COPY_TEXT[lang].copy
+          })
+
+          document.querySelectorAll(".lang-switch button").forEach((button) => {
+            button.classList.toggle("active", button.dataset.lang === lang)
+          })
+
+          setActive(current)
+        }
+
+        const detectLanguage = () => {
+          const forced = new URLSearchParams(location.search).get("lang")
+          if (forced === "zh-CN" || forced === "en-US") return forced
+          let saved = null
+          try {
+            saved = localStorage.getItem("vault.portal.lang")
+          } catch {}
+          if (saved === "zh-CN" || saved === "en-US") return saved
+          let zone = ""
+          try {
+            zone = Intl.DateTimeFormat().resolvedOptions().timeZone || ""
+          } catch {}
+          const chineseZones =
+            /^(Asia\/(Shanghai|Chongqing|Harbin|Urumqi|Kashgar|Hong_Kong|Macau|Taipei)|PRC)$/i
+          if (zone) return chineseZones.test(zone) ? "zh-CN" : "en-US"
+          return (navigator.language || "").toLowerCase().startsWith("zh") ? "zh-CN" : "en-US"
+        }
+
+        const go = (index) => {
+          const target = slides[index]
+          if (!target) return
+          target.scrollIntoView({ behavior: "smooth", block: "start" })
+        }
+
+        const jump = (index) => {
+          const target = slides[index]
+          if (!target) return
+          deck.scrollTop = target.offsetTop
+          setActive(index)
+        }
+
+        const observer = new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (entry.isIntersecting) setActive(slides.indexOf(entry.target))
+            }
+          },
+          { root: deck, threshold: 0.52 }
+        )
+        slides.forEach((slide) => observer.observe(slide))
+
+        const onScroll = () => {
+          const max = deck.scrollHeight - deck.clientHeight
+          const ratio = max > 0 ? deck.scrollTop / max : 0
+          if (progress) progress.style.width = `${Math.round(ratio * 100)}%`
+        }
+        deck.addEventListener("scroll", onScroll, { passive: true })
+        onScroll()
+
+        document.querySelectorAll("[data-go]").forEach((el) => {
+          el.addEventListener("click", (event) => {
+            event.preventDefault()
+            const index = slides.findIndex((slide) => slide.id === el.dataset.go)
+            if (index >= 0) go(index)
+          })
+        })
+
+        window.addEventListener("keydown", (event) => {
+          if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
+          if (["ArrowDown", "PageDown", " "].includes(event.key)) {
+            event.preventDefault()
+            go(Math.min(current + 1, slides.length - 1))
+          } else if (["ArrowUp", "PageUp"].includes(event.key)) {
+            event.preventDefault()
+            go(Math.max(current - 1, 0))
+          } else if (event.key === "Home") {
+            event.preventDefault()
+            go(0)
+          } else if (event.key === "End") {
+            event.preventDefault()
+            go(slides.length - 1)
+          }
+        })
+
+        const dialog = document.getElementById("lightbox")
+        const full = dialog?.querySelector("img")
+        const close = dialog?.querySelector(".dialog-close")
+        document.querySelectorAll("img[data-lightbox]").forEach((image) => {
+          image.addEventListener("click", () => {
+            if (!dialog || !full) return
+            full.src = image.currentSrc || image.src
+            full.alt = image.alt || ""
+            if (typeof dialog.showModal === "function") dialog.showModal()
+          })
+        })
+        const dismiss = () => dialog && dialog.open && dialog.close()
+        close?.addEventListener("click", dismiss)
+        dialog?.addEventListener("click", (event) => {
+          if (event.target === dialog) dismiss()
+        })
+        dialog?.addEventListener("close", () => {
+          if (full) full.removeAttribute("src")
+        })
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") dismiss()
+        })
+
+        document.querySelectorAll(".copy-btn").forEach((button) => {
+          button.addEventListener("click", async () => {
+            const text = button.getAttribute("data-copy") || ""
+            const original = button.textContent
+            let ok = false
+            try {
+              await navigator.clipboard.writeText(text)
+              ok = true
+            } catch {
+              try {
+                const area = document.createElement("textarea")
+                area.value = text
+                area.style.position = "fixed"
+                area.style.opacity = "0"
+                document.body.appendChild(area)
+                area.select()
+                ok = document.execCommand("copy")
+                area.remove()
+              } catch {
+                ok = false
+              }
+            }
+            button.textContent = ok ? COPY_TEXT[currentLang].copied : COPY_TEXT[currentLang].failed
+            window.setTimeout(() => {
+              button.textContent = original
+            }, 1400)
+          })
+        })
+
+        document.querySelectorAll(".lang-switch button").forEach((button) => {
+          button.addEventListener("click", () => {
+            try {
+              localStorage.setItem("vault.portal.lang", button.dataset.lang)
+            } catch {}
+            applyLanguage(button.dataset.lang)
+          })
+        })
+
+        applyLanguage(detectLanguage())
+
+        if ("scrollRestoration" in history) history.scrollRestoration = "manual"
+
+        const params = new URLSearchParams(location.search)
+        const startSlide = Number(params.get("slide"))
+        if (Number.isInteger(startSlide) && startSlide >= 1 && startSlide <= slides.length) {
+          jump(startSlide - 1)
+          window.requestAnimationFrame(() => jump(startSlide - 1))
+          window.addEventListener("load", () => jump(startSlide - 1))
+        }
+      })()
+    </script>
+  </body>
+</html>

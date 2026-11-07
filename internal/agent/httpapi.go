@@ -51,9 +51,9 @@ func (a *Agent) localMux() http.Handler {
 	// 设置页用它提示"L2 缓存目录落在机械盘上"。做成独立接口而不是并进 /agent/cache：
 	// 用户正在编辑目录、尚未保存时也要能立即看到类型。
 	mux.HandleFunc("GET /agent/media-type", a.handleMediaType)
-	// 近 5 分钟的缓存指标采样（存储库页面"缓存指标曲线"弹窗）。
+	// 近 10 分钟的缓存指标采样（性能详情的逐库视图）。
 	mux.HandleFunc("GET /agent/cache/history", a.handleCacheHistory)
-	// 近 5 分钟的全局性能曲线（IOPS / 吞吐 / 缓存占用 / 命中率）。
+	// 近 10 分钟的全局性能曲线（IOPS / 吞吐 / 缓存占用 / 命中率 / 4K 随机读占比）。
 	//
 	// 数据由缓存代理每 5 秒采样并算好；这里只返回缓存，前端不在请求里做差分。
 	mux.HandleFunc("GET /agent/performance", a.handlePerformance)
@@ -537,12 +537,12 @@ func (a *Agent) handleMediaType(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"media_type": mediaType})
 }
 
-// handleCacheHistory 返回近 5 分钟的缓存指标采样（每 5 秒一点，见 cacheproxy.go）。
+// handleCacheHistory 返回近 10 分钟的缓存指标采样（每 5 秒一点，见 cacheproxy.go）。
 func (a *Agent) handleCacheHistory(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, a.cache.History())
 }
 
-// handlePerformance 返回近 5 分钟的全局性能曲线（已由代理侧采样计算好）。
+// handlePerformance 返回近 10 分钟的全局性能曲线（已由代理侧采样计算好）。
 func (a *Agent) handlePerformance(w http.ResponseWriter, _ *http.Request) {
 	a.writeJSON(w, http.StatusOK, a.cache.Performance())
 }
@@ -709,6 +709,10 @@ type repoMountPrefRequest struct {
 	//
 	// 同样属于**整条偏好替换**的一部分，必须与其它字段一起回传。
 	DirectMode bool `json:"direct_mode"`
+	// ShortcutEnabled 是否在挂载后自动创建快捷方式、卸载后自动删除（默认关闭）。
+	//
+	// 与其它字段一样属于**整条偏好替换**的一部分。
+	ShortcutEnabled bool `json:"shortcut_enabled"`
 }
 
 // groupMountPrefRequest 是存储库分组挂载配置的写入请求。
@@ -734,13 +738,14 @@ func (a *Agent) handleSetGroupMountPref(w http.ResponseWriter, r *http.Request) 
 		cacheEnabled = *in.CacheEnabled
 	}
 	cfg, err := a.cfg.SetGroupMountPref(in.Group, RepoMountPref{
-		MountMode:    in.MountMode,
-		MountDir:     in.MountDir,
-		AutoMount:    in.AutoMount,
-		CacheEnabled: cacheEnabled,
-		DirectMode:   in.DirectMode,
-		UseForRepos:  in.UseForRepos,
-		UseRepos:     in.UseRepos,
+		MountMode:       in.MountMode,
+		MountDir:        in.MountDir,
+		AutoMount:       in.AutoMount,
+		CacheEnabled:    cacheEnabled,
+		DirectMode:      in.DirectMode,
+		ShortcutEnabled: in.ShortcutEnabled,
+		UseForRepos:     in.UseForRepos,
+		UseRepos:        in.UseRepos,
 	})
 	if err != nil {
 		a.writeError(w, err)
@@ -766,11 +771,12 @@ func (a *Agent) handleSetRepoMountPref(w http.ResponseWriter, r *http.Request) {
 		cacheEnabled = *in.CacheEnabled
 	}
 	cfg, err := a.cfg.SetRepoMountPref(repoID, RepoMountPref{
-		MountMode:    in.MountMode,
-		MountDir:     in.MountDir,
-		AutoMount:    in.AutoMount,
-		CacheEnabled: cacheEnabled,
-		DirectMode:   in.DirectMode,
+		MountMode:       in.MountMode,
+		MountDir:        in.MountDir,
+		AutoMount:       in.AutoMount,
+		CacheEnabled:    cacheEnabled,
+		DirectMode:      in.DirectMode,
+		ShortcutEnabled: in.ShortcutEnabled,
 	})
 	if err != nil {
 		a.writeError(w, err)

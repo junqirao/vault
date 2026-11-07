@@ -1,22 +1,30 @@
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
-import type { ReactNode } from 'react'
+import type { ReactNode, RefObject } from 'react'
 import {
   Button,
   Card,
   Col,
   Input,
-  Pagination,
   Progress,
   Row,
   Segmented,
   Skeleton,
   Space,
+  Spin,
   Tooltip,
   Typography,
   message
 } from 'antd'
 import type { TableColumnsType } from 'antd'
-import { AppstoreOutlined, ArrowLeftOutlined, BarsOutlined, FolderOutlined, SettingOutlined, SortAscendingOutlined } from '@ant-design/icons'
+import {
+  AppstoreOutlined,
+  ArrowLeftOutlined,
+  BarsOutlined,
+  FolderOutlined,
+  RightOutlined,
+  SettingOutlined,
+  SortAscendingOutlined
+} from '@ant-design/icons'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { DataTable } from '../../components/DataTable'
@@ -30,14 +38,14 @@ import { useApi } from '../../api/provider'
 import type { AgentMountState, UploadState } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
 import { isActiveUpload, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
-import { useAuth } from '../../hooks/useAuth'
+import { useAuth, usePermission } from '../../hooks/useAuth'
 import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime, repoUsage, userDiffUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
-import { GroupMountSettingsModal, RepoMountSettingsModal } from './RepoMountSettings'
+import { GroupMountSettingsModal } from './RepoMountSettings'
 import { PerformanceMonitor } from './PerformanceMonitor'
 import { StorageUsageCard } from '../storage/StorageUsage'
 import { isPlaceholderRepoId, uploadPlaceholderRepo } from './uploadView'
@@ -46,6 +54,14 @@ export interface RepoListProps {
   isSuperAdmin: boolean
   onCreate: () => void
   onOpen: (repoId: string) => void
+  /**
+   * 卡片「设置」入口：跳到存储库详情的「设置」页签，而不是弹出配置弹窗。
+   *
+   * 可选：不带时退回普通详情页（管理端没有每库设置入口）。
+   */
+  onOpenSettings?: (repoId: string) => void
+  /** 点击顶部「性能」模块进入性能详情页（三个可折叠模块）。 */
+  onOpenPerformance?: () => void
   /**
    * 打开「上传任务」页：进行中的上传就以库的身份摆在列表里（见 RepoListEntry），
    * 点它进这个页面看进度 / 取消。
@@ -58,6 +74,13 @@ export interface RepoListProps {
    * 不传时（管理端列表）不渲染该卡片。
    */
   onOpenStorages?: () => void
+  /**
+   * 打开用户管理页（首页「我的配额」标题后的箭头按钮）。
+   *
+   * 只有超级管理员会看到这个入口（见 QuotaOverview 的 isSuperAdmin 判断）；
+   * 普通用户连按钮都不渲染，不传也不影响页面。
+   */
+  onOpenUsers?: () => void
   /**
    * 打开「导入母盘」页：把存储根里已存在的 VHDX 文件原地接管成存储库。
    *
@@ -85,10 +108,83 @@ type RepoViewMode = 'card' | 'list'
 type RepoSortMode = 'name' | 'size'
 
 /**
- * 每页条数按形态分别取值：卡片一行 3~4 张（每页 8 张 = 两行上下），列表一行一库（每页 10 行）。
- * 两者都压在一屏上下，分页才有意义 —— 一页要滚三屏的话，用户只会直接找搜索框。
+ * 瀑布流每批追加的条数，按形态分别取值：卡片一行 3~4 张（一批 8 张 = 两行上下），
+ * 列表一行一库（一批 10 行）。首屏先铺一屏左右，之后滚到底再续下一批。
  */
-const PAGE_SIZE: Record<RepoViewMode, number> = { card: 8, list: 10 }
+const BATCH_SIZE: Record<RepoViewMode, number> = { card: 8, list: 10 }
+
+/**
+ * 分组总览每批追加的分组数：分组卡是整行一条，一批 10 条约一屏。
+ */
+const GROUP_BATCH_SIZE = 10
+
+/**
+ * 瀑布流增量展示：首屏先渲染 `batch` 条，滚到列表末尾时再追加一批。
+ *
+ * 用 IntersectionObserver 观察末尾的哨兵，而不是监听 scroll：内容区的滚动容器在外壳
+ * （`Layout.Content`）上，观察哨兵不受容器实现影响。每次追加后 effect 会重建观察器并
+ * 重新 observe 哨兵 —— 若一屏还没填满，会立刻继续追加，直到填满或取完，不会卡住。
+ *
+ * `resetKey` 变化（切分组 / 改搜索 / 换展示形态）时回到第一批，避免用户还停在上一次的
+ * 滚动深度里，看到一段"从中间开始"的列表。
+ */
+function useInfiniteReveal(
+  total: number,
+  batch: number,
+  resetKey: string
+): { visibleCount: number; hasMore: boolean; sentinelRef: RefObject<HTMLDivElement> } {
+  const [visibleCount, setVisibleCount] = useState(batch)
+  const sentinelRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    setVisibleCount(batch)
+  }, [batch, resetKey])
+
+  useEffect(() => {
+    if (visibleCount >= total) return
+    const node = sentinelRef.current
+    if (!node) return
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting)) {
+          setVisibleCount((count) => Math.min(count + batch, total))
+        }
+      },
+      // 提前 200px 预取：用户滚到底之前下一批已经渲染好（数据都在本地，几乎没有等待）。
+      { rootMargin: '0px 0px 200px 0px' }
+    )
+    observer.observe(node)
+    return () => observer.disconnect()
+  }, [batch, total, visibleCount])
+
+  return {
+    visibleCount: Math.min(visibleCount, total),
+    hasMore: visibleCount < total,
+    sentinelRef
+  }
+}
+
+/** 瀑布流底部的续载提示：还有下一批时挂在末尾，滚进视野即触发追加。 */
+function InfiniteSentinel({ sentinelRef }: { sentinelRef: RefObject<HTMLDivElement> }): JSX.Element {
+  const { t } = useI18n()
+  return (
+    <div
+      ref={sentinelRef}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        gap: spacing.xs,
+        paddingBlock: spacing.md
+      }}
+    >
+      <Spin size="small" />
+      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+        {t('common.loading')}
+      </Typography.Text>
+    </div>
+  )
+}
 
 /**
  * 展示形式的本地偏好键。
@@ -198,14 +294,18 @@ function RepoGroupHeader({
  */
 function QuotaOverview({
   repos,
-  embedded = false
+  embedded = false,
+  onOpenUsers
 }: {
   repos: RepoDTO[]
   /** 嵌在「用量」大模块里时不再套一层 Card。 */
   embedded?: boolean
+  /** 超级管理员点标题进入「用户管理」查看各用户的配额；普通用户没有这个入口。 */
+  onOpenUsers?: () => void
 }): JSX.Element | null {
   const api = useApi()
   const { t } = useI18n()
+  const { isSuperAdmin } = usePermission()
   const meQuery = useQuery({ queryKey: ['me'], queryFn: () => api.me() })
   const user = meQuery.data
   if (!user) return null
@@ -215,10 +315,31 @@ function QuotaOverview({
   const percent = unlimited ? 0 : Math.min(100, Math.round((user.used_bytes / user.quota_bytes) * 100))
   const creating = repos.filter((repo) => repo.state === 'creating').length
 
+  // 标题与「存储 →」保持同一套入口样式：一级文字 + 右箭头整体可点（见 StorageUsageCard）。
+  // 普通用户看不到这个入口：配额只能由管理员在用户管理页维护，给一个点不进去的箭头没有意义。
+  const title =
+    isSuperAdmin && onOpenUsers ? (
+      <Tooltip title={t('nav.users')}>
+        <Button
+          type="text"
+          size="small"
+          aria-label={t('nav.users')}
+          icon={<RightOutlined style={{ fontSize: 10 }} />}
+          iconPosition="end"
+          onClick={onOpenUsers}
+          style={{ paddingInline: 0, height: 'auto', fontWeight: 600 }}
+        >
+          {t('repo.quota.title')}
+        </Button>
+      </Tooltip>
+    ) : (
+      <Typography.Text strong>{t('repo.quota.title')}</Typography.Text>
+    )
+
   const content = (
     <>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
-        <Typography.Text strong>{t('repo.quota.title')}</Typography.Text>
+        {title}
         <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
           {`${t('repo.quota.used')} ${formatBytes(user.used_bytes)} / ${t('repo.quota.total')} ${
             unlimited ? t('common.unlimited') : formatBytes(user.quota_bytes)
@@ -279,9 +400,12 @@ function QuotaOverview({
 /** 首页右上角的「用量」大模块：存储 + 配额两个子模块合成一张卡片。 */
 function UsageOverviewCard({
   onOpenStorages,
+  onOpenUsers,
   repos
 }: {
   onOpenStorages?: () => void
+  /** 超级管理员点「我的配额 →」进入用户管理页。 */
+  onOpenUsers?: () => void
   repos: RepoDTO[]
 }): JSX.Element {
   const { t } = useI18n()
@@ -324,7 +448,7 @@ function UsageOverviewCard({
           paddingBlock: spacing.xs
         }}
       >
-        <QuotaOverview repos={repos} embedded />
+        <QuotaOverview repos={repos} embedded onOpenUsers={onOpenUsers} />
       </div>
     </Card>
   )
@@ -402,10 +526,10 @@ interface RepoSectionProps {
 }
 
 /**
- * 一个分组区块：标题 + 当前页 + 分页。
+ * 一个分组区块：标题 + 瀑布流列表。
  *
- * 分页**每个分组各自一份**：两个分组的含义不同（我拥有的 / 我参与的），
- * 合成一个跨组的分页器时，"第 2 页"读到什么全凭两组各有几个库，很难理解。
+ * 不做手动分页：首屏铺一批，滚到底部自动续下一批；每个分组各有一根哨兵，
+ * 互不影响（搜索时会同时出现多个分组）。
  */
 function RepoSection({
   title,
@@ -417,15 +541,15 @@ function RepoSection({
   onConfigure,
   onOpenUpload
 }: RepoSectionProps): JSX.Element {
-  const [page, setPage] = useState(1)
-  const pageSize = PAGE_SIZE[viewMode]
-  // 切换形态会换掉每页条数（卡片 8 / 列表 10），当前页可能已经越界；
-  // 回到第 1 页最不容易迷失（越界本身另有兜底，见下面的 current）。
-  useEffect(() => setPage(1), [viewMode])
-
-  const pageCount = Math.max(1, Math.ceil(items.length / pageSize))
-  const current = Math.min(page, pageCount)
-  const visible = items.slice((current - 1) * pageSize, current * pageSize)
+  // 条目集合变了（搜索 / 上传占位换成真库）就回到第一批；进度事件只改 upload 对象，
+  // id 序列不变，因此不会打断当前的滚动深度。
+  const itemsKey = useMemo(() => items.map((entry) => entry.repo.id).join('|'), [items])
+  const { visibleCount, hasMore, sentinelRef } = useInfiniteReveal(
+    items.length,
+    BATCH_SIZE[viewMode],
+    itemsKey
+  )
+  const visible = items.slice(0, visibleCount)
 
   return (
     <div>
@@ -460,18 +584,7 @@ function RepoSection({
           ))}
         </Space>
       )}
-      {items.length > pageSize ? (
-        <div style={{ display: 'flex', justifyContent: 'center', marginTop: spacing.md }}>
-          <Pagination
-            size="small"
-            current={current}
-            pageSize={pageSize}
-            total={items.length}
-            showSizeChanger={false}
-            onChange={setPage}
-          />
-        </div>
-      ) : null}
+      {hasMore ? <InfiniteSentinel sentinelRef={sentinelRef} /> : null}
     </div>
   )
 }
@@ -955,6 +1068,47 @@ function RepoGroupCard({
   )
 }
 
+/**
+ * 分组总览列表：一行一个分组，同样走瀑布流 —— 分组多时不再一次性铺满，
+ * 滚到末尾自动续下一批。分组排序变化（名称 / 大小）时回到第一批。
+ */
+function RepoGroupList({
+  groups,
+  currentUserId,
+  onOpen,
+  onSettings
+}: {
+  groups: RepoGroupBucket[]
+  currentUserId: string
+  onOpen: (groupKey: string) => void
+  onSettings: (groupKey: string) => void
+}): JSX.Element {
+  const resetKey = useMemo(() => groups.map((bucket) => bucket.key).join('|'), [groups])
+  const { visibleCount, hasMore, sentinelRef } = useInfiniteReveal(
+    groups.length,
+    GROUP_BATCH_SIZE,
+    resetKey
+  )
+
+  return (
+    <>
+      <Row gutter={[spacing.md, spacing.md]}>
+        {groups.slice(0, visibleCount).map((bucket) => (
+          <Col key={bucket.key || '__ungrouped__'} span={24}>
+            <RepoGroupCard
+              bucket={bucket}
+              currentUserId={currentUserId}
+              onOpen={() => onOpen(bucket.key)}
+              onSettings={() => onSettings(bucket.key)}
+            />
+          </Col>
+        ))}
+      </Row>
+      {hasMore ? <InfiniteSentinel sentinelRef={sentinelRef} /> : null}
+    </>
+  )
+}
+
 /** 分组下钻后的内容：返回 + 组名 + 批量挂载/卸载 + 分组设置 + 库列表。 */
 function RepoGroupDetail({
   bucket,
@@ -1064,13 +1218,16 @@ function RepoGroupDetail({
   )
 }
 
-/** 存储库列表：管理端表格；用户端卡片/列表两种形态（可切换 + 分组分页）。 */
+/** 存储库列表：管理端表格；用户端卡片/列表两种形态（可切换 + 分组与组内库瀑布流）。 */
 export function RepoList({
   isSuperAdmin,
   onCreate,
   onOpen,
+  onOpenSettings,
+  onOpenPerformance,
   onOpenUpload,
   onOpenStorages,
+  onOpenUsers,
   onImport
 }: RepoListProps): JSX.Element {
   const api = useApi()
@@ -1088,8 +1245,14 @@ export function RepoList({
     setViewMode(next)
     storeView(next)
   }
-  // 挂载配置弹窗只服务当前点开的这一个库（弹窗在列表这一层只保留一份，避免每张卡都挂一个）。
-  const [settingsRepo, setSettingsRepo] = useState<RepoDTO | null>(null)
+  // 卡片「设置」不再弹窗：跳到存储库详情的「设置」页签（没有提供入口时退回普通详情）。
+  const openSettings = useCallback(
+    (repo: RepoDTO): void => {
+      if (onOpenSettings) onOpenSettings(repo.id)
+      else onOpen(repo.id)
+    },
+    [onOpen, onOpenSettings]
+  )
   // 分组挂载设置弹窗（同一次只开一个分组）。
   const [settingsGroup, setSettingsGroup] = useState<string | null>(null)
   // 用户端的分组下钻：null = 分组总览；否则是当前进入的分组 key（空串 = 未分组）。
@@ -1292,10 +1455,14 @@ export function RepoList({
     const overview = (quotaRepos: RepoDTO[]): JSX.Element => (
       <Row gutter={[spacing.md, spacing.md]} style={{ alignItems: 'stretch' }}>
         <Col xs={24} lg={16} style={{ display: 'flex' }}>
-          <PerformanceMonitor />
+          <PerformanceMonitor onOpen={onOpenPerformance} />
         </Col>
         <Col xs={24} lg={8} style={{ display: 'flex' }}>
-          <UsageOverviewCard onOpenStorages={onOpenStorages} repos={quotaRepos} />
+          <UsageOverviewCard
+            onOpenStorages={onOpenStorages}
+            onOpenUsers={onOpenUsers}
+            repos={quotaRepos}
+          />
         </Col>
       </Row>
     )
@@ -1344,7 +1511,7 @@ export function RepoList({
             onSortModeChange={setSortMode}
             onBack={() => setActiveGroup(null)}
             onOpen={onOpen}
-            onConfigure={setSettingsRepo}
+            onConfigure={openSettings}
             onOpenUpload={onOpenUpload}
             onSettings={() => setSettingsGroup(currentGroup.key)}
           />
@@ -1385,7 +1552,7 @@ export function RepoList({
                 viewMode={viewMode}
                 currentUserId={userId}
                 onOpen={onOpen}
-                onConfigure={setSettingsRepo}
+                onConfigure={openSettings}
                 onOpenUpload={onOpenUpload}
               />
             ))
@@ -1414,18 +1581,12 @@ export function RepoList({
         </div>
         {/* 一行一个分组：组卡片信息按整行宽度排布，组再多也不会挤成两列
             （真实反馈："存储库分组一行一个，不要一行多个"）。 */}
-        <Row gutter={[spacing.md, spacing.md]}>
-          {allGroups.map((bucket) => (
-            <Col key={bucket.key || '__ungrouped__'} span={24}>
-              <RepoGroupCard
-                bucket={bucket}
-                currentUserId={userId}
-                onOpen={() => setActiveGroup(bucket.key)}
-                onSettings={() => setSettingsGroup(bucket.key)}
-              />
-            </Col>
-          ))}
-        </Row>
+        <RepoGroupList
+          groups={allGroups}
+          currentUserId={userId}
+          onOpen={setActiveGroup}
+          onSettings={setSettingsGroup}
+        />
       </Space>
     )
   }
@@ -1456,10 +1617,6 @@ export function RepoList({
       }
     >
       {reposQuery.error ? <ErrorNotice error={reposQuery.error} /> : null}
-      {/* 每库独立的挂载配置：卡片「配置」图标打开，只改被点的这一个库 */}
-      {settingsRepo ? (
-        <RepoMountSettingsModal repo={settingsRepo} open onClose={() => setSettingsRepo(null)} />
-      ) : null}
       {/* 分组挂载设置：一次只开一个分组（含"使用分组配置"与作用的库勾选）。 */}
       {settingsGroup !== null ? (
         <GroupMountSettingsModal

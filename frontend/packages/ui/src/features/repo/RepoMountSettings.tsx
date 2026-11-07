@@ -23,7 +23,7 @@ const SETTINGS_MODAL_WIDTH = 676
  */
 const REPO_PAGE_SIZE = 8
 
-/** 单个存储库挂载配置的表单状态与保存动作（卡片弹窗与详情页 tab 共用一份）。 */
+/** 单个存储库挂载配置的表单状态与保存动作（详情页设置 tab 与分组弹窗共用同一套字段）。 */
 export interface RepoMountSettingsState {
   mode: AgentMountMode
   dir: string
@@ -32,11 +32,14 @@ export interface RepoMountSettingsState {
   cacheEnabled: boolean
   /** 是否为该库启用直连模式（跳过本机代理，默认关闭）。 */
   directMode: boolean
+  /** 是否在挂载后自动创建快捷方式、卸载后自动删除（默认关闭）。 */
+  shortcutEnabled: boolean
   setMode: (mode: AgentMountMode) => void
   setDir: (dir: string) => void
   setAutoMount: (value: boolean) => void
   setCacheEnabled: (value: boolean) => void
   setDirectMode: (value: boolean) => void
+  setShortcutEnabled: (value: boolean) => void
   saving: boolean
   error: unknown
   /** 本地代理不可用：控件置灰（配置存在本机，没有代理就落不下去）。 */
@@ -108,12 +111,15 @@ export function useRepoMountSettings(repoId: string, repoName: string, repoGroup
   const effectiveCache = effective?.cache_enabled ?? true
   // 直连模式**默认关闭**：默认所有库都经本机代理（未开缓存也走纯透传，从而可监控）。
   const effectiveDirect = Boolean(effective?.direct_mode)
+  // 自动快捷方式**默认关闭**：只有用户显式开启才会在挂载后创建、卸载后删除。
+  const effectiveShortcut = Boolean(effective?.shortcut_enabled)
 
   const [mode, setMode] = useState<AgentMountMode>(effectiveMode)
   const [dir, setDir] = useState(effectiveDir)
   const [autoMount, setAutoMount] = useState(effectiveAuto)
   const [cacheEnabled, setCacheEnabled] = useState(effectiveCache)
   const [directMode, setDirectMode] = useState(effectiveDirect)
+  const [shortcutEnabled, setShortcutEnabled] = useState(effectiveShortcut)
   const [saving, setSaving] = useState(false)
   const [clearing, setClearing] = useState(false)
   const [error, setError] = useState<unknown>(null)
@@ -136,7 +142,8 @@ export function useRepoMountSettings(repoId: string, repoName: string, repoGroup
     setAutoMount(effectiveAuto)
     setCacheEnabled(effectiveCache)
     setDirectMode(effectiveDirect)
-  }, [repoId, effectiveMode, effectiveDir, effectiveAuto, effectiveCache, effectiveDirect])
+    setShortcutEnabled(effectiveShortcut)
+  }, [repoId, effectiveMode, effectiveDir, effectiveAuto, effectiveCache, effectiveDirect, effectiveShortcut])
 
   // 打开这份设置时主动取一次缓存状态：用量随读写一直在变，而**详情页这一层没有轮询器**
   // （10s 轮询放在库列表那一层，离开列表就停了），只靠进入本页前的快照可能已经过时，
@@ -164,7 +171,8 @@ export function useRepoMountSettings(repoId: string, repoName: string, repoGroup
         mount_dir: dir.trim(),
         auto_mount: autoMount,
         cache_enabled: cacheEnabled,
-        direct_mode: directMode
+        direct_mode: directMode,
+        shortcut_enabled: shortcutEnabled
       })
       // 刷新全局配置快照：卡片、详情页读的都是它，否则界面还显示上一次的值。
       await agent.refresh()
@@ -207,11 +215,13 @@ export function useRepoMountSettings(repoId: string, repoName: string, repoGroup
     autoMount,
     cacheEnabled,
     directMode,
+    shortcutEnabled,
     setMode,
     setDir,
     setAutoMount,
     setCacheEnabled,
     setDirectMode,
+    setShortcutEnabled,
     saving,
     error,
     disabled: !agent.available || governedByGroup !== '',
@@ -229,7 +239,7 @@ export function useRepoMountSettings(repoId: string, repoName: string, repoGroup
 /** 各字段的展示：弹窗与详情页 tab 用同一份，避免两处配置长得不一样。 */
 function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Element {
   const { t } = useI18n()
-  const { mode, dir, autoMount, cacheEnabled, directMode, disabled, previewLabel } = state
+  const { mode, dir, autoMount, cacheEnabled, directMode, shortcutEnabled, disabled, previewLabel } = state
 
   return (
     <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
@@ -306,6 +316,16 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
         <Switch checked={autoMount} disabled={disabled} onChange={state.setAutoMount} />
         <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
           {t('repo.settings.autoMountHint')}
+        </Typography.Text>
+      </div>
+
+      <div>
+        <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+          {t('repo.settings.shortcutEnabled')}
+        </Typography.Text>
+        <Switch checked={shortcutEnabled} disabled={disabled} onChange={state.setShortcutEnabled} />
+        <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+          {t('repo.settings.shortcutHint')}
         </Typography.Text>
       </div>
 
@@ -399,6 +419,7 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
   const effectiveAuto = saved ? saved.auto_mount : Boolean(config?.auto_mount)
   const effectiveCache = saved?.cache_enabled ?? true
   const effectiveDirect = Boolean(saved?.direct_mode)
+  const effectiveShortcut = Boolean(saved?.shortcut_enabled)
   const effectiveUseForRepos = Boolean(saved?.use_for_repos)
   // 空 = 全选：不用把当前组的库 ID 全存一遍，将来新加入组的库自动包含在内。
   const savedUseReposKey = (saved?.use_repos ?? []).join('|')
@@ -408,6 +429,7 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
   const [autoMount, setAutoMount] = useState(effectiveAuto)
   const [cacheEnabled, setCacheEnabled] = useState(effectiveCache)
   const [directMode, setDirectMode] = useState(effectiveDirect)
+  const [shortcutEnabled, setShortcutEnabled] = useState(effectiveShortcut)
   const [useForRepos, setUseForRepos] = useState(effectiveUseForRepos)
   const [useRepos, setUseRepos] = useState<string[]>(saved?.use_repos ?? [])
   const [saving, setSaving] = useState(false)
@@ -419,8 +441,18 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
     setAutoMount(effectiveAuto)
     setCacheEnabled(effectiveCache)
     setDirectMode(effectiveDirect)
+    setShortcutEnabled(effectiveShortcut)
     setUseForRepos(effectiveUseForRepos)
-  }, [group, effectiveMode, effectiveDir, effectiveAuto, effectiveCache, effectiveDirect, effectiveUseForRepos])
+  }, [
+    group,
+    effectiveMode,
+    effectiveDir,
+    effectiveAuto,
+    effectiveCache,
+    effectiveDirect,
+    effectiveShortcut,
+    effectiveUseForRepos
+  ])
 
   // 勾选列表按库 ID 存（改库名不会让已勾选的库失效）；配置里换了列表就重填。
   useEffect(() => {
@@ -454,6 +486,7 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
         auto_mount: autoMount,
         cache_enabled: cacheEnabled,
         direct_mode: directMode,
+        shortcut_enabled: shortcutEnabled,
         use_for_repos: useForRepos,
         // 全选就存空数组（新加入组的库也算上），只有部分勾选才存具体列表。
         // 注意别在这里"猜"：state 已经是配置里的值，组内库没加载出来时也照存不误。
@@ -476,11 +509,13 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
     autoMount,
     cacheEnabled,
     directMode,
+    shortcutEnabled,
     setMode,
     setDir,
     setAutoMount,
     setCacheEnabled,
     setDirectMode,
+    setShortcutEnabled,
     useForRepos,
     setUseForRepos,
     useRepos,
@@ -665,46 +700,11 @@ export function GroupMountSettingsModal({
   )
 }
 
-export interface RepoMountSettingsModalProps {
-  repo: RepoDTO
-  open: boolean
-  onClose: () => void
-}
-
-/** 卡片「配置」图标弹出的挂载配置弹窗（只改当前这一个库）。 */
-export function RepoMountSettingsModal({ repo, open, onClose }: RepoMountSettingsModalProps): JSX.Element {
-  const { t } = useI18n()
-  const state = useRepoMountSettings(repo.id, repo.name, repo.group)
-
-  return (
-    <Modal
-      open={open}
-      title={`${t('repo.settings.title')} · ${repo.name}`}
-      width={SETTINGS_MODAL_WIDTH}
-      centered
-      okText={t('common.save')}
-      cancelText={t('common.cancel')}
-      confirmLoading={state.saving}
-      // 跟随分组时这里保存不了（生效的是分组那份配置），按钮一并置灰。
-      okButtonProps={{ disabled: state.governedByGroup !== '' }}
-      onCancel={onClose}
-      onOk={() => {
-        // 保存失败不关窗：错误提示就在表单里，用户改完可以直接重试。
-        void state.save().then((saved) => {
-          if (saved) onClose()
-        })
-      }}
-    >
-      <RepoMountFields state={state} />
-    </Modal>
-  )
-}
-
 /**
- * 详情页「设置」tab 的挂载配置：与卡片弹窗同一份数据、同一套控件。
+ * 详情页「设置」tab 的挂载配置。
  *
- * 弹窗是"不改库、只改本机怎么挂"的快捷入口，详情页 tab 是同一件事的完整页，
- * 两者不引入第二套语义。
+ * 列表卡片的「设置」按钮也跳到这里（`/repos/:id?tab=settings`），
+ * 不再为同一个库额外弹一层配置弹窗 —— 配置与详情上下文在同一页，改完就能接着看别的设置。
  */
 export function RepoMountSettingsPanel({
   repo,

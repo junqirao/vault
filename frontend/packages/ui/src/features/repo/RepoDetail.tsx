@@ -31,12 +31,22 @@ import { RepoMountSettingsPanel } from './RepoMountSettings'
 import { diffUsageAsVolume, RepoUsageTooltip, useRepoDiffUsage } from './RepoUsageTip'
 import { RepoPrepareDetail } from './repoPrepareView'
 
+/** 详情页的页签；路由可据此直接打开「设置」。 */
+export type RepoDetailTab = 'overview' | 'disks' | 'parentFiles' | 'settings'
+
 export interface RepoDetailProps {
   repoId: string
   isSuperAdmin: boolean
   currentUserId: string
   /** 当前用户的显示名：非管理员无法拉取用户列表，用于自己的分配列回退显示。 */
   currentUserName: string
+  /**
+   * 初始页签（默认「概览」）。
+   *
+   * 列表卡片上的「设置」按钮跳过来时传 "settings"：这是页面内的配置区，
+   * 不再为同一个库额外弹一层配置弹窗。
+   */
+  initialTab?: RepoDetailTab
   onBack: () => void
 }
 
@@ -52,11 +62,19 @@ interface EditValues {
 }
 
 /** 存储库详情：概览 + 成员 + 磁盘（含分配与挂载），以及编辑/删除/母盘操作/复制。 */
-export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserName, onBack }: RepoDetailProps): JSX.Element {
+export function RepoDetail({
+  repoId,
+  isSuperAdmin,
+  currentUserId,
+  currentUserName,
+  initialTab,
+  onBack
+}: RepoDetailProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
   const agent = useAgent()
   const queryClient = useQueryClient()
+  const [activeTab, setActiveTab] = useState<RepoDetailTab>(initialTab ?? 'overview')
   const [error, setError] = useState<unknown>(null)
   const [copyOpen, setCopyOpen] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
@@ -86,6 +104,12 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
     if (Date.now() - mountedAt.current < 500) return
     onBack()
   }
+
+  // 从列表的「设置」入口进来时直接落在设置页签；换到另一个库时按新的入口重新定位。
+  // 依赖里不放 activeTab：用户手动切页签不应被这条 effect 拉回去。
+  useEffect(() => {
+    setActiveTab(initialTab ?? 'overview')
+  }, [repoId, initialTab])
 
   const repoQuery = useQuery({
     queryKey: ['repo', repoId],
@@ -581,7 +605,9 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
 
       <Tabs
         // 「设置」固定在最右：管理动作与挂载配置都收在这里，详情默认先看概览。
-        defaultActiveKey="overview"
+        // 受控：列表卡片的「设置」按钮可从路由直接打开这一页签。
+        activeKey={activeTab}
+        onChange={(key) => setActiveTab(key as RepoDetailTab)}
         items={[
           {
             key: 'overview',
@@ -713,7 +739,7 @@ export function RepoDetail({ repoId, isSuperAdmin, currentUserId, currentUserNam
                   </SectionCard>
                 ) : null}
 
-                {/* 挂载配置：与列表卡片弹窗同一份数据、同一套控件。 */}
+                {/* 挂载配置：列表卡片的「设置」入口也直接跳到这里（不再弹窗）。 */}
                 <RepoMountSettingsPanel repo={repo} description={t('repo.settings.mount.desc')} />
 
                 {canManage && repo.mode === 'shared' ? (

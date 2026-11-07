@@ -9,6 +9,7 @@ import {
   LogViewer,
   MyRepos,
   PageShell,
+  PerformancePage,
   RepoCreateForm,
   RepoDetail,
   RepoList,
@@ -21,7 +22,8 @@ import {
   UserList,
   useAuth,
   useI18n,
-  type Language
+  type Language,
+  type RepoDetailTab
 } from '@vault/ui'
 
 import { AppLayout } from '../layouts/AppLayout'
@@ -53,6 +55,11 @@ interface RepoDetailState {
   from?: string
 }
 
+/** 只接受详情页真实存在的页签，避免 URL 上随便一个 `?tab=…` 把 Tabs 打空。 */
+function isRepoDetailTab(value: string | null): value is RepoDetailTab {
+  return value === 'overview' || value === 'disks' || value === 'parentFiles' || value === 'settings'
+}
+
 function RepoDetailRoute(): JSX.Element {
   const { repoId } = useParams<{ repoId: string }>()
   const navigate = useNavigate()
@@ -64,12 +71,17 @@ function RepoDetailRoute(): JSX.Element {
   // 来源在跳转时写进 location.state（见下面各处的 onOpen），直接打开/刷新链接时没有来源，
   // 才退回按角色判断。
   const backTo = (location.state as RepoDetailState | null)?.from ?? (isSuperAdmin ? '/admin/repos' : '/my-repos')
+  // 列表卡片的「设置」按钮用 `?tab=settings` 打开同一个详情页（不再弹配置弹窗）；
+  // 用查询参数而不是一次性 state：刷新/分享链接后仍停在设置页。
+  const tab = new URLSearchParams(location.search).get('tab')
+  const initialTab: RepoDetailTab | undefined = isRepoDetailTab(tab) ? tab : undefined
   return (
     <RepoDetail
       repoId={repoId}
       isSuperAdmin={isSuperAdmin}
       currentUserId={user?.id ?? ''}
       currentUserName={user?.username ?? ''}
+      initialTab={initialTab}
       // 详情的「返回」回到进来时的那份列表，不做 navigate(-1)：从新建页跳进详情时，
       // 历史里那张已经提交过的表单还在，后退会把用户送回去（表单已重置，看着像白填了）。
       onBack={() => navigate(backTo, { replace: true })}
@@ -139,11 +151,18 @@ export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.E
               onCreate={() => navigate('/my-repos/new')}
               // 详情「返回」靠这个来源回到应用端列表（见 RepoDetailRoute）。
               onOpen={(repoId) => navigate(`/repos/${repoId}`, { state: { from: '/my-repos' } })}
+              // 卡片「设置」直接打开详情页的设置页签（不再弹配置弹窗）。
+              onOpenSettings={(repoId) =>
+                navigate(`/repos/${repoId}?tab=settings`, { state: { from: '/my-repos' } })
+              }
+              onOpenPerformance={() => navigate('/performance')}
               // 上传中的库点进「上传任务」页：进度只在本机代理里，所以只有应用端有这个入口。
               onOpenUpload={(uploadId) =>
                 navigate(`/uploads/${uploadId}`, { state: { from: '/my-repos' } })
               }
               onOpenStorages={() => navigate('/storages', { state: { from: '/my-repos' } })}
+              // 配额只能由管理员在用户管理页查看/调整；普通用户看不到这个入口（见 QuotaOverview）。
+              onOpenUsers={() => navigate('/admin/users')}
             />
           }
         />
@@ -167,6 +186,8 @@ export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.E
           element={<StorageUsagePage onBack={() => navigate('/my-repos')} onManage={() => navigate('/admin/storages')} />}
         />
         <Route path="repos/:repoId" element={<RepoDetailRoute />} />
+        {/* 性能详情：总览 + 已挂载库 + 未挂载库（默认收起）三个可折叠模块。 */}
+        <Route path="performance" element={<PerformancePage onBack={() => navigate('/my-repos')} />} />
         {/* 上传任务页独立于存储库详情：上传中的库在服务端可能还不存在（压根没有 repoId 可用）。 */}
         <Route path="uploads/:uploadId" element={<UploadTaskRoute />} />
         <Route path="settings" element={<ClientSettingsRoute />} />
@@ -199,6 +220,9 @@ export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.E
               onCreate={() => navigate('/admin/repos/new')}
               // 详情「返回」靠这个来源回到管理端列表（见 RepoDetailRoute）。
               onOpen={(repoId) => navigate(`/repos/${repoId}`, { state: { from: '/admin/repos' } })}
+              onOpenSettings={(repoId) =>
+                navigate(`/repos/${repoId}?tab=settings`, { state: { from: '/admin/repos' } })
+              }
               // 迁移入口：把存储根里已有的 VHDX 原地接管成存储库（见 DiskImport）。
               onImport={() => navigate('/admin/repos/import')}
             />

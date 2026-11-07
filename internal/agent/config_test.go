@@ -114,9 +114,10 @@ func TestRepoMountPrefIsIndependentPerRepo(t *testing.T) {
 		t.Fatalf("加载配置失败：%v", err)
 	}
 	if _, err := store.SetRepoMountPref("repo-a", RepoMountPref{
-		MountMode: mountModeDirectory,
-		MountDir:  `D:\vault\a`,
-		AutoMount: true,
+		MountMode:       mountModeDirectory,
+		MountDir:        `D:\vault\a`,
+		AutoMount:       true,
+		ShortcutEnabled: true,
 	}); err != nil {
 		t.Fatalf("写入 repo-a 偏好失败：%v", err)
 	}
@@ -142,7 +143,7 @@ func TestRepoMountPrefIsIndependentPerRepo(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("应有两个库的偏好，实际 %d 个：%+v", len(got), got)
 	}
-	if a := got["repo-a"]; !a.AutoMount || a.MountMode != mountModeDirectory || a.MountDir != `D:\vault\a` {
+	if a := got["repo-a"]; !a.AutoMount || a.MountMode != mountModeDirectory || a.MountDir != `D:\vault\a` || !a.ShortcutEnabled {
 		t.Fatalf("repo-a 偏好未正确落盘：%+v", a)
 	}
 	if b := got["repo-b"]; b.AutoMount || b.MountMode != mountModeLetter {

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, Space, Tooltip, Typography } from 'antd'
-import { QuestionCircleOutlined } from '@ant-design/icons'
+import { QuestionCircleOutlined, RightOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
@@ -16,7 +16,7 @@ import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
 
-// 只注册用到的图表/组件，沿用 CacheMetricsDialog 的按需引入。
+// 只注册用到的图表/组件，走 echarts 的按需引入。
 echarts.use([LineChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer])
 
 /** ECharts 的薄封装：负责 init/resize/dispose，option 变化时整份替换。 */
@@ -76,6 +76,7 @@ function zeroPoint(t: number): AgentPerformancePoint {
     read_bytes_per_sec: 0,
     write_bytes_per_sec: 0,
     hit_rate: 0,
+    random_4k_rate: 0,
     l1_used_bytes: 0,
     l2_used_bytes: 0,
     cache_used_bytes: 0
@@ -139,17 +140,15 @@ function chartTitle(params: unknown): string {
 }
 
 /**
- * 我的存储库首页的「性能」模块。
+ * 订阅全局性能曲线（GET /agent/performance 的 SSE）。
  *
- * 数据来自 GET /agent/performance/events：页面挂载时才建立 SSE，代理每 5 秒采样并在 Go 侧
- * 算好 IOPS / 吞吐 / 缓存占用 / 命中率；这里只画两张图，不再堆文字指标。
+ * 只在使用该 hook 的页面挂载时建立连接；离开页面立即断开，不在全局常驻。
+ * 总览卡片与总览详情页共用这一份订阅逻辑。
  */
-export function PerformanceMonitor(): JSX.Element {
-  const { t } = useI18n()
+export function usePerformanceHistory(): AgentPerformanceHistory | null {
   const agent = useAgent()
   const [data, setData] = useState<AgentPerformanceHistory | null>(null)
 
-  // 只在页面挂载时建立性能 SSE；卸载/切页立即断开，不在全局常驻。
   useEffect(() => {
     if (!agent.available) {
       setData(null)
@@ -201,8 +200,25 @@ export function PerformanceMonitor(): JSX.Element {
     }
   }, [agent.available])
 
+  return data
+}
+
+/**
+ * 全局性能的两张曲线（磁盘 / 缓存），总览卡片与详情页共用。
+ *
+ * 数据来自代理每 5 秒采样并在 Go 侧算好的 IOPS / 吞吐 / 缓存占用 / 命中率；
+ * 这里只画图，不再堆文字指标。
+ */
+export function PerformanceCharts({
+  data,
+  height = 190
+}: {
+  data: AgentPerformanceHistory | null
+  height?: number
+}): JSX.Element {
+  const { t } = useI18n()
   const points = useMemo<AgentPerformancePoint[]>(() => data?.points ?? [], [data?.points])
-  // 没有挂载/采样时也照常画：用两个零值点撑起坐标轴，所有读数显示 0。
+  // 没有挂载/采样时也照常画：用零值点撑起坐标轴，所有读数显示 0。
   const chartPoints = useMemo<AgentPerformancePoint[]>(() => {
     if (points.length >= 2) return points
     const now = Math.floor(Date.now() / 1000)
@@ -216,6 +232,7 @@ export function PerformanceMonitor(): JSX.Element {
   const readSpeed = t('repo.performance.readSpeed')
   const writeSpeed = t('repo.performance.writeSpeed')
   const hitRate = t('repo.performance.hitRate')
+  const random4k = t('repo.performance.random4k')
 
   // 磁盘性能：IOPS + 吞吐共用一张图（左轴 IOPS、右轴字节/秒），颜色区分读/写、线型区分指标。
   const diskOption = useMemo<EChartsOption>(() => {
@@ -266,19 +283,22 @@ export function PerformanceMonitor(): JSX.Element {
     }
   }, [times, chartPoints, readIops, writeIops, readSpeed, writeSpeed])
 
-  // 缓存性能：左轴缓存占用（L1/L2），右轴命中率。
+  // 缓存性能：左轴缓存占用（L1/L2），右轴命中率与 4K 随机读占比（都是 0..1）。
   const cacheOption = useMemo<EChartsOption>(() => {
     const option = baseOption(
       times,
       [
         { name: 'L1', color: palette.accent, data: chartPoints.map((p) => p.l1_used_bytes), axis: 0 },
         { name: 'L2', color: palette.warning, data: chartPoints.map((p) => p.l2_used_bytes), axis: 0 },
-        { name: hitRate, color: palette.success, data: chartPoints.map((p) => p.hit_rate), axis: 1 }
+        { name: hitRate, color: palette.success, data: chartPoints.map((p) => p.hit_rate), axis: 1 },
+        { name: random4k, color: palette.danger, data: chartPoints.map((p) => p.random_4k_rate ?? 0), soft: true, axis: 1 }
       ],
       (params) => {
         const title = chartTitle(params)
         const list = Array.isArray(params) ? (params as TooltipParam[]) : []
-        return tooltipLines(title, list, (name, value) => (name === hitRate ? fmtPct(value) : formatBytes(value)))
+        return tooltipLines(title, list, (name, value) =>
+          name === hitRate || name === random4k ? fmtPct(value) : formatBytes(value)
+        )
       }
     )
     return {
@@ -299,47 +319,78 @@ export function PerformanceMonitor(): JSX.Element {
         }
       ]
     }
-  }, [times, chartPoints, hitRate])
+  }, [times, chartPoints, hitRate, random4k])
+
+  return (
+    <div
+      style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
+        gap: spacing.md,
+        height: '100%'
+      }}
+    >
+      <div style={{ minWidth: 0 }}>
+        <Typography.Text strong style={{ display: 'block', marginBottom: spacing.xs, fontSize: fontSize.sm }}>
+          {t('repo.performance.disk')}
+        </Typography.Text>
+        <PerfChart option={diskOption} height={height} />
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <Typography.Text strong style={{ display: 'block', marginBottom: spacing.xs, fontSize: fontSize.sm }}>
+          {t('repo.performance.cache')}
+        </Typography.Text>
+        <PerfChart option={cacheOption} height={height} />
+      </div>
+    </div>
+  )
+}
+
+export interface PerformanceMonitorProps {
+  /** 点击整张卡片进入性能详情页（三个可折叠模块）。 */
+  onOpen?: () => void
+}
+
+/** 我的存储库首页的「性能」模块（可点击进入详情）。 */
+export function PerformanceMonitor({ onOpen }: PerformanceMonitorProps): JSX.Element {
+  const { t } = useI18n()
+  const data = usePerformanceHistory()
 
   return (
     <Card
+      hoverable={Boolean(onOpen)}
+      onClick={onOpen}
       title={
         <Space size={spacing.xs}>
           <span>{t('repo.performance.title')}</span>
           <Tooltip title={t('repo.performance.proxyHint')} placement="right">
-            <QuestionCircleOutlined style={{ color: palette.textTertiary, cursor: 'help' }} />
+            <QuestionCircleOutlined
+              style={{ color: palette.textTertiary, cursor: 'help' }}
+              onClick={(event) => event.stopPropagation()}
+            />
           </Tooltip>
+          {/* 与「存储 →」「我的配额 →」保持一致：入口箭头紧跟在标题后面，不放到右侧的
+              「近 10 分钟」后面，三张模块的入口位置才对得上。 */}
+          {onOpen ? <RightOutlined style={{ fontSize: 10, color: palette.textTertiary }} /> : null}
         </Space>
       }
       extra={
-        <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-          {t('repo.performance.window')}
-        </Typography.Text>
+        <Space size={spacing.xs}>
+          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+            {t('repo.performance.window')}
+          </Typography.Text>
+        </Space>
       }
       styles={{ body: { padding: spacing.md, flex: 1, minHeight: 0 } }}
-      style={{ width: '100%', height: '100%', display: 'flex', flexDirection: 'column' }}
+      style={{
+        width: '100%',
+        height: '100%',
+        display: 'flex',
+        flexDirection: 'column',
+        cursor: onOpen ? 'pointer' : undefined
+      }}
     >
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))',
-          gap: spacing.md,
-          height: '100%'
-        }}
-      >
-        <div style={{ minWidth: 0 }}>
-          <Typography.Text strong style={{ display: 'block', marginBottom: spacing.xs, fontSize: fontSize.sm }}>
-            {t('repo.performance.disk')}
-          </Typography.Text>
-          <PerfChart option={diskOption} height={190} />
-        </div>
-        <div style={{ minWidth: 0 }}>
-          <Typography.Text strong style={{ display: 'block', marginBottom: spacing.xs, fontSize: fontSize.sm }}>
-            {t('repo.performance.cache')}
-          </Typography.Text>
-          <PerfChart option={cacheOption} height={190} />
-        </div>
-      </div>
+      <PerformanceCharts data={data} />
     </Card>
   )
 }

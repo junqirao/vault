@@ -92,6 +92,7 @@ type TargetConfig struct {
 // counters are the per-target forwarding counters.
 type counters struct {
 	reads         atomic.Int64
+	random4k      atomic.Int64
 	writes        atomic.Int64
 	readBytes     atomic.Int64
 	writeBytes    atomic.Int64
@@ -531,6 +532,7 @@ func (t *target) statsSnapshot() Stats {
 	st := Stats{
 		Proxy: StatsSnapshot{
 			Reads:          t.stats.reads.Load(),
+			Random4K:       t.stats.random4k.Load(),
 			Writes:         t.stats.writes.Load(),
 			ReadBytes:      t.stats.readBytes.Load(),
 			WriteBytes:     t.stats.writeBytes.Load(),
