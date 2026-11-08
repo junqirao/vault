@@ -180,6 +180,7 @@ func (r *Router) routes() {
 		g.Put("/v1/repos/{id}/members", r.handleSetMembers)
 		g.Get("/v1/repos/{id}/allocations", r.handleListAllocations)
 		g.Post("/v1/repos/{id}/allocations", r.handleAllocate)
+		g.Post("/v1/repos/{id}/reset-diff", r.handleResetRepoDiff)
 		g.Post("/v1/repos/{id}/parent/actions", r.handleParentAction)
 		g.Post("/v1/repos/{id}/parent/cleanup-diffs", r.handleCleanupDiffs)
 		g.Post("/v1/repos/{id}/parent/resize", r.handleResizeParent)

@@ -257,6 +257,50 @@ func TestStatusReportsRecommendation(t *testing.T) {
 
 // TestQuotaLedgerKeepsTotalWithinBudget 锁定 L1 的"全局共享"口径：集合变化（新库加入）
 // 之后，新库只能分到账本上**还剩**的 L1，不能在老库已占的份额之上再叠一份。
+// TestQuotaTotalL2Cap 锁定「本地缓存上限」：它是所有库 L2 合计的硬上限，
+// 按当前开缓存的库数均分到每库；分到低于下限时宁可关闭 L2，也不留半残缓存。
+func TestQuotaTotalL2Cap(t *testing.T) {
+	const gib = int64(1) << 30
+	store := newCacheTestStore(t)
+	l2 := int64(10 * gib)
+	total := int64(12 * gib)
+	if _, err := store.Patch(ConfigPatch{CacheL2Bytes: &l2, CacheTotalBytes: &total}); err != nil {
+		t.Fatalf("Patch 缓存上限失败：%v", err)
+	}
+	m := newCacheManager(store, testLogger())
+	enable := func(id string) {
+		t.Helper()
+		if _, err := store.SetRepoMountPref(id, RepoMountPref{CacheEnabled: true, AutoMount: true}); err != nil {
+			t.Fatalf("启用 %s 的缓存失败：%v", id, err)
+		}
+	}
+
+	// 只有 A：总预算 12 GiB，A 拿满单库上限 10 GiB。
+	enable("a")
+	aL1, aL2 := m.quotaFor(cacheTargetRequest{AllocationID: "alloc-a", RepoID: "a", RepoSizeBytes: 1000 * gib})
+	if aL2 != 10*gib {
+		t.Fatalf("只有 A 时应拿满 L2 上限 10GiB，实际 %d", aL2)
+	}
+	m.markCacheTarget("alloc-a", "a")
+	m.commitQuota("a", aL1, aL2)
+
+	// B 加入：总预算只剩 2 GiB，B 的 L2 必须被总量夹到 2 GiB（而不是均分的 6 GiB），
+	// 否则 A+B 会超过"本地缓存上限"。
+	enable("b")
+	if _, got := m.quotaFor(cacheTargetRequest{AllocationID: "alloc-b", RepoID: "b", RepoSizeBytes: 1000 * gib}); got != 2*gib {
+		t.Fatalf("总上限扣除 A 后 B 的 L2 应为 2GiB，实际 %d", got)
+	}
+
+	// 总上限小到连每库下限都分不到：关闭 L2（0），而不是开一个放不下索引的缓存。
+	small := int64(cacheMinL2Bytes)
+	if _, err := store.Patch(ConfigPatch{CacheTotalBytes: &small}); err != nil {
+		t.Fatalf("Patch 总上限失败：%v", err)
+	}
+	if _, got := m.quotaFor(cacheTargetRequest{AllocationID: "alloc-a", RepoID: "a", RepoSizeBytes: 1000 * gib}); got != 0 {
+		t.Fatalf("总上限不足每库下限时应关闭 L2，实际 %d", got)
+	}
+}
+
 func TestQuotaLedgerKeepsTotalWithinBudget(t *testing.T) {
 	const gib = int64(1) << 30
 	store := newCacheTestStore(t)
@@ -352,9 +396,10 @@ func TestQuotaForNeverStarvesLaterRepos(t *testing.T) {
 	}
 }
 
-// TestCollectCacheFilesRemovesOrphans 锁定无主文件回收：卸载/删除库之后，既不在门户里、
-// 也没有挂载记录的 l2-/l1- 文件应被删除；有主文件与无关文件不动。
-func TestCollectCacheFilesRemovesOrphans(t *testing.T) {
+// TestCollectCacheFilesKeepsDataRemovesOrphanIndex 锁定：自动清理**只删孤立 .idx**，
+// 任何 .bin（L1/L2 数据）都必须保留，哪怕当前没有挂载记录/最近挂载记录 —— 数据只有
+// 用户在「缓存管理」里确认清除后才会删除。
+func TestCollectCacheFilesKeepsDataRemovesOrphanIndex(t *testing.T) {
 	const mib = int64(1) << 20
 	dir := t.TempDir()
 	store := newCacheTestStore(t)
@@ -363,10 +408,6 @@ func TestCollectCacheFilesRemovesOrphans(t *testing.T) {
 		t.Fatalf("Patch 缓存目录失败：%v", err)
 	}
 	m := newCacheManager(store, testLogger())
-	// 状态里还有挂载记录的分配（应用重启后、自动挂载完成之前就是这种状态）。
-	m.liveAllocations = func() map[string]struct{} {
-		return map[string]struct{}{"alloc-live": {}}
-	}
 
 	write := func(name string) {
 		t.Helper()
@@ -374,23 +415,26 @@ func TestCollectCacheFilesRemovesOrphans(t *testing.T) {
 			t.Fatalf("造缓存文件失败：%v", err)
 		}
 	}
-	write("l2-alloc-live.bin")
-	write("l1-alloc-live.bin")
-	write("l2-alloc-gone.bin")
-	write("l1-alloc-gone.bin")
+	write("l2-repo-a.bin")
+	write("l2-repo-a.idx")
+	write("l1-repo-a.bin")
+	write("l2-repo-old.bin")
+	write("l1-repo-old.bin")
+	write("l2-orphan-index.idx")
 	write("notes.txt")
 
 	m.collectCacheFiles()
 
-	for _, name := range []string{"l2-alloc-live.bin", "l1-alloc-live.bin"} {
+	for _, name := range []string{
+		"l2-repo-a.bin", "l2-repo-a.idx", "l1-repo-a.bin",
+		"l2-repo-old.bin", "l1-repo-old.bin",
+	} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
-			t.Fatalf("%s 还有挂载记录，不该被删：%v", name, err)
+			t.Fatalf("%s 是数据文件/有数据对应的索引，不该被自动删除：%v", name, err)
 		}
 	}
-	for _, name := range []string{"l2-alloc-gone.bin", "l1-alloc-gone.bin"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Fatalf("%s 已无主，应被回收", name)
-		}
+	if _, err := os.Stat(filepath.Join(dir, "l2-orphan-index.idx")); !os.IsNotExist(err) {
+		t.Fatal("没有同名 .bin 的孤立索引应被清理")
 	}
 	if _, err := os.Stat(filepath.Join(dir, "notes.txt")); err != nil {
 		t.Fatalf("非缓存文件不该被删：%v", err)

@@ -311,6 +311,25 @@ func (r *Router) handleAllocate(w http.ResponseWriter, req *http.Request) {
 	r.writeJSON(w, http.StatusCreated, toAllocationDTO(alloc))
 }
 
+// handleResetRepoDiff 重置**当前登录用户**在共享库里的差异盘。
+//
+// 和“先 DELETE 分配、等删除完再 POST 分配”不同：这里在同一个事务里作废旧分配并立刻
+// 建好新分配，旧盘只在后台删除，客户端可以马上走新建+挂载流程。
+func (r *Router) handleResetRepoDiff(w http.ResponseWriter, req *http.Request) {
+	id := chi.URLParam(req, "id")
+	p, err := r.requireRepoPerm(req, id, domain.PermManage)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	alloc, err := r.deps.App.Repos().ResetDiff(req.Context(), id, p.UserID)
+	if err != nil {
+		r.writeError(w, req, err)
+		return
+	}
+	r.writeJSON(w, http.StatusCreated, toAllocationDTO(alloc))
+}
+
 // parentActionRequest 是母盘用途迁移请求。
 type parentActionRequest struct {
 	// Action temp_share | unshare | maintenance | finish_maintenance。

@@ -198,7 +198,8 @@ type Config struct {
 	Language string `json:"language"`
 	// StartAtLogin 是否开机启动。
 	StartAtLogin bool `json:"start_at_login"`
-	// UpdateChannel 更新通道。
+	// UpdateChannel 更新通道，**只读**：客户端设置页不再展示，PATCH 也不接受；
+	// 默认 stable（见 defaultConfig），缺失/为空时同样归一为 stable。
 	UpdateChannel string `json:"update_channel"`
 	// ServerAlias 服务端别名（目录模式命名空间，见 3.4.5）。
 	ServerAlias string `json:"server_alias"`
@@ -213,6 +214,12 @@ type Config struct {
 	// 该配多大可以看 GET /agent/cache 的 recommend（按本机已知的库容量估算），
 	// 口径是"库容量的 5%"，客户端设置页会把推荐值显示在输入框后面。
 	CacheL2Bytes int64 `json:"cache_l2_bytes"`
+	// CacheTotalBytes 是本机**所有库 L2 缓存文件合计**的上限（0 表示不额外限制）。
+	//
+	// 每库的 L2 上限只约束单个库，开 N 个库时目录理论上可以涨到 N × cache_l2_bytes。
+	// 这个总上限把"最终磁盘大小"再封一次：设置了正数时，每个库分到的 L2 配额不超过
+	// cache_total_bytes / 开缓存库数（仍受每库上限与库容量约束）。
+	CacheTotalBytes int64 `json:"cache_total_bytes"`
 	// CacheL2Dir 是 L2 缓存文件的存放目录（客户端设置里可改）。
 	//
 	// 空串表示默认位置 `<DataDir>\iscsi-cache`。非空必须是**绝对路径**：相对路径会随
@@ -284,11 +291,12 @@ type ConfigPatch struct {
 	DownloadConnections *int    `json:"download_connections"`
 	Language            *string `json:"language"`
 	StartAtLogin        *bool   `json:"start_at_login"`
-	UpdateChannel       *string `json:"update_channel"`
 	ServerAlias         *string `json:"server_alias"`
 	// CacheL1Bytes 是 L1 的全局预算；CacheL2Bytes 是**每库** L2 上限（字节）；L2 允许 0（关闭）。
 	CacheL1Bytes *int64 `json:"cache_l1_bytes"`
 	CacheL2Bytes *int64 `json:"cache_l2_bytes"`
+	// CacheTotalBytes 是所有库 L2 缓存的合计上限；0 表示不额外限制。
+	CacheTotalBytes *int64 `json:"cache_total_bytes"`
 	// CacheL2Dir 是 L2 缓存文件目录；空串表示恢复默认位置（见 Config.CacheL2Dir）。
 	CacheL2Dir *string `json:"cache_l2_dir"`
 }
@@ -390,6 +398,7 @@ func normalizeConfig(c Config) Config {
 	}
 	c.CacheL1Bytes = clampCacheL1(c.CacheL1Bytes)
 	c.CacheL2Bytes = clampCacheL2(c.CacheL2Bytes)
+	c.CacheTotalBytes = clampCacheTotal(c.CacheTotalBytes)
 	// L2 目录：空串是合法值（用默认位置），只去空白。
 	c.CacheL2Dir = strings.TrimSpace(c.CacheL2Dir)
 	// 每库 / 每分组挂载偏好：非法形态归一为"跟随默认"（不丢用户的自动挂载表态），目录去空白。
@@ -456,6 +465,20 @@ func clampCacheL2(n int64) int64 {
 		return cacheMinL2Bytes
 	case n > cacheMaxL2Bytes:
 		return cacheMaxL2Bytes
+	default:
+		return n
+	}
+}
+
+// clampCacheTotal 归一化 L2 合计上限：0 表示不额外限制；正数按上下界裁剪。
+func clampCacheTotal(n int64) int64 {
+	switch {
+	case n <= 0:
+		return 0
+	case n < cacheMinL2Bytes:
+		return cacheMinL2Bytes
+	case n > cacheMaxTotalBytes:
+		return cacheMaxTotalBytes
 	default:
 		return n
 	}
@@ -609,9 +632,6 @@ func (s *ConfigStore) Patch(p ConfigPatch) (Config, error) {
 	if p.StartAtLogin != nil {
 		s.cfg.StartAtLogin = *p.StartAtLogin
 	}
-	if p.UpdateChannel != nil {
-		s.cfg.UpdateChannel = strings.TrimSpace(*p.UpdateChannel)
-	}
 	if p.ServerAlias != nil {
 		s.cfg.ServerAlias = strings.TrimSpace(*p.ServerAlias)
 	}
@@ -630,6 +650,13 @@ func (s *ConfigStore) Patch(p ConfigPatch) (Config, error) {
 		s.cfg.CacheL2Bytes = v
 		// 用户显式表过态了：0 从此表示"关闭 L2"，不再被归一成默认值。
 		s.cfg.cacheL2Set = true
+	}
+	if p.CacheTotalBytes != nil {
+		v := *p.CacheTotalBytes
+		if v < 0 || v > cacheMaxTotalBytes || (v > 0 && v < cacheMinL2Bytes) {
+			return s.cfg, apperr.InvalidParam("cache_total_bytes")
+		}
+		s.cfg.CacheTotalBytes = v
 	}
 	if p.CacheL2Dir != nil {
 		v := strings.TrimSpace(*p.CacheL2Dir)

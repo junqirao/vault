@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Alert, Button, Descriptions, Form, Input, InputNumber, Modal, Progress, Skeleton, Space, Switch, Tabs, Tooltip, Typography, message } from 'antd'
 import { ArrowLeftOutlined, ReloadOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -15,6 +15,7 @@ import { useApi } from '../../api/provider'
 import type { JobDTO, ParentAction, RepoDTO, StorageDTO, UpdateRepoRequest } from '../../api/types'
 import { pickMountUsage, repoUsageLoading, useAgent, useAgentUsagePolling } from '../../hooks/useAgent'
 import { isJobTerminal, useJobProgress } from '../../hooks/useJobProgress'
+import { useServerConfig } from '../../hooks/useServerConfig'
 import { useI18n } from '../../i18n'
 
 import { fontSize, palette, spacing } from '../../tokens/palette'
@@ -73,6 +74,7 @@ export function RepoDetail({
   const api = useApi()
   const { t } = useI18n()
   const agent = useAgent()
+  const { active } = useServerConfig()
   const queryClient = useQueryClient()
   const [activeTab, setActiveTab] = useState<RepoDetailTab>(initialTab ?? 'overview')
   const [error, setError] = useState<unknown>(null)
@@ -89,6 +91,9 @@ export function RepoDetail({
   const [diffToolBusy, setDiffToolBusy] = useState(false)
   // 上传核对弹窗。
   const [verifyOpen, setVerifyOpen] = useState(false)
+  // 共享库「重置当前用户的差异盘」：确认框 + 执行状态。执行时冻结挂载入口。
+  const [resetOpen, setResetOpen] = useState(false)
+  const [resetting, setResetting] = useState(false)
   // 存储库迁移：目标存储选择弹窗 + 本次发起的迁移任务（用于跟踪进度与终态刷新）。
   const [moveOpen, setMoveOpen] = useState(false)
   const [moveStorageID, setMoveStorageID] = useState('')
@@ -149,6 +154,13 @@ export function RepoDetail({
     // 独享库的用量走本机实测（10s 那条），这里不必刷。
     refetchInterval: repoQuery.data?.mode === 'shared' ? 60_000 : false
   })
+
+  // 重置差异盘前先看本机有没有这个库的挂载：有就先卸载，再让服务端替换分配。
+  // 不查分配列表：服务端 reset-diff 会直接作废当前用户的旧分配，客户端不需要先知道它。
+  const resetMount = useMemo(
+    () => (agent.state?.mounts ?? []).find((item) => item.repo_id === repoId),
+    [agent.state, repoId]
+  )
 
   // 共享库的「已用」与列表卡片**共用同一套取数逻辑**（见 RepoUsageTip 的 useRepoDiffUsage）：
   // 先用分配记录找到"我"这块差异盘的 disk_id，再取它的 physical_bytes。详情页此前另写了一份
@@ -442,6 +454,49 @@ export function RepoDetail({
     parentMutation.mutate(isMaintenance ? 'finish_maintenance' : 'maintenance')
   }
 
+  /**
+   * 重置当前用户的差异盘：弹窗已先关闭；本机已挂载就先卸载，然后**立刻**让服务端
+   * 作废旧分配并返回一块新差异盘，客户端直接挂载新盘。
+   *
+   * 旧盘物理销毁由服务端后台 JobDeleteDisk 完成，这里不再等待它删完 —— 用户不会
+   * 卡在“释放中”几分钟。reset 期间挂载入口仍冻结（见 resetting → suspended）。
+   */
+  const resetDiff = async (): Promise<void> => {
+    setError(null)
+    setResetting(true)
+    try {
+      // 先记住重置前是否挂载：只有原来挂载的，重置完才自动挂回去；
+      // 原来没挂载的只新建差异盘 + 后台清理旧盘，不替用户顺手挂上。
+      const wasMounted = resetMount !== undefined
+      if (resetMount) {
+        await agent.unmount({ allocation_id: resetMount.allocation_id })
+      }
+      const allocation = await api.resetRepoDiff(repoId)
+      if (wasMounted) {
+        await agent.mount({
+          allocation_id: allocation.id,
+          repo_id: repoId,
+          repo_name: repo?.name,
+          repo_group: repo?.group,
+          server_key: active?.key,
+          server_url: active?.baseUrl
+        })
+      }
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: ['repo-allocations', repoId] }),
+        queryClient.invalidateQueries({ queryKey: ['repo-disks', repoId] }),
+        queryClient.invalidateQueries({ queryKey: ['repo', repoId] }),
+        queryClient.invalidateQueries({ queryKey: ['leases'] })
+      ])
+      await agent.refresh()
+      message.success(t('repo.reset.done'))
+    } catch (err) {
+      setError(err)
+    } finally {
+      setResetting(false)
+    }
+  }
+
   return (
     <PageShell
       title={repo?.name ?? t('repo.detail.title')}
@@ -459,16 +514,37 @@ export function RepoDetail({
         </Tooltip>
       }
       extra={
-        // 标题栏只保留最常用的挂载/卸载；其余管理动作统一收进「设置」tab。
-        // 与列表卡片同一套联动按钮：进了详情也不必退回列表才能挂载。
-        // read 成员只能看：挂载/卸载后端都不放行，按钮就不摆出来。
+        // 标题栏只保留最常用的挂载/卸载与「重置差异盘」；其余管理动作统一收进「设置」tab。
+        // read 成员只能看：挂载/卸载/重置后端都不放行，按钮就不摆出来。
         repo && repo.permission !== 'read' && !isMoving && !repoLocked ? (
-          <RepoDetailMountActions repo={repo} currentUserId={currentUserId} />
+          <Space size={spacing.sm}>
+            {repo.mode === 'shared' &&
+            canManage &&
+            repo.state === 'active' &&
+            !isMaintenance &&
+            agent.available ? (
+              <Tooltip title={t('repo.reset.action')}>
+                <Button size="middle" loading={resetting} disabled={resetting} onClick={() => setResetOpen(true)} style={{ color: palette.danger }}>
+                  {t('repo.reset.short')}
+                </Button>
+              </Tooltip>
+            ) : null}
+            <RepoDetailMountActions repo={repo} currentUserId={currentUserId} suspended={resetting} />
+          </Space>
         ) : null
       }
     >
       {error ? <ErrorNotice error={error} /> : null}
       {repoQuery.error ? <ErrorNotice error={repoQuery.error} /> : null}
+      {resetting ? (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: spacing.md }}
+          message={t('repo.reset.inProgress')}
+          description={t('repo.reset.inProgressHint')}
+        />
+      ) : null}
       {repoLocked ? (
         <div
           style={{
@@ -677,6 +753,7 @@ export function RepoDetail({
                 canManage={canManage}
                 currentUserId={currentUserId}
                 currentUserName={currentUserName}
+                resetting={resetting}
               />
             )
           },
@@ -931,6 +1008,20 @@ export function RepoDetail({
         onCancel={() => setDeleteOpen(false)}
       />
 
+      <ConfirmDialog
+        open={resetOpen}
+        danger
+        title={t('repo.reset.action')}
+        content={t('repo.reset.confirm')}
+        onConfirm={() => {
+          // 交互上先立刻关闭弹窗；卸载/新建/挂载继续在页面后台进行，
+          // 用户能马上看到顶部「重置中」状态。
+          setResetOpen(false)
+          void resetDiff()
+        }}
+        onCancel={() => setResetOpen(false)}
+      />
+
       <Modal
         open={resizeOpen}
         title={t('repo.maintenance.resizeTitle')}
@@ -1088,7 +1179,16 @@ function UsageLegend({ color, label, value }: { color: string; label: string; va
  * 样式取描边：这一排邻居清一色是描边按钮，挂载按钮若还是卡片的实心主色，尺寸虽同、视觉重量
  * 却压过整排（真实反馈："看起来比别的按钮大了，我要统一"）。实心留给卡片——那里它是唯一的主操作。
  */
-function RepoDetailMountActions({ repo, currentUserId }: { repo: RepoDTO; currentUserId: string }): JSX.Element {
+function RepoDetailMountActions({
+  repo,
+  currentUserId,
+  suspended
+}: {
+  repo: RepoDTO
+  currentUserId: string
+  /** 重置差异盘等长操作进行中：冻结挂载/卸载。 */
+  suspended?: boolean
+}): JSX.Element {
   const controller = useRepoMount(repo, currentUserId)
-  return <RepoMountActions controller={controller} size="middle" variant="outlined" />
+  return <RepoMountActions controller={controller} size="middle" variant="outlined" suspended={suspended} />
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -190,6 +191,58 @@ func TestCacheTargetIQNAndPaths(t *testing.T) {
 	custom := t.TempDir()
 	if got := cacheL2Path(custom, "alloc:1"); filepath.Dir(got) != custom {
 		t.Fatalf("自定义 L2 目录未生效：%q（期望目录 %q）", got, custom)
+	}
+}
+
+// TestCacheFilesAndRemove 锁定管理弹窗依赖的文件级快照：
+//
+// 新版权威缓存文件按库键命名，客户端退出/卸载后仍在盘上；没有活动目标时
+// `targets` 为空，管理弹窗必须能从 `files` 看到并清除它们。
+func TestCacheFilesAndRemove(t *testing.T) {
+	dir := t.TempDir()
+	store := newCacheTestStore(t)
+	budget := int64(cacheMinL2Bytes)
+	if _, err := store.Patch(ConfigPatch{CacheL2Bytes: &budget, CacheL2Dir: &dir}); err != nil {
+		t.Fatalf("Patch 缓存目录失败：%v", err)
+	}
+	m := newCacheManager(store, testLogger())
+
+	write := func(name string, size int) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, name), make([]byte, size), 0o600); err != nil {
+			t.Fatalf("造缓存文件失败：%v", err)
+		}
+	}
+	write("l2-repo-a.bin", 10)
+	write("l2-repo-a.idx", 4)
+	write("l1-repo-a.bin", 2)
+	write("l2-repo-b.bin", 7)
+
+	files := m.cacheFiles()
+	if len(files) != 2 {
+		t.Fatalf("应看到 2 个库键的文件，实际 %+v", files)
+	}
+	byKey := map[string]CacheFileStatus{}
+	for _, f := range files {
+		byKey[f.Key] = f
+	}
+	a := byKey["repo-a"]
+	if a.L2Bytes != 10 || a.L2IndexBytes != 4 || a.L1Bytes != 2 || a.Active {
+		t.Fatalf("repo-a 文件统计不对：%+v", a)
+	}
+	if !m.RemoveCacheFiles("repo-a") {
+		t.Fatal("repo-a 有文件，应报告删除成功")
+	}
+	files = m.cacheFiles()
+	if len(files) != 1 || files[0].Key != "repo-b" {
+		t.Fatalf("repo-a 的文件应被全部删除，实际 %+v", files)
+	}
+
+	if allocs, removed := m.ClearAll(); !removed || len(allocs) != 0 {
+		t.Fatalf("ClearAll 应删掉剩余文件（无活动目标）：allocs=%v removed=%v", allocs, removed)
+	}
+	if files = m.cacheFiles(); len(files) != 0 {
+		t.Fatalf("ClearAll 后不应再有缓存文件，实际 %+v", files)
 	}
 }
 

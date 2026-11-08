@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, Space, Tooltip, Typography } from 'antd'
-import { QuestionCircleOutlined, RightOutlined } from '@ant-design/icons'
+import { QuestionCircleOutlined } from '@ant-design/icons'
 import dayjs from 'dayjs'
 import * as echarts from 'echarts/core'
 import { LineChart } from 'echarts/charts'
@@ -11,6 +11,7 @@ import type { EChartsOption } from 'echarts'
 import { agentApi } from '../../api/agentClient'
 import type { AgentEventStream } from '../../api/agentClient'
 import type { AgentPerformanceHistory, AgentPerformancePoint } from '../../api/agentTypes'
+import { SectionTitleLink } from '../../components/SectionTitleLink'
 import { useAgent } from '../../hooks/useAgent'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
@@ -347,38 +348,41 @@ export function PerformanceCharts({
 }
 
 export interface PerformanceMonitorProps {
-  /** 点击整张卡片进入性能详情页（三个可折叠模块）。 */
+  /** 点击标题按钮进入性能详情页（三个可折叠模块）；不传则标题不可点。 */
   onOpen?: () => void
 }
 
-/** 我的存储库首页的「性能」模块（可点击进入详情）。 */
+/** 我的存储库首页的「性能」模块（标题按钮进入详情，卡片本身不可点）。 */
 export function PerformanceMonitor({ onOpen }: PerformanceMonitorProps): JSX.Element {
   const { t } = useI18n()
   const data = usePerformanceHistory()
 
   return (
     <Card
-      hoverable={Boolean(onOpen)}
-      onClick={onOpen}
       title={
-        <Space size={spacing.xs}>
-          <span>{t('repo.performance.title')}</span>
-          <Tooltip title={t('repo.performance.proxyHint')} placement="right">
-            <QuestionCircleOutlined
-              style={{ color: palette.textTertiary, cursor: 'help' }}
-              onClick={(event) => event.stopPropagation()}
-            />
+        onOpen ? (
+          // 与「存储 →」「我的配额 →」保持同一套入口样式：一级文字 + 右箭头整体可点，
+          // 卡片本身不再整块可点（因此也没有悬停变色）。
+          <Tooltip title={t('repo.performance.detail.title')}>
+            <SectionTitleLink title={t('repo.performance.detail.title')} onClick={onOpen}>
+              {t('repo.performance.title')}
+            </SectionTitleLink>
           </Tooltip>
-          {/* 与「存储 →」「我的配额 →」保持一致：入口箭头紧跟在标题后面，不放到右侧的
-              「近 10 分钟」后面，三张模块的入口位置才对得上。 */}
-          {onOpen ? <RightOutlined style={{ fontSize: 10, color: palette.textTertiary }} /> : null}
-        </Space>
+        ) : (
+          <Typography.Text strong style={{ fontSize: fontSize.sm }}>
+            {t('repo.performance.title')}
+          </Typography.Text>
+        )
       }
       extra={
-        <Space size={spacing.xs}>
+        <Space size={spacing.xxs}>
           <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
             {t('repo.performance.window')}
           </Typography.Text>
+          {/* 说明图标放在「近 10 分钟」之后，随右侧读数一起靠边；字号比读数再小一档。 */}
+          <Tooltip title={t('repo.performance.proxyHint')} placement="topRight">
+            <QuestionCircleOutlined style={{ color: palette.textTertiary, cursor: 'help', fontSize: fontSize.xs }} />
+          </Tooltip>
         </Space>
       }
       styles={{ body: { padding: spacing.md, flex: 1, minHeight: 0 } }}
@@ -386,8 +390,7 @@ export function PerformanceMonitor({ onOpen }: PerformanceMonitorProps): JSX.Ele
         width: '100%',
         height: '100%',
         display: 'flex',
-        flexDirection: 'column',
-        cursor: onOpen ? 'pointer' : undefined
+        flexDirection: 'column'
       }}
     >
       <PerformanceCharts data={data} />

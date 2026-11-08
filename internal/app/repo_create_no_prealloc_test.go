@@ -185,6 +185,102 @@ func TestCreateSharedRepoWithoutPreallocateMarksErrorWhenParentFails(t *testing.
 // TestAllocateReplacesFailedDiffDisk 锁定"历史坏盘自愈"：差异盘被标成 error 后不能再被
 // 复用（父文件可能根本不存在），分配要作废旧盘并重建 —— 否则用户每次挂载都只得到
 // disk.create_failed，而且客户端没有删除分配的入口，等于永久锁死。
+// TestResetDiffReplacesHealthyDiskInBackground 锁定「重置差异盘」的核心语义：
+// 即使旧盘状态正常、也还有分配，Replace 必须新建一块盘并立即返回；旧盘只标记 deleting
+// 后交给后台 JobDeleteDisk，客户端不需要等它删完。
+func TestResetDiffReplacesHealthyDiskInBackground(t *testing.T) {
+	ctx := context.Background()
+	svc, st, root := newRepoFlowService(t)
+	owner := createFlowOwner(t, st)
+
+	cond := domain.ParentIdle
+	repo := &domain.Repository{
+		Name:            "reset",
+		Mode:            domain.RepoModeShared,
+		OwnerID:         owner.ID,
+		MaxDiffDisks:    5,
+		State:           domain.RepoStateActive,
+		ParentCondition: &cond,
+	}
+	if err := st.CreateRepository(ctx, repo); err != nil {
+		t.Fatalf("建存储库失败：%v", err)
+	}
+	parent := &domain.Disk{
+		RepoID:    repo.ID,
+		Kind:      domain.DiskKindParent,
+		VHDXPath:  filepath.Join(root, "parents", repo.ID, "base.vhdx"),
+		SizeBytes: 1 << 20,
+		State:     domain.DiskStateReady,
+	}
+	if err := st.CreateDisk(ctx, parent); err != nil {
+		t.Fatalf("建母盘失败：%v", err)
+	}
+	parentID := parent.ID
+	repo.ParentDiskID = &parentID
+	if err := st.UpdateRepository(ctx, repo); err != nil {
+		t.Fatalf("回写母盘关联失败：%v", err)
+	}
+
+	oldDisk := &domain.Disk{
+		RepoID:    repo.ID,
+		Kind:      domain.DiskKindDiff,
+		ParentID:  &parentID,
+		VHDXPath:  filepath.Join(root, "diffs", repo.ID, "old.vhdx"),
+		SizeBytes: parent.SizeBytes,
+		State:     domain.DiskStatePublished,
+	}
+	if err := st.CreateDisk(ctx, oldDisk); err != nil {
+		t.Fatalf("建旧差异盘失败：%v", err)
+	}
+	oldAlloc := &domain.Allocation{
+		RepoID: repo.ID,
+		DiskID: oldDisk.ID,
+		UserID: owner.ID,
+		State:  domain.AllocationStateMounted,
+	}
+	if err := st.CreateAllocation(ctx, oldAlloc); err != nil {
+		t.Fatalf("建旧分配失败：%v", err)
+	}
+
+	got, err := svc.ResetDiff(ctx, repo.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("重置差异盘失败：%v", err)
+	}
+	if got.DiskID == oldDisk.ID {
+		t.Fatal("重置必须新建差异盘，不能复用旧盘")
+	}
+	if _, err := st.GetAllocation(ctx, oldAlloc.ID); !isNotFound(err) {
+		t.Fatalf("旧分配应被立即删除，err=%v", err)
+	}
+	old, err := st.GetDisk(ctx, oldDisk.ID)
+	if err != nil {
+		t.Fatalf("读旧盘失败：%v", err)
+	}
+	if old.State != domain.DiskStateDeleting {
+		t.Fatalf("旧盘应标记 deleting 交给后台销毁，实际 %q", old.State)
+	}
+
+	jobs, err := st.ListJobs(ctx, "", 50, 0)
+	if err != nil {
+		t.Fatalf("列任务失败：%v", err)
+	}
+	var createNew, deleteOld bool
+	for i := range jobs {
+		switch {
+		case jobs[i].Type == domain.JobCreateDiff && jobs[i].RefID == got.DiskID:
+			createNew = true
+		case jobs[i].Type == domain.JobDeleteDisk && jobs[i].RefID == oldDisk.ID:
+			deleteOld = true
+		}
+	}
+	if !createNew {
+		t.Fatal("应入队新差异盘的派生任务")
+	}
+	if !deleteOld {
+		t.Fatal("应入队旧盘的后台删除任务")
+	}
+}
+
 func TestAllocateReplacesFailedDiffDisk(t *testing.T) {
 	ctx := context.Background()
 	svc, st, root := newRepoFlowService(t)

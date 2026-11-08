@@ -59,18 +59,40 @@ export interface AppLayoutProps {
  */
 const SERVER_SWITCH_RELOAD_DELAY_MS = 300
 
-/** 侧边栏收起后只露出图标：把菜单图标从 antd 默认的 16px 提到 20px（不改变展开态）。 */
-const SIDEBAR_COLLAPSED_CSS = `
+/** 收起后的菜单图标尺寸：antd 默认 16px 在窄栏里偏小，放大到 20px 便于辨认。 */
+const SIDEBAR_COLLAPSED_ICON_SIZE = 20
+
+/**
+ * 侧边栏菜单的视觉微调：
+ * - 菜单项在主题的 38px 高度上上下各加 2px，项间距（上下各 4px）同样各加 2px；
+ * - 收起后只露出图标：图标放大到 20px（不改变展开态）；
+ * - 收起态用 flex 让图标垂直居中，并按 20px 图标重算 antd 的居中 padding
+ *   （默认公式按 16px 图标算，图标变大后不重算会右偏 2px）。
+ */
+const SIDEBAR_CSS = `
 .vault-sidebar {
   transition: all 200ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
 }
+.vault-sidebar .ant-menu-item,
+.vault-sidebar .ant-menu-submenu-title {
+  height: 42px !important;
+  line-height: 42px !important;
+  margin-block: 6px !important;
+}
 .vault-sidebar .ant-menu-item .anticon,
 .vault-sidebar .ant-menu-submenu-title .anticon {
+  flex: none;
   transition: font-size 200ms cubic-bezier(0.22, 0.61, 0.36, 1) !important;
 }
 .vault-sidebar-collapsed .ant-menu-inline-collapsed .ant-menu-item .anticon,
 .vault-sidebar-collapsed .ant-menu-inline-collapsed .ant-menu-submenu-title .anticon {
-  font-size: 20px !important;
+  font-size: ${SIDEBAR_COLLAPSED_ICON_SIZE}px !important;
+}
+.vault-sidebar-collapsed .ant-menu-inline-collapsed .ant-menu-item,
+.vault-sidebar-collapsed .ant-menu-inline-collapsed .ant-menu-submenu-title {
+  display: flex !important;
+  align-items: center !important;
+  padding-inline: calc(50% - ${SIDEBAR_COLLAPSED_ICON_SIZE / 2}px - ${spacing.xs}px) !important;
 }
 `
 /** 侧边栏收起状态的本机偏好键：只影响布局，不进客户端配置。 */
@@ -317,7 +339,7 @@ export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
 
   return (
     <LayoutModeProvider mode={mode}>
-      <style>{SIDEBAR_COLLAPSED_CSS}</style>
+      <style>{SIDEBAR_CSS}</style>
       <Layout style={{ height: '100vh' }}>
         <Layout.Sider
           width={layout.sidebarWidth}

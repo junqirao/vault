@@ -413,6 +413,7 @@ python release.py --with-linux           # 额外收集 Linux 服务端 tar.gz
 | [实施文档](docs/implementation.md) | 架构、数据模型、平台实现与边界 |
 | [Benchmark](docs/benchmark.md) | 代理与缓存的基准方法、命令与参考结果 |
 | [客户端代理 API](docs/agent-api.md) | 本地挂载、缓存、状态与事件接口 |
+| [Steam 账号模块](docs/steam-account-module.md) | 独立账号绑定、许可同步、并发租约与创建时选择 |
 | [iSCSI 缓存设计](docs/iscsi-cache/iscsi_cache_v2_design.md) | 旁路代理、序号修正、故障降级 |
 | [L2 区域归位布局](docs/iscsi-cache/l2_region_layout_design.md) | 把 L2 命中变成顺序读 |
 | [Windows iSCSI/VHDX 边界](docs/windows-iscsi-vhdx-api.md) | Windows 平台能力与限制 |

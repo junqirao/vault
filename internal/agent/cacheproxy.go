@@ -48,6 +48,9 @@ const (
 	// cacheMinL2Bytes 保证 L2 文件至少能放下超级块与若干槽位。
 	cacheMinL2Bytes = 256 << 20
 	cacheMaxL2Bytes = 1 << 40
+	// cacheMaxTotalBytes 是"所有库 L2 合计上限"的硬上限（4 TiB），防止前端/API 传一个
+	// 大到溢出的值。它是所有库共享的总盘占用，不是单库值。
+	cacheMaxTotalBytes = 4 << 40
 
 	// cacheQuotaGranularity 是配额与推荐值的取整粒度（1 MiB）：分摊出来的数字对齐到 MiB，
 	// 界面上不会出现 1048577 字节这种读数。
@@ -156,14 +159,8 @@ type cacheManager struct {
 	quotaMu   sync.Mutex
 	allocated map[string]cacheQuota
 
-	// gcMu 串行化无主文件回收，避免两次挂载并发删同一批文件。
+	// gcMu 串行化孤立索引回收，避免两次挂载并发删同一批文件。
 	gcMu sync.Mutex
-
-	// liveAllocations 返回状态里仍然存在的挂载分配 ID（门户之外的"有主"来源）。
-	//
-	// 缓存文件按分配 ID 命名，卸载后挂载记录随之删除、文件再也不会被打开；而应用重启
-	// 后到自动挂载完成之前，记录仍在。以它为准既尊重"重启预热"，又能回收真正无主的文件。
-	liveAllocations func() map[string]struct{}
 }
 
 // cacheQuota 是一个库当前生效的 L1/L2 配额。
@@ -717,11 +714,16 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 		if l1 < cacheMinL1Bytes {
 			return fmt.Errorf("cache: 库 %s 分到的 L1 配额 %d 字节低于下限", req.key(), l1)
 		}
+		// 缓存文件按**稳定的库键**命名（RepoID；缺省才退回分配 ID），而不是分配 ID：
+		// 客户端每次重新挂载都会拿到新的分配 ID，按分配 ID 命名会让上次退出时留下的
+		// 预热缓存永远对不上号。L2 的 Namespace 仍然绑定后端盘指纹，换盘后旧内容自动作废，
+		// 因此复用文件名不会把别的盘的数据当成命中返回。
+		cacheKey := req.key()
 		cc = iscsiproxy.CacheConfig{
 			L1Bytes: l1,
 			// L1 是内存缓存，收尾时落盘、下次启动装回内存：停止代理或重新挂载之后
 			// 热数据不必从零预热。它和 L2 独立，关掉 L2 也照样恢复。
-			L1Snapshot: cacheL1Path(m.cfg.Get().CacheL2Dir, allocationID),
+			L1Snapshot: cacheL1Path(m.cfg.Get().CacheL2Dir, cacheKey),
 			// 与 v1 一致：默认开启顺序扫描准入，连续大顺序读不冲掉热点。
 			ScanEnabled:   true,
 			ScanThreshold: 32,
@@ -729,7 +731,7 @@ func (m *cacheManager) EnsureTarget(ctx context.Context, req cacheTargetRequest)
 		if l2 >= cacheMinL2Bytes {
 			cc.L2 = iscsiproxy.L2Config{
 				Enabled:   true,
-				Path:      cacheL2Path(m.cfg.Get().CacheL2Dir, allocationID),
+				Path:      cacheL2Path(m.cfg.Get().CacheL2Dir, cacheKey),
 				SizeBytes: l2,
 			}
 		}
@@ -843,7 +845,7 @@ func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 
 	// L1：全局预算按容量分摊，再按账本剩余夹紧。
 	l1 = splitCacheBudget(cfg.CacheL1Bytes, cacheMinL1Bytes, repos)[key]
-	usedL1, _ := m.quotaInUse(key)
+	usedL1, usedL2 := m.quotaInUse(key)
 	var over int64
 	l1, over = clampQuota(l1, cfg.CacheL1Bytes-usedL1, cacheMinL1Bytes)
 	if over > 0 {
@@ -865,13 +867,39 @@ func (m *cacheManager) quotaFor(req cacheTargetRequest) (l1, l2 int64) {
 			"budget_bytes", cfg.CacheL1Bytes, "cache_repos", len(repos))
 	}
 
-	// L2：每库一个固定上限，不参与分摊、也不受其他库影响。
+	// L2：每库一个固定上限；再叠加"所有库 L2 合计上限"（cache_total_bytes）时，
+	// 按当前开缓存的库数均分这份总预算。总上限只控制最终磁盘大小，不参与 L1 分摊。
 	if cfg.CacheL2Bytes > 0 {
 		l2 = cfg.CacheL2Bytes
 		if keySize > 0 && keySize < l2 {
 			l2 = keySize
 		}
 		l2 = l2 / cacheQuotaGranularity * cacheQuotaGranularity
+		if cfg.CacheTotalBytes > 0 {
+			share := cfg.CacheTotalBytes / int64(len(repos))
+			share = share / cacheQuotaGranularity * cacheQuotaGranularity
+			if share < l2 {
+				l2 = share
+			}
+			// 再用账本里**实际已占**的 L2 夹一次：已经挂载的库不会自动缩容，如果只看
+			// 均分份额，先挂的库会拿走一大份、后挂的又会再拿一份，合计会超过总上限。
+			remaining := cfg.CacheTotalBytes - usedL2
+			if remaining < 0 {
+				remaining = 0
+			}
+			remaining = remaining / cacheQuotaGranularity * cacheQuotaGranularity
+			if remaining < l2 {
+				l2 = remaining
+			}
+			if l2 > 0 && l2 < cacheMinL2Bytes {
+				// 总上限太小（例如 256 MiB 却有 2 个库）：与其给一个放不下索引的
+				// 半残缓存，不如明确关闭 L2，让用户去调大总上限或减少开缓存的库。
+				m.logger.Warn("本地缓存合计上限不足以覆盖每个开缓存的库，该库关闭 L2",
+					"repo", key, "quota_bytes", l2, "min_bytes", cacheMinL2Bytes,
+					"total_budget_bytes", cfg.CacheTotalBytes, "used_bytes", usedL2, "cache_repos", len(repos))
+				l2 = 0
+			}
+		}
 	}
 	return l1, l2
 }
@@ -1000,19 +1028,154 @@ func (m *cacheManager) cacheDirUsage() (l2, l1 int64) {
 	return l2, l1
 }
 
-// collectCacheFiles 回收缓存目录里**已经没有主人**的文件。
+// cacheFiles 扫描缓存目录，按文件名里的稳定键汇总占用。
 //
-// 为什么需要它：L2 文件是按配额定长预分配的，只在目标创建时写一次。库被删掉、
-// 分配换新之后，旧文件不会自己消失 —— 它们不会再被任何目标打开，却永远实占磁盘
-// （"库早就删了，目录还挂着一百多 GiB"就是这么来的）。
+// 新版 L2 索引是独立的 l2-<key>.idx；这里把它单列，界面可据此显示
+// "数据 + 索引"的实际磁盘占用，而不是只看到 target 的逻辑槽数。
+func (m *cacheManager) cacheFiles() []CacheFileStatus {
+	if m == nil {
+		return []CacheFileStatus{}
+	}
+	dir := cacheStorageDir(m.cfg.Get().CacheL2Dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return []CacheFileStatus{}
+	}
+	byKey := make(map[string]*CacheFileStatus)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		name := e.Name()
+		var key string
+		var apply func(*CacheFileStatus)
+		switch {
+		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".bin"):
+			key = strings.TrimSuffix(strings.TrimPrefix(name, "l2-"), ".bin")
+			apply = func(st *CacheFileStatus) { st.L2Bytes += info.Size() }
+		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".idx"):
+			key = strings.TrimSuffix(strings.TrimPrefix(name, "l2-"), ".idx")
+			apply = func(st *CacheFileStatus) { st.L2IndexBytes += info.Size() }
+		case strings.HasPrefix(name, "l1-") && strings.HasSuffix(name, ".bin"):
+			key = strings.TrimSuffix(strings.TrimPrefix(name, "l1-"), ".bin")
+			apply = func(st *CacheFileStatus) { st.L1Bytes += info.Size() }
+		default:
+			continue
+		}
+		if key == "" {
+			continue
+		}
+		st := byKey[key]
+		if st == nil {
+			st = &CacheFileStatus{Key: key}
+			byKey[key] = st
+		}
+		apply(st)
+	}
+
+	// 给当前仍在用的库键打上 Active / AllocationID：界面用前者区分
+	// "正在缓存"与"已保留（未挂载）"，用后者排障。
+	m.activeMu.Lock()
+	for alloc, key := range m.activeTargets {
+		if st := byKey[sanitizeIQNSuffix(key)]; st != nil {
+			st.Active = true
+			st.AllocationID = alloc
+		}
+	}
+	m.activeMu.Unlock()
+
+	out := make([]CacheFileStatus, 0, len(byKey))
+	for _, st := range byKey {
+		out = append(out, *st)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
+	return out
+}
+
+// RemoveCacheFiles 删除某个稳定键对应的全部缓存文件（L1 快照、L2 数据与索引）。
 //
-// "有主"的判定有两条，任一满足即保留：
-//   - 门户里还有这个分配的目标（正在读写，删也删不掉）；
-//   - 状态里还有这个分配的挂载记录（应用重启后、自动挂载前，记录仍在 —— 这正是
-//     跨重启预热成立的前提）。
+// 返回是否真的删掉了东西。文件正被当前目标打开时 Windows 可能拒绝删除，
+// 这时只记日志并返回 false；调用方（清缓存）已经先 Drop 了内容，不算失败。
+func (m *cacheManager) RemoveCacheFiles(key string) bool {
+	if m == nil {
+		return false
+	}
+	key = sanitizeIQNSuffix(key)
+	if key == "" {
+		return false
+	}
+	// 正在被门户目标打开的文件不能删：Windows 上删 .idx 可能成功而 .bin 失败，
+	// 那会把一份正在使用的 L2 变成无索引的垃圾。活动目标的"清除"只做 Drop
+	// （内容已丢），文件留到卸载后再回收。
+	m.activeMu.Lock()
+	active := false
+	for _, owner := range m.activeTargets {
+		if sanitizeIQNSuffix(owner) == key {
+			active = true
+			break
+		}
+	}
+	m.activeMu.Unlock()
+	if active {
+		return false
+	}
+	dir := cacheStorageDir(m.cfg.Get().CacheL2Dir)
+	removed := false
+	for _, name := range []string{
+		"l2-" + key + ".bin",
+		"l2-" + key + ".idx",
+		"l1-" + key + ".bin",
+	} {
+		err := os.Remove(filepath.Join(dir, name))
+		switch {
+		case err == nil:
+			removed = true
+		case os.IsNotExist(err):
+		default:
+			m.logger.Warn("删除缓存文件失败（可能仍被打开）", "path", name, "error", err)
+		}
+	}
+	return removed
+}
+
+// ClearAll 清空所有活动目标的缓存内容，并删除所有已落盘缓存文件。
 //
-// 卸载会删掉挂载记录，所以卸载后的文件在这里被回收：L2 是每库上限、不预留空间，
-// 没有"留着给下次挂载"的必要。
+// 它服务"全部清除"：既包含当前挂载的库，也包含退出/卸载后按库键保留的预热文件。
+// 正在挂载的 L2 文件可能因句柄占用删不掉，但内容已经 Drop，逻辑占用已归零。
+func (m *cacheManager) ClearAll() (allocs []string, removedFiles bool) {
+	if m == nil {
+		return nil, false
+	}
+	m.activeMu.Lock()
+	ids := make([]string, 0, len(m.activeTargets))
+	for allocationID := range m.activeTargets {
+		ids = append(ids, allocationID)
+	}
+	m.activeMu.Unlock()
+	for _, allocationID := range ids {
+		if m.ClearTarget(allocationID) {
+			allocs = append(allocs, allocationID)
+		}
+	}
+	for _, f := range m.cacheFiles() {
+		if m.RemoveCacheFiles(f.Key) {
+			removedFiles = true
+		}
+	}
+	return allocs, removedFiles
+}
+
+// collectCacheFiles 清理缓存目录里**没有数据文件对应的孤立 L2 索引**（.idx）。
+//
+// 重要边界：这里**不会删除任何 .bin**（L1 快照 / L2 数据）。新版 L2 按稳定库键（RepoID）
+// 命名，要跨退出/卸载保留；旧版本按分配 ID 命名的文件也交给用户在「缓存管理」里确认后
+// 清除，避免状态文件丢失、升级或分配变化时误删用户几 GiB 的预热缓存。
+// 唯一自动清掉的是没有同名 l2-<key>.bin 的 .idx —— 索引本身不含数据，留着只会让目录里
+// 堆满 0 字节/小文件。
 func (m *cacheManager) collectCacheFiles() {
 	if m == nil {
 		return
@@ -1023,20 +1186,7 @@ func (m *cacheManager) collectCacheFiles() {
 	dir := cacheStorageDir(m.cfg.Get().CacheL2Dir)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return // 目录还不存在（从没开过缓存），没有可回收的
-	}
-
-	// 文件名里的 id 后缀要和 cacheL2Path/cacheL1Path 的命名口径一致。
-	live := map[string]struct{}{}
-	if p := m.runningPortal(); p != nil {
-		for _, key := range p.Keys() {
-			live[sanitizeIQNSuffix(key)] = struct{}{}
-		}
-	}
-	if m.liveAllocations != nil {
-		for id := range m.liveAllocations() {
-			live[sanitizeIQNSuffix(id)] = struct{}{}
-		}
+		return // 目录还不存在（从没开过缓存），没有可清理的
 	}
 
 	var removed int
@@ -1045,27 +1195,27 @@ func (m *cacheManager) collectCacheFiles() {
 			continue
 		}
 		name := e.Name()
-		var id string
-		switch {
-		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".bin"):
-			id = strings.TrimSuffix(strings.TrimPrefix(name, "l2-"), ".bin")
-		case strings.HasPrefix(name, "l1-") && strings.HasSuffix(name, ".bin"):
-			id = strings.TrimSuffix(strings.TrimPrefix(name, "l1-"), ".bin")
-		default:
+		// 新版 L2 把索引放在独立的 .idx 文件里（见 iscsicache/l2 的 indexPath）。
+		if !strings.HasPrefix(name, "l2-") || !strings.HasSuffix(name, ".idx") {
 			continue
 		}
-		if _, ok := live[id]; ok {
+		id := strings.TrimSuffix(strings.TrimPrefix(name, "l2-"), ".idx")
+		if id == "" {
+			continue
+		}
+		// 数据文件还在时索引必须保留；.bin 是否"有主"由用户管理，不在这里判断。
+		if _, err := os.Stat(filepath.Join(dir, "l2-"+id+".bin")); err == nil {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, name)); err != nil {
 			// 正被别的进程/会话占用时删不掉：跳过即可，下次挂载再试。
-			m.logger.Warn("回收无主缓存文件失败", "path", name, "error", err)
+			m.logger.Warn("清理孤立缓存索引失败", "path", name, "error", err)
 			continue
 		}
 		removed++
 	}
 	if removed > 0 {
-		m.logger.Info("已回收无主缓存文件", "count", removed, "dir", dir)
+		m.logger.Info("已清理孤立缓存索引", "count", removed, "dir", dir)
 	}
 }
 
@@ -1289,6 +1439,10 @@ type CacheStatus struct {
 	// 逐库实际分到多少见 Targets 里的 l1_limit_bytes/l2_limit_bytes。
 	L1LimitBytes int64 `json:"l1_limit_bytes"`
 	L2LimitBytes int64 `json:"l2_limit_bytes"`
+	// LocalLimitBytes 是所有库 L2 缓存文件的**合计**上限（0 = 不额外限制）。
+	//
+	// 设置页/首页概览的"本地缓存"进度条用它当分母；逐库实际配额见 targets。
+	LocalLimitBytes int64 `json:"local_limit_bytes"`
 	// DiskL2Bytes/DiskL1Bytes 是缓存目录里 L2/L1 文件的**实际**合计（含尚未回收的旧文件）。
 	//
 	// 它是解释"设置 40 GiB、目录却有一百多 GiB"的读数：回收只在挂载/注销时按预算
@@ -1307,8 +1461,28 @@ type CacheStatus struct {
 	Recommend CacheRecommend `json:"recommend"`
 	// Targets 是按库（分配）汇总的用量与命中情况。
 	Targets []CacheTargetStatus `json:"targets"`
+	// Files 是缓存目录里的**文件级**快照（含未挂载的预热缓存）。
+	//
+	// Targets 只覆盖当前挂载的库；客户端退出/卸载后 L2 文件会按库键保留下来，
+	// 管理弹窗要靠 Files 才能看到并清除这些"没有活动目标"的缓存。
+	Files []CacheFileStatus `json:"files"`
 	// Error 是最近一次打开门户失败的原因（如端口被占用）。
 	Error string `json:"error,omitempty"`
+}
+
+// CacheFileStatus 是缓存目录里的一个库键对应的文件占用。
+//
+// Key 是文件名里的稳定键：新版是库 ID（RepoID），旧版本遗留文件则是分配 ID。
+// 前端用 Key 与存储库列表对齐；对不上名字的历史文件仍可显示 Key 并清除。
+type CacheFileStatus struct {
+	Key string `json:"key"`
+	// Active 表示本进程门户里还有这个库键的缓存目标（正在使用）。
+	Active bool `json:"active"`
+	// AllocationID 仅在 Active 时有意义，供界面提示/排障。
+	AllocationID string `json:"allocation_id,omitempty"`
+	L1Bytes      int64  `json:"l1_bytes"`
+	L2Bytes      int64  `json:"l2_bytes"`
+	L2IndexBytes int64  `json:"l2_index_bytes"`
 }
 
 // CacheTargetStatus 是单个库的缓存用量与命中情况。
@@ -1379,15 +1553,18 @@ func (m *cacheManager) Status() CacheStatus {
 		knownBytes += size
 	}
 	st := CacheStatus{
-		L1LimitBytes:   cfg.CacheL1Bytes,
-		L2LimitBytes:   cfg.CacheL2Bytes,
-		EnabledRepos:   len(cachePoolRepos(cfg, "", m.activeRepoKeys())),
-		KnownRepoBytes: knownBytes,
-		KnownRepos:     len(known),
-		Recommend:      cacheRecommend(knownBytes, len(known)),
-		Targets:        []CacheTargetStatus{},
+		L1LimitBytes:    cfg.CacheL1Bytes,
+		L2LimitBytes:    cfg.CacheL2Bytes,
+		LocalLimitBytes: cfg.CacheTotalBytes,
+		EnabledRepos:    len(cachePoolRepos(cfg, "", m.activeRepoKeys())),
+		KnownRepoBytes:  knownBytes,
+		KnownRepos:      len(known),
+		Recommend:       cacheRecommend(knownBytes, len(known)),
+		Targets:         []CacheTargetStatus{},
+		Files:           []CacheFileStatus{},
 	}
 	st.DiskL2Bytes, st.DiskL1Bytes = m.cacheDirUsage()
+	st.Files = m.cacheFiles()
 
 	m.mu.Lock()
 	p, lastErr := m.portal, m.lastErr
@@ -1459,14 +1636,18 @@ func cacheStorageDir(dir string) string {
 	return dir
 }
 
-// cacheL2Path 返回某个分配的 L2 数据文件路径。
-func cacheL2Path(dir, allocationID string) string {
-	return filepath.Join(cacheStorageDir(dir), "l2-"+sanitizeIQNSuffix(allocationID)+".bin")
+// cacheL2Path 返回某个稳定库键（RepoID；缺省为分配 ID）的 L2 数据文件路径。
+//
+// 用稳定键而不是分配 ID：重新挂载会换分配 ID，按分配 ID 命名会让上次退出时
+// 留下的预热缓存永远对不上号。L2 文件内部的 Namespace 仍绑定后端盘指纹，
+// 换盘后会整体作废，不会误命中旧数据。
+func cacheL2Path(dir, key string) string {
+	return filepath.Join(cacheStorageDir(dir), "l2-"+sanitizeIQNSuffix(key)+".bin")
 }
 
-// cacheL1Path 返回某个分配的 L1 内存快照路径，与 L2 同目录。
-func cacheL1Path(dir, allocationID string) string {
-	return filepath.Join(cacheStorageDir(dir), "l1-"+sanitizeIQNSuffix(allocationID)+".bin")
+// cacheL1Path 返回某个稳定库键的 L1 内存快照路径，与 L2 同目录。
+func cacheL1Path(dir, key string) string {
+	return filepath.Join(cacheStorageDir(dir), "l1-"+sanitizeIQNSuffix(key)+".bin")
 }
 
 // cacheBackendPort 返回后端目标的有效端口（服务端未下发时取 iSCSI 默认端口）。

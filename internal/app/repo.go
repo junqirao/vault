@@ -130,6 +130,11 @@ type AllocateInput struct {
 	UserID string
 	// OperatorID 发起人（用于权限校验与审计）。
 	OperatorID string
+	// Replace 强制作废该用户已有的分配并新建一块差异盘（重置差异盘）。
+	//
+	// 旧分配与旧差异盘立即从用户身上摘掉，旧盘标记 deleting 后交给后台
+	// JobDeleteDisk 销毁；新分配不等待旧盘删完就能返回。
+	Replace bool
 }
 
 // Create 创建存储库。
@@ -726,9 +731,16 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 	// poolDiskID 非空表示这次分配用的是池中**已建好并已发布**的差异盘（池化库的常态路径）：
 	// 不需要派发建盘任务，只需在事务外把该盘上预建的 iSCSI 目标绑到这次分配上。
 	var poolDiskID string
-	// staleAllocID/staleDiskID 记录"母盘版本已更新、必须作废重建"的旧分配与旧差异盘。
+	// staleAllocID/staleDiskID 记录“母盘版本已更新、必须作废重建”的旧分配与旧差异盘。
 	var staleAllocID string
 	var staleDiskID string
+	// stalePoolReset 表示旧盘是池位盘：后台改成原地重置回池（JobResetDiff），而不是删除，
+	// 避免每次重置都永久少一个池位。
+	var stalePoolReset bool
+	var staleParentID string
+	// staleDiskSize 用于替换时抵消旧盘在配额里的占用量：旧分配在本事务里立即删除，
+	// 但 repo/user 的 used_bytes 记账列要等任务结束才重算，不抵消会让替换被误判超额。
+	var staleDiskSize int64
 
 	unlock := s.Locks.Acquire(lock.RepoKey(in.RepoID))
 	defer unlock()
@@ -763,6 +775,9 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			// 建库还没完成（母盘 / 池位盘 / iSCSI 目标还在建）：此刻分配只会拿到一块
 			// 还没派生好的池位盘，用户点挂载又得等 —— 等建完再分配，体验才是"分完即挂"。
 			return apperr.RepoCreating()
+		}
+		if in.Replace && !repo.IsShared() {
+			return apperr.New("repo.not_shared", 409).WithArg("mode", string(repo.Mode))
 		}
 		if repo.State != domain.RepoStateActive {
 			return apperr.New("repo.state_invalid", 409).WithArg("state", string(repo.State))
@@ -811,6 +826,36 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			case domain.AllocationStateReleased, domain.AllocationStateReleasing:
 				continue
 			}
+			if in.Replace {
+				// 重置：把这个用户的旧分配整体作废。旧盘先移出“可分配”状态，避免它被
+				// 当成空闲池位盘重新分配；池化库交给后台 JobResetDiff 原地回池，
+				// 普通库交给 JobDeleteDisk 后台销毁 —— 都不阻塞新分配的创建。
+				staleAllocID = existing[i].ID
+				staleDiskID = existing[i].DiskID
+				if staleDiskID != "" {
+					if d, dErr := tx.GetDisk(ctx, staleDiskID); dErr == nil {
+						staleDiskSize = d.SizeBytes
+						if d.ParentID != nil {
+							staleParentID = *d.ParentID
+						} else if repo.ParentDiskID != nil {
+							staleParentID = *repo.ParentDiskID
+						}
+						if repo.Meta.Pool {
+							d.State = domain.DiskStateCreating
+							stalePoolReset = true
+						} else {
+							d.State = domain.DiskStateDeleting
+						}
+						if err := tx.UpdateDisk(ctx, d); err != nil {
+							return err
+						}
+					} else if !isNotFound(dErr) {
+						return dErr
+					}
+				}
+				in.Replace = false // 一次重置只替换一条分配
+				continue
+			}
 			if !repo.IsShared() || existing[i].DiskID == "" {
 				// 独享模式：复用母盘映射，没有差异盘，也就没有版本可比。
 				alloc = &existing[i]
@@ -825,6 +870,17 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 				// 版本对不上（或盘记录已读不到）：作废旧分配，下面重建。
 				staleAllocID = existing[i].ID
 				staleDiskID = existing[i].DiskID
+				if staleDiskID != "" {
+					if d, dErr := tx.GetDisk(ctx, staleDiskID); dErr == nil {
+						staleDiskSize = d.SizeBytes
+						d.State = domain.DiskStateDeleting
+						if err := tx.UpdateDisk(ctx, d); err != nil {
+							return err
+						}
+					} else if !isNotFound(dErr) {
+						return dErr
+					}
+				}
 				break
 			}
 			alloc = &existing[i]
@@ -901,6 +957,19 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 				WithArg("state", string(parent.State))
 		}
 
+		// 替换旧盘时，旧分配刚在本事务里删掉，但 repo/user 的 used_bytes 记账列还没重算；
+		// 配额判断先把这部分减掉，否则“重置”会被误判成在原有占用上再多分一块盘。
+		repoUsedForQuota := repo.UsedBytes
+		userUsedForQuota := target.UsedBytes
+		if staleDiskSize > 0 {
+			if repoUsedForQuota -= staleDiskSize; repoUsedForQuota < 0 {
+				repoUsedForQuota = 0
+			}
+			if userUsedForQuota -= staleDiskSize; userUsedForQuota < 0 {
+				userUsedForQuota = 0
+			}
+		}
+
 		// 池化库的常态路径：取一块**建库时就派生好、并已发布**的空闲池位盘。
 		//
 		// 这是"共享数量"真正的收益点：分配在这里只写几行记录，
@@ -916,10 +985,10 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 				// 用量口径：池位盘被分出去就按它的标称容量计费（与派生路径、对账三者一致，
 				// 见 store.accountedUsageSQL）。
 				need := idle.SizeBytes
-				if err := checkQuota(repo.QuotaBytes, repo.UsedBytes, need); err != nil {
+				if err := checkQuota(repo.QuotaBytes, repoUsedForQuota, need); err != nil {
 					return err
 				}
-				if err := checkQuota(target.QuotaBytes, target.UsedBytes, need); err != nil {
+				if err := checkQuota(target.QuotaBytes, userUsedForQuota, need); err != nil {
 					return err
 				}
 				a := &domain.Allocation{
@@ -961,10 +1030,10 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 		// 配额：按差异盘的标称容量（= 母盘容量）计费，建盘期间就已经计上，
 		// 防止并发分配在同一瞬间超卖。
 		need := parent.SizeBytes
-		if err := checkQuota(repo.QuotaBytes, repo.UsedBytes, need); err != nil {
+		if err := checkQuota(repo.QuotaBytes, repoUsedForQuota, need); err != nil {
 			return err
 		}
-		if err := checkQuota(target.QuotaBytes, target.UsedBytes, need); err != nil {
+		if err := checkQuota(target.QuotaBytes, userUsedForQuota, need); err != nil {
 			return err
 		}
 
@@ -1057,19 +1126,64 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 	}
 
 	if staleDiskID != "" {
-		// 作废旧差异盘（连带删除它的 iSCSI 目标）：这是"母盘版本对不上才释放"的唯一路径。
-		// 配额上，新盘已按母盘容量计费，旧盘要等删除任务真正删掉记录后才退出账目，
-		// 中间会短暂多占一份；对账（reclaim/reconcile）随后按已分配盘重算收敛。
-		stalePayload := deleteDiskPayload{DiskID: staleDiskID}
-		if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobDeleteDisk, staleDiskID,
-			"delete_disk:"+staleDiskID, lock.DiskKey(staleDiskID), stalePayload); err != nil {
-			return alloc, err
+		if stalePoolReset {
+			// 池位盘：后台原地重置回池，避免每重置一次就永久少一个池位。
+			resetPayload := resetDiffPayload{
+				DiskID:       staleDiskID,
+				RepoID:       alloc.RepoID,
+				ParentDiskID: staleParentID,
+				AllocationID: staleAllocID,
+			}
+			if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobResetDiff, staleDiskID,
+				"reset_diff:"+staleAllocID, lock.RepoKey(alloc.RepoID), resetPayload); err != nil {
+				return alloc, err
+			}
+			s.audit(ctx, operatorID, "repo.reset_diff", "repo:"+alloc.RepoID,
+				"user="+userID+" stale_disk="+staleDiskID+" new_allocation="+alloc.ID, domain.AuditResultOK)
+		} else {
+			// 作废旧差异盘（连带删除它的 iSCSI 目标）：这是"母盘版本对不上才释放"的唯一路径。
+			// 配额上，新盘已按母盘容量计费，旧盘要等删除任务真正删掉记录后才退出账目，
+			// 中间会短暂多占一份；对账（reclaim/reconcile）随后按已分配盘重算收敛。
+			stalePayload := deleteDiskPayload{DiskID: staleDiskID}
+			if _, _, err := s.Jobs.EnqueueWith(ctx, domain.JobDeleteDisk, staleDiskID,
+				"delete_disk:"+staleDiskID, lock.DiskKey(staleDiskID), stalePayload); err != nil {
+				return alloc, err
+			}
+			s.audit(ctx, operatorID, "repo.rebuild_diff", "repo:"+alloc.RepoID,
+				"user="+userID+" stale_disk="+staleDiskID+" new_allocation="+alloc.ID, domain.AuditResultOK)
 		}
-		s.audit(ctx, operatorID, "repo.rebuild_diff", "repo:"+alloc.RepoID,
-			"user="+userID+" stale_disk="+staleDiskID+" new_allocation="+alloc.ID, domain.AuditResultOK)
 	}
 
 	s.audit(ctx, operatorID, "repo.allocate", "repo:"+alloc.RepoID, "user="+userID+" allocation="+alloc.ID, domain.AuditResultOK)
+	return alloc, nil
+}
+
+// ResetDiff 重置某个用户在共享库里的差异盘：作废旧分配并立刻新建一块空差异盘。
+//
+// 旧盘不在这里同步删除：Allocate 的 Replace 路径只把旧盘移出可分配状态，普通库交给
+// 后台 JobDeleteDisk 销毁、池化库交给 JobResetDiff 原地回池（客户端都不需要等它）。
+// 调用方应在调用前先卸载本机旧挂载，否则旧 lease 会让后台销毁任务反复重试。
+func (s *RepoService) ResetDiff(ctx context.Context, repoID, userID string) (*domain.Allocation, error) {
+	if strings.TrimSpace(userID) == "" {
+		return nil, apperr.InvalidParam("user_id")
+	}
+	alloc, err := s.Allocate(ctx, AllocateInput{
+		RepoID:     repoID,
+		UserID:     userID,
+		OperatorID: userID,
+		Replace:    true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	// 旧分配已删、旧盘仍在后台销毁/回池：立刻按当前分配重算一次，避免用户用量里
+	// 短暂把"旧盘 + 新盘"都算上（池化库旧分配在后台任务开始前就已经删掉了）。
+	if _, err := s.Store.RecomputeUserUsage(ctx, userID); err != nil {
+		s.Log.Warn("重置差异盘后重算用户用量失败", "user_id", userID, "error", err)
+	}
+	if _, err := s.Store.RecomputeRepoUsage(ctx, repoID); err != nil {
+		s.Log.Warn("重置差异盘后重算存储库用量失败", "repo_id", repoID, "error", err)
+	}
 	return alloc, nil
 }
 

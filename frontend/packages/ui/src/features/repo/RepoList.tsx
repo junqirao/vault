@@ -5,7 +5,6 @@ import {
   Card,
   Col,
   Input,
-  Progress,
   Row,
   Segmented,
   Skeleton,
@@ -21,7 +20,6 @@ import {
   ArrowLeftOutlined,
   BarsOutlined,
   FolderOutlined,
-  RightOutlined,
   SettingOutlined,
   SortAscendingOutlined
 } from '@ant-design/icons'
@@ -32,8 +30,9 @@ import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
+import { SectionTitleLink } from '../../components/SectionTitleLink'
 import { StatusTag } from '../../components/StatusTag'
-import { UsageBar, usageColor } from '../../components/UsageBar'
+import { UsageBar } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { AgentMountState, UploadState } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
@@ -47,6 +46,7 @@ import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
 import { GroupMountSettingsModal } from './RepoMountSettings'
 import { PerformanceMonitor } from './PerformanceMonitor'
+import { CacheOverview } from './CacheOverview'
 import { StorageUsageCard } from '../storage/StorageUsage'
 import { isPlaceholderRepoId, uploadPlaceholderRepo } from './uploadView'
 
@@ -320,20 +320,14 @@ function QuotaOverview({
   const title =
     isSuperAdmin && onOpenUsers ? (
       <Tooltip title={t('nav.users')}>
-        <Button
-          type="text"
-          size="small"
-          aria-label={t('nav.users')}
-          icon={<RightOutlined style={{ fontSize: 10 }} />}
-          iconPosition="end"
-          onClick={onOpenUsers}
-          style={{ paddingInline: 0, height: 'auto', fontWeight: 600 }}
-        >
+        <SectionTitleLink title={t('nav.users')} onClick={onOpenUsers}>
           {t('repo.quota.title')}
-        </Button>
+        </SectionTitleLink>
       </Tooltip>
     ) : (
-      <Typography.Text strong>{t('repo.quota.title')}</Typography.Text>
+      <Typography.Text strong style={{ fontSize: fontSize.sm }}>
+        {t('repo.quota.title')}
+      </Typography.Text>
     )
 
   const content = (
@@ -345,26 +339,10 @@ function QuotaOverview({
             unlimited ? t('common.unlimited') : formatBytes(user.quota_bytes)
           }`}
         </Typography.Text>
-        {/* 不限配额时没有分母，百分比无意义（进度条也不画）。 */}
-        {unlimited ? null : (
-          <Typography.Text strong style={{ fontSize: fontSize.sm }}>
-            {`${percent}%`}
-          </Typography.Text>
-        )}
       </div>
-      {unlimited ? null : (
-        <Progress
-          percent={percent}
-          showInfo={false}
-          size="small"
-          // 与库卡片同一条分档规则（见 components/UsageBar 的 usageColor）：配额也是"占比"，
-          // 同一页上两处条子一套颜色，免得一条橙一条蓝看着像两种口径。
-          strokeColor={usageColor(percent)}
-          trailColor={palette.neutralFill}
-          style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-        />
-      )}
-      <Space size={spacing.md} wrap style={{ marginTop: spacing.sm }}>
+      {/* 与库卡片同一条用量条（UsageBar）：百分数叠在条正中，颜色按占比分档。 */}
+      {unlimited ? null : <UsageBar percent={percent} />}
+      <Space size={spacing.md} wrap style={{ marginTop: spacing.xxs }}>
         {unlimited ? null : (
           <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
             {t('repo.quota.remaining')} {formatBytes(Math.max(0, user.quota_bytes - user.used_bytes))}
@@ -420,35 +398,21 @@ function UsageOverviewCard({
           minHeight: 0,
           display: 'flex',
           flexDirection: 'column',
-          gap: spacing.md
+          justifyContent: 'center',
+          gap: spacing.xs
         }
       }}
     >
       {onOpenStorages ? (
-        <div
-          style={{
-            flex: 1,
-            minHeight: 0,
-            display: 'flex',
-            flexDirection: 'column',
-            justifyContent: 'center',
-            paddingBlock: spacing.xs
-          }}
-        >
+        <div>
           <StorageUsageCard onOpen={onOpenStorages} embedded />
         </div>
       ) : null}
-      <div
-        style={{
-          flex: 1,
-          minHeight: 0,
-          display: 'flex',
-          flexDirection: 'column',
-          justifyContent: 'center',
-          paddingBlock: spacing.xs
-        }}
-      >
+      <div>
         <QuotaOverview repos={repos} embedded onOpenUsers={onOpenUsers} />
+      </div>
+      <div>
+        <CacheOverview embedded />
       </div>
     </Card>
   )

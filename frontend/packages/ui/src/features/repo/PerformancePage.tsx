@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Col, Collapse, Empty, Row, Typography } from 'antd'
+import { Button, Col, Collapse, Empty, Row, Space, Typography } from 'antd'
 import { ArrowLeftOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 
@@ -157,7 +157,17 @@ export function PerformancePage({ onBack }: PerformancePageProps): JSX.Element {
       }
       subtitle={t('repo.performance.proxyHint')}
     >
-      <Collapse defaultActiveKey={['overview', 'mounted']} items={sections} />
+      {/* antd 的 Collapse 默认把多个面板拼成同一个带边框的盒子，面板之间没有间隔。
+          这里每个模块单独成一个可折叠面板，用竖向 Space 拉开间距。 */}
+      <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
+        {sections.map((section) => (
+          <Collapse
+            key={section.key}
+            defaultActiveKey={section.key === 'unmounted' ? undefined : [section.key]}
+            items={[section]}
+          />
+        ))}
+      </Space>
     </PageShell>
   )
 }

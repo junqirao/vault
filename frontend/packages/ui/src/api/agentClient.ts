@@ -917,13 +917,16 @@ export const agentApi = {
    * "清空缓存"。**不**关缓存、不断会话：门户目标与挂载都留着，后续读照常重新填充。
    *
    * 传 repo_id 即可：缓存目标按分配 ID 注册，而界面手里只有库 ID，代理会自己按挂载记录
-   * 映射（见 internal/agent/httpapi.go 的 handleCacheClear）。该库当前没有缓存目标时返回
-   * `cleared:false`（HTTP 200，不是错误）。
+   * 映射（见 internal/agent/httpapi.go 的 handleCacheClear）。新版缓存按库键保留，
+   * 没有活动目标时也会删除已落盘的预热文件；都没有时返回 `cleared:false`
+   * （HTTP 200，不是错误）。
+   *
+   * `{ all: true }` 用于管理弹窗的“全部清除”：清掉所有活动目标与所有落盘缓存。
    *
    * 必须是 POST：Electron 主进程按方法放行（只接受 GET/POST/PATCH/DELETE，见
    * setRepoMountPref 的说明），PUT/DELETE 会被挡在代理之外。
    */
-  clearCache(target: { repo_id?: string; allocation_id?: string }): Promise<AgentCacheClearResult> {
+  clearCache(target: { repo_id?: string; allocation_id?: string; all?: boolean }): Promise<AgentCacheClearResult> {
     return request<AgentCacheClearResult>({ method: 'POST', path: '/agent/cache/clear', body: target })
   },
 

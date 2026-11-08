@@ -294,13 +294,20 @@ export interface RepoMountActionsProps {
    * 尺寸那一步已经对齐过，这里缺的只是样式）。
    */
   variant?: 'solid' | 'outlined'
+  /**
+   * 外部操作（如重置差异盘）进行中：挂载/卸载保持可见并禁用，但**不显示 loading**。
+   *
+   * loading 只表示这一行自己的请求在跑；重置按钮自己会转圈，这里不要跟着转。
+   */
+  suspended?: boolean
 }
 
 /** 卡片头部的挂载/卸载按钮：与「打开」图标并排，随标题行垂直居中。 */
 export function RepoMountActions({
   controller,
   size = 'small',
-  variant = 'solid'
+  variant = 'solid',
+  suspended = false
 }: RepoMountActionsProps): JSX.Element {
   const { t } = useI18n()
   const { mount, sessionLost, pending, resolving, busy, canMount, canUnmount, disabledReason } = controller
@@ -308,8 +315,8 @@ export function RepoMountActions({
   const buttonType = variant === 'outlined' ? 'default' : 'primary'
   // 挂载/卸载只受"代理可用 + 有分配"约束，与库状态无关：库异常/建库中时仍要能摘掉本机的盘。
   // "操作进行中"（pending）由下面的 working 统一接管，这里不再重复判断。
-  const mountDisabled = !canMount
-  const unmountDisabled = !canUnmount
+  const mountDisabled = !canMount || suspended
+  const unmountDisabled = !canUnmount || suspended
   // 记录在、但实测已无活动会话（会话被断/服务重启）：盘实际不在了，"卸载"是错的入口 ——
   // 用户点它只是把记录收掉，盘还是挂不上。此时给"挂载"：代理会先清理残留再真重连
   // （服务端/代理自己闭环），用户不必先卸载再挂载。
@@ -317,7 +324,8 @@ export function RepoMountActions({
   // 操作进行中：本次请求在跑、代理状态机已经是 mounting/unmounting，或本人分配还在解析。
   // 解析中必须一起算进来：那一刻"没有分配"只是"还不知道"，先亮一个灰着的「未分配」按钮、
   // 等列表回来再变成可点，有分配的用户第一眼会以为被收走了。
-  const working = busy || pending || resolving
+  // 外部冻结时不转圈：按钮仍在、只是禁用；转圈只表达本行自己的请求/状态机。
+  const working = !suspended && (busy || pending || resolving)
 
   return (
     // 卡片整卡可点进详情，按钮区的事件不得冒泡触发跳转。

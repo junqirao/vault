@@ -7,6 +7,7 @@ import type { BlockDeviceDTO, DeviceReleaseReportDTO } from '../../api/types'
 import { useApi } from '../../api/provider'
 import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { ErrorNotice } from '../../components/ErrorNotice'
+import { MediaTypeTag } from '../../components/MediaTypeTag'
 import { useI18n } from '../../i18n'
 import { formatBytes } from '../../utils/format'
 
@@ -113,11 +114,7 @@ export function BlockDevicePicker({
             title: t('system.lvm.device.kind'),
             dataIndex: 'rotational',
             key: 'kind',
-            render: (rotational: boolean) => (
-              <Tag color={rotational ? 'default' : 'green'}>
-                {rotational ? t('system.lvm.device.hdd') : t('system.lvm.device.ssd')}
-              </Tag>
-            )
+            render: (rotational: boolean) => <MediaTypeTag mediaType={rotational ? 'hdd' : 'ssd'} />
           },
           {
             // 只讲"能不能选"：原因本身是数据，动作另起一列，两者不挤在一格里。

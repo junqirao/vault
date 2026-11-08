@@ -414,6 +414,7 @@ For a real release, signing keys must already exist (`keys/update-private.pem` +
 | [Implementation](docs/implementation.md) | Architecture, data model, platform implementation, and boundaries |
 | [Benchmark](docs/benchmark.md) | Proxy and cache benchmark methodology, commands, and reference numbers |
 | [Client agent API](docs/agent-api.md) | Local mounting, cache, state, and event APIs |
+| [Steam account module](docs/steam-account-module.md) | Standalone Steam account binding, licensing, leases, and creation-time selection |
 | [iSCSI cache design](docs/iscsi-cache/iscsi_cache_v2_design.md) | Bypass proxy, sequence correction, failure fallback |
 | [L2 region layout](docs/iscsi-cache/l2_region_layout_design.md) | Turning L2 hits into sequential reads |
 | [Windows iSCSI/VHDX boundaries](docs/windows-iscsi-vhdx-api.md) | Windows platform capabilities and limits |

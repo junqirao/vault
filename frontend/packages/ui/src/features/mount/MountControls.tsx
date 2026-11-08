@@ -250,6 +250,11 @@ export interface MountActionButtonsProps {
   /** 代理是否可用。 */
   available: boolean
   busy?: boolean
+  /**
+   * 外部长操作（如重置差异盘）冻结入口：按钮保持可见并禁用，但**不显示 loading**。
+   * loading 只表达"这一行自己正在请求"，不替外部操作转圈。
+   */
+  disabled?: boolean
   onMount: () => void
   onUnmount: () => void
   onRemount: () => void
@@ -262,6 +267,7 @@ export function MountActionButtons({
   canMount,
   available,
   busy,
+  disabled,
   onMount,
   onUnmount,
   onRemount,
@@ -280,31 +286,34 @@ export function MountActionButtons({
   // 记录在、但实测没有活动会话：盘根本不在，此时"卸载"不是用户要的入口（点了只是清记录），
   // 该给的是"挂载"—— 代理会先清理残留再真重连（服务端/代理自己闭环），用户不必先卸载再挂载。
   const sessionLost = mount !== undefined && mountSessionLive(mount) === false
+  const frozen = Boolean(disabled)
+  // 外部冻结时不转圈；只有这一行自己的请求在跑才 loading。
+  const spinning = Boolean(busy) && !frozen
   const buttons = (
     <Space size={0}>
       {mount ? (
         sessionLost ? (
           <>
-            <Button type="link" size="small" disabled={!available} loading={busy} onClick={onMount}>
+            <Button type="link" size="small" disabled={!available || frozen} loading={spinning} onClick={onMount}>
               {t('action.mount')}
             </Button>
             {/* 记录清理入口保留：用户也可能就是想把这条断线的记录收掉。 */}
-            <Button type="link" size="small" disabled={unmountDisabled} loading={busy} onClick={onUnmount}>
+            <Button type="link" size="small" disabled={unmountDisabled || frozen} loading={spinning} onClick={onUnmount}>
               {t('action.unmount')}
             </Button>
           </>
         ) : (
           <>
-            <Button type="link" size="small" disabled={unmountDisabled} loading={busy} onClick={onUnmount}>
+            <Button type="link" size="small" disabled={unmountDisabled || frozen} loading={spinning} onClick={onUnmount}>
               {t('action.unmount')}
             </Button>
-            <Button type="link" size="small" disabled={!available || transitioning} loading={busy} onClick={onRemount}>
+            <Button type="link" size="small" disabled={!available || transitioning || frozen} loading={spinning} onClick={onRemount}>
               {t('agent.action.remount')}
             </Button>
             <Button
               type="link"
               size="small"
-              disabled={!available || mount.state !== 'mounted'}
+              disabled={!available || mount.state !== 'mounted' || frozen}
               onClick={() => onOpenPath(openTargetOf(mount))}
             >
               {t('agent.action.openDirectory')}
@@ -312,7 +321,7 @@ export function MountActionButtons({
           </>
         )
       ) : (
-        <Button type="link" size="small" disabled={!available} loading={busy} onClick={onMount}>
+        <Button type="link" size="small" disabled={!available || frozen} loading={spinning} onClick={onMount}>
           {t('action.mount')}
         </Button>
       )}

@@ -37,6 +37,10 @@ export interface RepoDisksProps {
   currentUserId: string
   /** 当前用户的显示名：非管理员无法拉取用户列表，用于自己的分配列回退显示。 */
   currentUserName: string
+  /**
+   * 重置差异盘进行中：禁用本页的挂载/分配/释放入口，避免和重置并发。
+   */
+  resetting?: boolean
 }
 
 /**
@@ -70,7 +74,8 @@ export function RepoDisks({
   isSuperAdmin,
   canManage,
   currentUserId,
-  currentUserName
+  currentUserName,
+  resetting = false
 }: RepoDisksProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
@@ -377,6 +382,7 @@ export function RepoDisks({
               canMount={mine !== undefined}
               available={agent.available}
               busy={mine !== undefined && busyId === mine.id}
+              disabled={mine !== undefined && resetting}
               onMount={() => mine && openMountDialog(mine)}
               onUnmount={() => mount && setPendingUnmount(mount)}
               onRemount={() => mine && void runAgentAction(mine.id, () => agent.remount({ allocation_id: mine.id }))}
@@ -385,7 +391,14 @@ export function RepoDisks({
             {allocs
               .filter((alloc) => canManage || alloc.user_id === currentUserId)
               .map((alloc) => (
-                <Button key={alloc.id} type="link" size="small" danger onClick={() => setPendingRelease(alloc)}>
+                <Button
+                  key={alloc.id}
+                  type="link"
+                  size="small"
+                  danger
+                  disabled={resetting}
+                  onClick={() => setPendingRelease(alloc)}
+                >
                   {t('action.release')}
                 </Button>
               ))}
@@ -432,7 +445,7 @@ export function RepoDisks({
           />
           <Button
             type="primary"
-            disabled={!selectedUser}
+            disabled={!selectedUser || resetting}
             loading={allocateMutation.isPending}
             onClick={() => selectedUser && allocateMutation.mutate(selectedUser)}
           >

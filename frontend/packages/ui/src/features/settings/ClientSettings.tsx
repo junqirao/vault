@@ -1,12 +1,14 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Descriptions, Input, InputNumber, Progress, Select, Space, Switch, Tag, Typography } from 'antd'
+import { Alert, Button, Descriptions, Input, InputNumber, Progress, Select, Space, Switch, Typography } from 'antd'
 import { CheckCircleOutlined } from '@ant-design/icons'
 
 import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { CopyableText } from '../../components/CopyableText'
 import { ErrorNotice } from '../../components/ErrorNotice'
+import { MediaTypeTag } from '../../components/MediaTypeTag'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
+import { UsageBar } from '../../components/UsageBar'
 import {
   agentApi,
   getAgentVersionInfo,
@@ -23,21 +25,25 @@ import { useAuth } from '../../hooks/useAuth'
 import { useServerConfig } from '../../hooks/useServerConfig'
 import { LANGUAGE_LABELS, LANGUAGES, useI18n, type Language } from '../../i18n'
 import { fontSize, spacing } from '../../tokens/palette'
-import { bytesToMegabytes, formatBytes, formatTime, megabytesToBytes } from '../../utils/format'
+import { bytesToGigabytes, bytesToMegabytes, formatBytes, formatTime, gigabytesToBytes, megabytesToBytes } from '../../utils/format'
+import { CacheManagementModal } from './CacheManagementModal'
+import { cacheTotals } from './cacheUsage'
 import { ServerManagementCard } from './ServerManagementCard'
 
 /**
- * 本地读缓存代理的 L1（全局共享）/ L2（每库上限）配置，单位 MiB。
+ * 本地读缓存代理的 L1（全局共享，MiB）/ L2（每库上限，G）/ 合计上限（G）配置。
  *
  * 上下界必须与代理侧（internal/agent/cacheproxy.go 的 cacheMin/Max）一致 —— 否则界面放行、
- * 保存却被 PATCH 以 cache_l1_bytes/cache_l2_bytes invalid_param 拒掉，用户只看到一个对不上的报错。
- * L2 的 0 是**合法值**（关闭 L2），所以它的下界是 0 而不是 cacheMinL2Bytes。
+ * 保存却被 PATCH 以 cache_l1_bytes/cache_l2_bytes/cache_total_bytes invalid_param 拒掉，
+ * 用户只看到一个对不上的报错。L2 的 0 是**合法值**（关闭 L2），所以它的下界是 0。
  */
 const CACHE_L1_MIN_MIB = 64
 const CACHE_L1_MAX_MIB = 64 * 1024
-const CACHE_L2_MAX_MIB = 1024 * 1024
-/** L2 非零时的最小值（MiB）：小于它就等于没意义（放不下超级块与槽位）。 */
-const CACHE_L2_MIN_MIB = 256
+const CACHE_L2_MAX_GIB = 1024
+/** L2 非零时的最小值（G）：小于它就等于没意义（放不下超级块与槽位）。 */
+const CACHE_L2_MIN_GIB = 0.25
+/** 本地缓存合计上限的最大值（G）：4 TiB，与代理侧 cacheMaxTotalBytes 对齐。 */
+const CACHE_TOTAL_MAX_GIB = 4096
 
 export interface ClientSettingsProps {
   language: Language
@@ -64,6 +70,7 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   const [identityBusy, setIdentityBusy] = useState(false)
   const [autoLoginSaving, setAutoLoginSaving] = useState(false)
   const [autoUpdateSaving, setAutoUpdateSaving] = useState(false)
+  const [cacheManagerOpen, setCacheManagerOpen] = useState(false)
   const [removeOpen, setRemoveOpen] = useState(false)
   // 待撤销的"其他服务端"证书；null 表示没有待确认的撤销。
   const [removeOther, setRemoveOther] = useState<AgentIdentity | null>(null)
@@ -105,7 +112,7 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         if (!cancelled) setError(err)
       })
     // 缓存推荐值按"本机已知的库容量"估算，库容量会随后台挂载/服务端列表变化：
-    // 只靠进入本页前留下的快照可能已经过时，这里主动取一次（本页不轮询，取一次就够）。
+    // 只靠进入本页前留下的快照可能已经过时，这里主动取一次；后续由下面的 10s 轮询刷新。
     void agent.refreshCache()
     return () => {
       cancelled = true
@@ -170,11 +177,27 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
   // 缓存推荐值：代理按"本机已知的库容量"估算（GET /agent/cache 的 recommend）。
   // 一个库容量都还不知道时不显示推荐 —— 无从估算，显示一个拍脑袋的数字反而误导。
   const cacheRecommend = agent.cache && agent.cache.recommend.basis_repos > 0 ? agent.cache.recommend : null
+  // 卡片标题右侧的紧凑用量：活动目标按逻辑占用，退出后保留的 L2 文件按落盘大小。
+  const cacheTotal = cacheTotals(agent.cache, agent.state?.mounts ?? [])
+
+  // 标题旁的用量会随读写变化：管理弹窗开着时由它自己轮询，这里只在关闭时补一个
+  // 低频刷新，避免同一页面两个 10s 定时器重复请求。
+  const refreshCache = agent.refreshCache
+  useEffect(() => {
+    if (!agent.available || cacheManagerOpen) return
+    const timer = window.setInterval(() => void refreshCache(), 10000)
+    return () => window.clearInterval(timer)
+  }, [agent.available, cacheManagerOpen, refreshCache])
 
   // 套用推荐值只改本地草稿，用户点"保存"才落盘（与这一页其他字段一致）。
+  // 本地缓存上限也按"每库推荐 L2 × 当前已知库数"给出一个等价的合计值。
   const applyCacheRecommend = (): void => {
     if (!cacheRecommend) return
-    patch({ cache_l1_bytes: cacheRecommend.l1_bytes, cache_l2_bytes: cacheRecommend.l2_bytes })
+    patch({
+      cache_l1_bytes: cacheRecommend.l1_bytes,
+      cache_l2_bytes: cacheRecommend.l2_bytes,
+      cache_total_bytes: cacheRecommend.l2_bytes * cacheRecommend.basis_repos
+    })
   }
 
   // 选择 L2 缓存目录：系统目录选择器 → 写进本地 config（保存时随表单一起提交）。
@@ -249,9 +272,9 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         shortcut_dir: config.shortcut_dir,
         language,
         start_at_login: config.start_at_login,
-        update_channel: config.update_channel,
         cache_l1_bytes: config.cache_l1_bytes,
         cache_l2_bytes: config.cache_l2_bytes,
+        cache_total_bytes: config.cache_total_bytes,
         cache_l2_dir: config.cache_l2_dir
       })
       setConfig(result.config)
@@ -469,7 +492,28 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
         </Space>
       </SectionCard>
 
-      <SectionCard title={t('settings.cache.title')}>
+      <SectionCard
+        title={
+          <Typography.Text strong style={{ fontSize: fontSize.md }}>
+            {t('settings.cache.title')}
+          </Typography.Text>
+        }
+        extra={
+          <Space size={spacing.sm} align="center">
+            <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+              {t('settings.cache.headerUsage', {
+                used: formatBytes(cacheTotal.usedBytes),
+                limit: cacheTotal.limitBytes > 0 ? formatBytes(cacheTotal.limitBytes) : t('common.unlimited')
+              })}
+            </Typography.Text>
+            <UsageBar
+              percent={cacheTotal.percent}
+              label={cacheTotal.limitBytes > 0 ? undefined : t('common.unlimited')}
+              style={{ width: 140, marginTop: 0 }}
+            />
+          </Space>
+        }
+      >
         <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
           <Typography.Text type="secondary">{t('settings.cache.hint')}</Typography.Text>
           <div>
@@ -494,17 +538,36 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
             </Typography.Text>
             <InputNumber
               min={0}
-              max={CACHE_L2_MAX_MIB}
-              step={256}
-              addonAfter="MiB"
+              max={CACHE_L2_MAX_GIB}
+              step={1}
+              addonAfter="G"
               disabled={disabled || !config}
-              value={config ? bytesToMegabytes(config.cache_l2_bytes) : undefined}
+              value={config ? bytesToGigabytes(config.cache_l2_bytes) : undefined}
               onChange={(value) =>
-                patch({ cache_l2_bytes: megabytesToBytes(value) ?? config?.cache_l2_bytes ?? 0 })
+                patch({ cache_l2_bytes: gigabytesToBytes(value) ?? config?.cache_l2_bytes ?? 0 })
               }
             />
             <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
-              {t('settings.cache.l2Hint', { min: CACHE_L2_MIN_MIB })}
+              {t('settings.cache.l2Hint', { min: CACHE_L2_MIN_GIB })}
+            </Typography.Text>
+          </div>
+          <div>
+            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+              {t('settings.cache.total')}
+            </Typography.Text>
+            <InputNumber
+              min={0}
+              max={CACHE_TOTAL_MAX_GIB}
+              step={1}
+              addonAfter="G"
+              disabled={disabled || !config}
+              value={config ? bytesToGigabytes(config.cache_total_bytes) : undefined}
+              onChange={(value) =>
+                patch({ cache_total_bytes: gigabytesToBytes(value) ?? config?.cache_total_bytes ?? 0 })
+              }
+            />
+            <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+              {t('settings.cache.totalHint', { min: CACHE_L2_MIN_GIB })}
             </Typography.Text>
           </div>
           {cacheRecommend ? (
@@ -514,6 +577,7 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
                   {t('settings.cache.recommend', {
                     l1: formatBytes(cacheRecommend.l1_bytes),
                     l2: formatBytes(cacheRecommend.l2_bytes),
+                    total: formatBytes(cacheRecommend.l2_bytes * cacheRecommend.basis_repos)
                   })}
                 </Typography.Text>
                 <Button size="small" disabled={disabled || !config} onClick={applyCacheRecommend}>
@@ -560,9 +624,7 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
                 <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
                   {t('settings.cache.l2DirMedia')}
                 </Typography.Text>
-                <Tag color={l2MediaType === 'ssd' ? 'green' : 'orange'}>
-                  {l2MediaType === 'ssd' ? t('storage.media.ssd') : t('storage.media.hdd')}
-                </Tag>
+                <MediaTypeTag mediaType={l2MediaType} />
               </Space>
             ) : null}
             {l2MediaType === 'hdd' ? (
@@ -573,6 +635,17 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
                 style={{ marginTop: spacing.xs }}
               />
             ) : null}
+          </div>
+          <div>
+            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+              {t('settings.cache.manager')}
+            </Typography.Text>
+            <Button disabled={disabled} onClick={() => setCacheManagerOpen(true)}>
+              {t('settings.cache.managerOpen')}
+            </Button>
+            <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+              {t('settings.cache.managerHint')}
+            </Typography.Text>
           </div>
         </Space>
       </SectionCard>
@@ -588,16 +661,6 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
             }}
             options={LANGUAGES.map((value) => ({ value, label: LANGUAGE_LABELS[value] }))}
           />
-          <div>
-            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>{t('settings.updateChannel')}</Typography.Text>
-            <Input
-              value={config?.update_channel ?? ''}
-              disabled={disabled}
-              style={{ maxWidth: 220 }}
-              placeholder={t('settings.update.channelPlaceholder')}
-              onChange={(event) => patch({ update_channel: event.target.value })}
-            />
-          </div>
         </Space>
       </SectionCard>
 
@@ -760,6 +823,8 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
 
         </Space>
       </SectionCard>
+
+      <CacheManagementModal open={cacheManagerOpen} onClose={() => setCacheManagerOpen(false)} />
     </PageShell>
   )
 }
@@ -779,8 +844,8 @@ function isAbsoluteDir(value: string): boolean {
 /**
  * 校验缓存配置，返回**非法字段名**列表（空表示全部合法）。
  *
- * L1 必须落在 [min, max]；L2 允许 0（关闭），非零则必须不小于 CACHE_L2_MIN_MIB。
- * 判定用 MiB（界面录入单位），与用户看到的数字同一口径。
+ * L1 必须落在 [min, max]；L2 允许 0（关闭），非零则必须不小于 CACHE_L2_MIN_GIB。
+ * L1 用 MiB，L2 与本地合计上限用 G；判定与界面录入单位同一口径。
  * L2 目录留空 = 默认位置（合法）；填了就必须是绝对路径，否则代理侧会以
  * cache_l2_dir invalid_param 拒掉 —— 界面提前拦下，避免一个对不上的报错。
  */
@@ -788,8 +853,12 @@ function cacheBudgetViolations(config: AgentConfig): string[] {
   const fields: string[] = []
   const l1 = bytesToMegabytes(config.cache_l1_bytes) ?? 0
   if (l1 < CACHE_L1_MIN_MIB || l1 > CACHE_L1_MAX_MIB) fields.push('cache_l1_bytes')
-  const l2 = bytesToMegabytes(config.cache_l2_bytes) ?? 0
-  if (l2 < 0 || l2 > CACHE_L2_MAX_MIB || (l2 > 0 && l2 < CACHE_L2_MIN_MIB)) fields.push('cache_l2_bytes')
+  const l2 = bytesToGigabytes(config.cache_l2_bytes) ?? 0
+  if (l2 < 0 || l2 > CACHE_L2_MAX_GIB || (l2 > 0 && l2 < CACHE_L2_MIN_GIB)) fields.push('cache_l2_bytes')
+  const total = bytesToGigabytes(config.cache_total_bytes) ?? 0
+  if (total < 0 || total > CACHE_TOTAL_MAX_GIB || (total > 0 && total < CACHE_L2_MIN_GIB)) {
+    fields.push('cache_total_bytes')
+  }
   const dir = (config.cache_l2_dir ?? '').trim()
   if (dir !== '' && !isAbsoluteDir(dir)) fields.push('cache_l2_dir')
   return fields

@@ -7,6 +7,7 @@ import { ConfirmDialog } from '../../components/ConfirmDialog'
 import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
+import { MediaTypeTag } from '../../components/MediaTypeTag'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
 import { useApi } from '../../api/provider'
@@ -225,9 +226,7 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
       width: 90,
       render: (_value, storage) =>
         storage.media_type && storage.media_type !== 'unknown' ? (
-          <Tag color={storage.media_type === 'ssd' ? 'green' : 'orange'}>
-            {t(`storage.media.${storage.media_type}`)}
-          </Tag>
+          <MediaTypeTag mediaType={storage.media_type} />
         ) : (
           '-'
         )

@@ -2,7 +2,7 @@ import type { CSSProperties } from 'react'
 import { Progress } from 'antd'
 import { LoadingOutlined } from '@ant-design/icons'
 
-import { fontSize, palette, spacing } from '../tokens/palette'
+import { fontSize, palette } from '../tokens/palette'
 
 /** 叠在条正中的那一层（百分数或转圈）：靠 inset: 0 与条严丝合缝，且不吃鼠标事件。 */
 const overlayStyle: CSSProperties = {
@@ -67,10 +67,10 @@ export interface UsageBarProps {
    */
   color?: string
   /**
-   * 条厚度，默认 16（刚好容得下内嵌的百分数）。
+   * 条厚度，默认 12（刚好容得下内嵌的百分数）。
    *
    * 悬浮明细里用 6：那里每行右边已经写着「已用 / 上限」，条只当比例尺用，
-   * 16px 的厚条 + 条内百分数会让气泡又高又挤（真实反馈："hover 里的不要那么大"）。
+   * 12px 的厚条 + 条内百分数会让气泡又高又挤（真实反馈："hover 里的不要那么大"）。
    */
   height?: number
   /**
@@ -79,6 +79,12 @@ export interface UsageBarProps {
    * 关掉的前提是**数值已经在行内写清楚了**（悬浮明细就是这种），否则条上就没数了。
    */
   showPercent?: boolean
+  /**
+   * 覆盖条正中的文字（不传则显示 `xx%`）。
+   *
+   * 用于"本地缓存无上限"这类没有百分比可算的场景：条仍要画出来，但中间写「无限」。
+   */
+  label?: string
   style?: CSSProperties
 }
 
@@ -96,7 +102,7 @@ export interface UsageBarProps {
  *
  * 两处"看起来多余"的写法都是在压 antd 的 inline-block 行盒：
  *   - 外层 lineHeight: 0、Progress 的 fontSize/lineHeight: 0 —— 行盒的基线间隙会让外层比
- *     条本身高出一截，居中的字就会整体偏低；压掉之后外层高度 = 条的高度（16px）。
+ *     条本身高出一截，居中的字就会整体偏低；压掉之后外层高度 = 条的高度（默认 12px）。
  *   - 于是叠层的 inset: 0 与条**严丝合缝**，字落在条的正中心。
  *
  * 字用「按进度分色」的渐变裁切：压在实心段上的部分取白字、压在浅灰底纹上的部分取深灰字
@@ -114,8 +120,9 @@ export function UsageBar({
   muted = false,
   loading = false,
   color,
-  height = 16,
+  height = 12,
   showPercent = true,
+  label,
   style
 }: UsageBarProps): JSX.Element {
   // 取数中与置灰一样：不填、不写数 —— 这一刻没有数字可填，填 0 或写 "0%" 都会被读成
@@ -124,8 +131,9 @@ export function UsageBar({
   const clamped = blank ? 0 : Math.min(100, Math.max(0, Math.round(percent)))
   // 空条的颜色给轨道色：不留"该是什么档"的悬念，也不必让分档函数去操心一个没画出来的颜色。
   const strokeColor = blank ? palette.neutralFill : (color ?? usageColor(clamped))
+  const labelSize = height >= 14 ? fontSize.xs : Math.max(9, height - 2)
   return (
-    <div style={{ position: 'relative', lineHeight: 0, marginTop: spacing.xxs, ...style }}>
+    <div style={{ position: 'relative', lineHeight: 0, marginTop: 2, ...style }}>
       {/* size 只给 height：line 形态下传单个数字是"宽高都设成它"（条会变成方块），
           传对象才是"只改粗细"，正好 = 条的厚度。 */}
       <Progress
@@ -146,7 +154,7 @@ export function UsageBar({
         <span
           style={{
             ...overlayStyle,
-            fontSize: fontSize.xs,
+            fontSize: labelSize,
             fontWeight: 600,
             backgroundImage: `linear-gradient(90deg, ${palette.textInverse} 0 ${clamped}%, ${palette.textSecondary} ${clamped}% 100%)`,
             WebkitBackgroundClip: 'text',
@@ -154,7 +162,7 @@ export function UsageBar({
             color: 'transparent'
           }}
         >
-          {`${clamped}%`}
+          {label ?? `${clamped}%`}
         </span>
       )}
     </div>

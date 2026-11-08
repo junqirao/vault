@@ -2609,6 +2609,7 @@ PUT    /v1/repos/{id}/members             覆盖式设置（仅 owner）
 
 # 分配
 POST   /v1/repos/{id}/allocations         分配给用户（建差异盘或独享映射）
+POST   /v1/repos/{id}/reset-diff          重置当前用户差异盘：立即返回新分配，旧盘后台销毁
 GET    /v1/repos/{id}/allocations
 DELETE /v1/allocations/{id}
 

@@ -322,6 +322,11 @@ export class VaultApi extends ApiClient {
     return this.request<AllocationDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/allocations`, { user_id: userId })
   }
 
+  /** 重置当前用户的差异盘：服务端立即返回新分配，旧盘后台销毁。 */
+  resetRepoDiff(id: string): Promise<AllocationDTO> {
+    return this.request<AllocationDTO>('POST', `/v1/repos/${encodeURIComponent(id)}/reset-diff`)
+  }
+
   /**
    * 母盘用途迁移。
    *

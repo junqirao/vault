@@ -274,6 +274,7 @@ export const demoCache = {
   addr: '127.0.0.1:49152',
   l1_limit_bytes: 512 * MB,
   l2_limit_bytes: 4 * GB,
+  local_limit_bytes: 40 * GB,
   enabled_repos: demoMounts.length,
   known_repo_bytes: demoRepos.reduce((sum, item) => sum + item.capacity_bytes, 0),
   known_repos: demoRepos.length,
@@ -283,7 +284,19 @@ export const demoCache = {
     basis_bytes: demoRepos.reduce((sum, item) => sum + item.capacity_bytes, 0),
     basis_repos: demoRepos.length
   },
-  targets: demoCacheTargets
+  disk_l1_bytes: 0,
+  disk_l2_bytes: demoCacheTargets.reduce((sum, item) => sum + item.l2_used_bytes, 0),
+  targets: demoCacheTargets,
+  files: demoRepos
+    .filter((item) => item._mounted)
+    .map((item) => ({
+      key: item.id,
+      active: true,
+      allocation_id: `alloc-${item.id}`,
+      l1_bytes: 0,
+      l2_bytes: Math.round(item._cacheGB * 0.82 * GB),
+      l2_index_bytes: 0
+    }))
 }
 
 export const demoPerformance = (() => {
@@ -390,7 +403,7 @@ export const demoAgentState = {
     checked_at: NOW - 6 * 1000
   },
   update: {
-    channel: 'beta',
+    channel: 'stable',
     current_version: '0.2.0',
     downloading: false,
     received_bytes: 0,
@@ -432,12 +445,13 @@ export const demoAgentConfig = {
   shortcut_dir: '',
   language: 'zh-CN',
   start_at_login: true,
-  update_channel: 'beta',
+  update_channel: 'stable',
   server_alias: 'WIN-E095H11JSS',
   auto_login: true,
   auto_update: true,
   cache_l1_bytes: 512 * MB,
   cache_l2_bytes: 4 * GB,
+  cache_total_bytes: 40 * GB,
   cache_l2_dir: '',
   repo_mounts: {},
   group_mounts: {}

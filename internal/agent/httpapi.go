@@ -611,11 +611,13 @@ func (a *Agent) handlePerformanceEvents(w http.ResponseWriter, r *http.Request) 
 	}
 }
 
-// cacheClearRequest 是清空缓存的入参：给 repo_id（界面手里只有库 ID）或
-// allocation_id，至少一个。
+// cacheClearRequest 是清空缓存的入参：给 repo_id（界面手里只有库 ID）、
+// allocation_id，或 all=true（管理弹窗的"全部清除"）。
 type cacheClearRequest struct {
 	RepoID       string `json:"repo_id"`
 	AllocationID string `json:"allocation_id"`
+	// All 清空所有活动目标与所有已落盘缓存（含未挂载的预热文件）。
+	All bool `json:"all"`
 }
 
 // cacheClearResponse 汇报**实际**清掉的目标：目标按分配注册，一个库可能同时有多个
@@ -628,20 +630,39 @@ type cacheClearResponse struct {
 
 // handleCacheClear 清空指定存储库的本地读缓存内容（L1 与 L2 两级，见 cacheproxy.go）。
 //
-// 缓存目标按分配注册，而界面手里只有库 ID，所以这里先把库映射到本次挂载的分配。库当前
-// 没有挂载记录时没有目标可清，直接回 cleared=false，不当作请求错误。
+// 支持三种入参：
+//   - allocation_id：当前分配的活动目标；
+//   - repo_id：库 ID。会清掉该库当前挂载目标的缓存，并删除按库键保留的预热文件
+//     （退出客户端/卸载后仍在盘上的 L2）；
+//   - all=true：管理弹窗的"全部清除"。
+//
+// 库当前没有挂载记录时不再直接当作错误：新版缓存按库键保留，可能只有落盘文件、
+// 没有活动目标；这时删文件同样算"清掉了"。
 func (a *Agent) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 	var req cacheClearRequest
 	if err := decodeJSON(r, &req); err != nil {
 		a.writeError(w, err)
 		return
 	}
+	if req.All {
+		allocs, removedFiles := a.cache.ClearAll()
+		a.writeJSON(w, http.StatusOK, cacheClearResponse{
+			Cleared:       len(allocs) > 0 || removedFiles,
+			AllocationIDs: allocs,
+		})
+		return
+	}
+
 	allocs := make([]string, 0, 1)
+	key := ""
 	switch {
 	case strings.TrimSpace(req.AllocationID) != "":
-		allocs = append(allocs, strings.TrimSpace(req.AllocationID))
+		allocID := strings.TrimSpace(req.AllocationID)
+		allocs = append(allocs, allocID)
+		key = allocID
 	case strings.TrimSpace(req.RepoID) != "":
 		repoID := strings.TrimSpace(req.RepoID)
+		key = repoID
 		for _, ms := range a.store.ListMounts() {
 			if ms.RepoID == repoID && strings.TrimSpace(ms.AllocationID) != "" {
 				allocs = append(allocs, strings.TrimSpace(ms.AllocationID))
@@ -657,8 +678,22 @@ func (a *Agent) handleCacheClear(w http.ResponseWriter, r *http.Request) {
 			cleared = append(cleared, id)
 		}
 	}
+	// 同时删除已落盘文件：按库键（新命名）和按分配 ID（旧命名）都试一遍，
+	// 避免升级前留下的文件在"清缓存"后还占着几十 GiB。
+	removedFiles := false
+	if key != "" {
+		removedFiles = a.cache.RemoveCacheFiles(key)
+	}
+	for _, id := range allocs {
+		if id == key {
+			continue
+		}
+		if a.cache.RemoveCacheFiles(id) {
+			removedFiles = true
+		}
+	}
 	a.writeJSON(w, http.StatusOK, cacheClearResponse{
-		Cleared:       len(cleared) > 0,
+		Cleared:       len(cleared) > 0 || removedFiles,
 		AllocationIDs: cleared,
 	})
 }

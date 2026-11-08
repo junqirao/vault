@@ -451,6 +451,9 @@ export interface AgentConfig {
   shortcut_dir: string
   language: string
   start_at_login: boolean
+  /**
+   * 更新通道，**只读**：设置页不再展示，PATCH 也不接受；默认 stable。
+   */
   update_channel: string
   server_alias: string
   /** 是否用本地客户端证书免密登录（identity.json 存在时生效）。 */
@@ -477,6 +480,13 @@ export interface AgentConfig {
    * 该配多大可以看 GET /agent/cache 的 `recommend.l2_bytes`（按平均库容量估算）。
    */
   cache_l2_bytes: number
+  /**
+   * 所有库 L2 缓存文件的**合计上限**（字节），0 表示不额外限制。
+   *
+   * 每库 L2 上限只约束单个库，开 N 个库时目录可能涨到 N × cache_l2_bytes；
+   * 这个上限把最终磁盘规模再封一次（按开缓存的库数均分到每库配额）。
+   */
+  cache_total_bytes: number
   /**
    * L2 缓存文件的存放目录（客户端设置里可改）。
    *
@@ -575,6 +585,16 @@ export interface AgentCacheStatus {
   l1_limit_bytes: number
   /** L2 每库上限（不做分摊；0 表示关闭 L2）。 */
   l2_limit_bytes: number
+  /** 所有库 L2 缓存文件的合计上限（0 表示不额外限制）。 */
+  local_limit_bytes: number
+  /**
+   * 缓存目录里 L2/L1 **数据文件**的实际合计（含退出/卸载后按库键保留的预热缓存）。
+   *
+   * 它是"设置 40 GiB、目录却有一百多 GiB"或"目录里有文件但列表为空"的解释读数：
+   * 列表只统计当前挂载目标的实时用量，磁盘上的保留文件要等用户清除或回收才消失。
+   */
+  disk_l2_bytes: number
+  disk_l1_bytes: number
   /** 已启用缓存的库数（分摊集合的规模）。 */
   enabled_repos: number
   /** 本机已知容量的库合计（字节），分摊与推荐值都按它算。 */
@@ -584,8 +604,28 @@ export interface AgentCacheStatus {
   /** 按已知库容量估算的推荐预算，界面显示在两个配置项后面。 */
   recommend: AgentCacheRecommend
   targets: AgentCacheTargetStatus[]
+  /**
+   * 缓存目录里的**文件级**快照，包含已卸载/退出客户端后仍保留的预热缓存。
+   *
+   * `targets` 只覆盖当前挂载的库；管理弹窗要靠 `files` 才能看到并清除那些
+   * “没有活动目标、但文件还在盘上”的缓存。
+   */
+  files: AgentCacheFile[]
   /** 最近一次打开门户失败的原因（如端口被占用）；正常时为空。 */
   error?: string
+}
+
+/** 缓存目录里一个稳定键（新版为存储库 ID，旧版遗留为分配 ID）的文件占用。 */
+export interface AgentCacheFile {
+  key: string
+  /** 本进程门户里是否还有这个键的缓存目标（正在使用）。 */
+  active: boolean
+  /** Active 时对应的挂载分配，便于排障。 */
+  allocation_id?: string
+  l1_bytes: number
+  l2_bytes: number
+  /** L2 索引文件的占用（新版把索引拆到了独立的 .idx）。 */
+  l2_index_bytes: number
 }
 
 /**

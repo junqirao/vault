@@ -161,6 +161,18 @@ export function megabytesToBytes(megabytes: number | undefined | null): number |
   return Math.round(megabytes * 1024 * 1024)
 }
 
+/** 字节 → GB（1024 进制，保留 2 位小数；用于表单回填）。 */
+export function bytesToGigabytes(bytes: number | undefined | null): number | undefined {
+  if (bytes === undefined || bytes === null || Number.isNaN(bytes)) return undefined
+  return Math.round((bytes / (1024 * 1024 * 1024)) * 100) / 100
+}
+
+/** GB → 字节（四舍五入到整数；用于表单提交）。 */
+export function gigabytesToBytes(gigabytes: number | undefined | null): number | undefined {
+  if (gigabytes === undefined || gigabytes === null || Number.isNaN(gigabytes)) return undefined
+  return Math.round(gigabytes * 1024 * 1024 * 1024)
+}
+
 /**
  * antd Form.Item 的容量字段配套属性。
  *

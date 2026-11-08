@@ -1,15 +1,17 @@
-import { ArrowLeftOutlined, RightOutlined } from '@ant-design/icons'
-import { Button, Card, Col, Progress, Row, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
+import { ArrowLeftOutlined } from '@ant-design/icons'
+import { Button, Card, Col, Row, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
 import { useQuery } from '@tanstack/react-query'
 
 import { EmptyState } from '../../components/EmptyState'
+import { MediaTypeTag } from '../../components/MediaTypeTag'
 import { PageShell } from '../../components/PageShell'
-import { usageColor } from '../../components/UsageBar'
+import { SectionTitleLink } from '../../components/SectionTitleLink'
+import { UsageBar } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { StorageDTO } from '../../api/types'
 import { usePermission } from '../../hooks/useAuth'
 import { useI18n } from '../../i18n'
-import { fontSize, palette, spacing } from '../../tokens/palette'
+import { fontSize, spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
 
 /** 存储用量的统一口径：有底层卷时看"已用 / 分配容量"，目录模式看"卷已用 / 卷容量"。 */
@@ -81,26 +83,18 @@ function StorageUsageTile({ storage }: { storage: StorageDTO }): JSX.Element {
           {!storage.enabled ? <Tag>{t('storage.usage.disabled')}</Tag> : null}
           <Tag>{t(`storage.kind.${storage.kind || 'dir'}`)}</Tag>
           {storage.media_type && storage.media_type !== 'unknown' ? (
-            <Tag color={storage.media_type === 'ssd' ? 'green' : 'orange'}>
-              {t(`storage.media.${storage.media_type}`)}
-            </Tag>
+            <MediaTypeTag mediaType={storage.media_type} />
           ) : null}
         </Space>
         <Typography.Text
           type="secondary"
           style={{ fontSize: fontSize.sm, fontVariantNumeric: 'tabular-nums' }}
         >
-          {`${formatBytes(used)} / ${formatBytes(total)} · ${Math.round(percent)}%`}
+          {`${formatBytes(used)} / ${formatBytes(total)}`}
         </Typography.Text>
       </div>
-      <Progress
-        percent={Math.round(percent)}
-        showInfo={false}
-        size="small"
-        strokeColor={usageColor(percent)}
-        trailColor={palette.neutralFill}
-        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-      />
+      {/* 与存储库详情同一条用量条：16px 厚、百分数叠在条正中，而不是 antd small 的细条。 */}
+      <UsageBar percent={percent} />
       <Typography.Text
         type="secondary"
         ellipsis={{ tooltip: storage.path }}
@@ -137,7 +131,6 @@ export function StorageUsageCard({
   })
   const storages = storagesQuery.data?.items ?? []
   const aggregate = aggregateStorageUsage(storages)
-  const percent = Math.round(aggregate.percent)
 
   const content = storagesQuery.isLoading ? (
     <Skeleton active title={false} paragraph={{ rows: 2 }} />
@@ -149,40 +142,21 @@ export function StorageUsageCard({
     <>
       <div style={{ display: 'flex', alignItems: 'baseline', gap: spacing.xs, flexWrap: 'wrap' }}>
         {/*
-          入口就是「存储 →」这一颗按钮：箭头用 Button 自带的 icon + iconPosition="end"，
-          不手写 span/SVG —— 手写的话箭头和文字各自占一行内位置，字号、行高、间距全要自己
-          调，结果就是箭头离标题很远、基线也对不齐（真实反馈："这个按钮要对齐，不要离太远"）。
-          paddingInline: 0 保证标题左边缘与下面「我的配额」标题对齐（两张卡上下叠在同一模块里）。
+          入口统一用 SectionTitleLink（文字 + 居中右箭头 + paddingInline: 0），保证与
+          下面「我的配额」「本地缓存」「性能」的标题左边缘和字号完全一致。
         */}
         <Tooltip title={t('storage.usage.detail')}>
-          <Button
-            type="text"
-            size="small"
-            aria-label={t('storage.usage.detail')}
-            icon={<RightOutlined style={{ fontSize: 10 }} />}
-            iconPosition="end"
-            onClick={onOpen}
-            style={{ paddingInline: 0, height: 'auto', fontWeight: 600 }}
-          >
+          <SectionTitleLink title={t('storage.usage.detail')} onClick={onOpen}>
             {t('storage.title')}
-          </Button>
+          </SectionTitleLink>
         </Tooltip>
         <Typography.Text style={{ marginLeft: 'auto', fontSize: fontSize.sm }}>
           {`${t('storage.usage.used')} ${formatBytes(aggregate.used)} / ${formatBytes(aggregate.total)}`}
         </Typography.Text>
-        <Typography.Text strong style={{ fontSize: fontSize.sm }}>
-          {`${percent}%`}
-        </Typography.Text>
       </div>
-      <Progress
-        percent={percent}
-        showInfo={false}
-        size="small"
-        strokeColor={usageColor(aggregate.percent)}
-        trailColor={palette.neutralFill}
-        style={{ marginTop: spacing.xxs, marginBottom: 0 }}
-      />
-      <Space size={spacing.md} wrap style={{ marginTop: spacing.sm }}>
+      {/* 与存储库卡片同一条用量条（UsageBar）：百分数叠在条正中，颜色按占比分档。 */}
+      <UsageBar percent={aggregate.percent} />
+      <Space size={spacing.md} wrap style={{ marginTop: spacing.xxs }}>
         <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
           {t('storage.usage.remaining')} {formatBytes(Math.max(0, aggregate.total - aggregate.used))}
         </Typography.Text>

@@ -455,11 +455,21 @@ CacheStatus = {
   running:bool,                 # 门户是否已打开（**懒启动**：首个库启用缓存时创建）
   addr,                         # 门户监听地址（running 时有值），如 "127.0.0.1:3261"
   l1_limit_bytes, l2_limit_bytes,   # L1 全局上限 / L2 每库上限（L2 为 0 表示关闭 L2）
+  local_limit_bytes,                # 所有库 L2 合计上限（0 = 不额外限制）
+  disk_l2_bytes, disk_l1_bytes,     # 缓存目录里 L2/L1 数据文件的实际合计（含保留的旧文件）
   enabled_repos:int,            # 已启用缓存的库数（配额分摊集合的规模）
   known_repo_bytes, known_repos,    # 本机**已知容量**的库合计与个数（分摊与推荐值的依据）
   recommend:CacheRecommend,     # 按已知库容量估算的推荐预算（设置页显示在配置项后面）
   targets:[CacheTargetStatus...],   # 按库（分配）汇总的用量与命中情况
+  files:[CacheFileStatus...],   # 缓存目录里的文件级快照（含未挂载、但仍保留的预热缓存）
   error                         # 可选：最近一次打开门户失败的原因（如端口被占用）
+}
+
+CacheFileStatus = {
+  key,                          # 文件名里的稳定键：新版是库 ID（RepoID），旧版遗留为分配 ID
+  active:bool,                  # 本进程门户里是否还有这个键的缓存目标
+  allocation_id,                # active 时对应的挂载分配（排障用）
+  l1_bytes, l2_bytes, l2_index_bytes   # L1 快照 / L2 数据 / L2 索引的实际文件大小
 }
 
 CacheRecommend = {              # 逐库分到多少没有单一数字，看 targets[].*_limit_bytes
@@ -504,8 +514,12 @@ CacheTargetStatus = {
 - **懒启动**：没有任何库启用缓存时不开门户；第一个库启用并挂载时才创建监听。
 - **回退直连**：门户建不起来（如 3261 被占用）时，库照常挂载，只是回退直连服务端目标，
   原因记在该库挂载状态的 `cache_error` 里。
-- **卸载即回收**：卸载时先断会话再注销该库在门户上的目标并回收其 L2 文件（顺序不能反，
-  否则仍在飞的命令会失败）。
+- **卸载/退出后保留**：缓存文件按**稳定库键（RepoID）**命名，而不是每次挂载都会变的分配 ID；
+  卸载或正常退出客户端后 L1 快照 / L2 数据与索引都会留在 `cache_l2_dir`，下次挂载同一个库
+  直接复用（L2 的 Namespace 仍绑定后端盘指纹，换盘后自动作废）。用户可以在客户端设置里
+  打开「缓存管理」查看并清除这些缓存；`files[]` 同时覆盖未挂载的保留文件。
+  自动清理**只删除没有同名 `.bin` 的孤立 `.idx`**，任何 L1/L2 `.bin` 都不会被自动删除；
+  数据文件只在用户点「清除」/「全部清除」时删除。
 
 ```
 GET /agent/performance            # 我的存储库首页「性能指标」
@@ -533,16 +547,15 @@ GET /agent/performance/events       # 性能页专用 SSE（页面挂载才连�
 ```
 
 ```
-POST /agent/cache/clear            # 存储库设置里的"清空缓存"
-  ↓ {repo_id} | {allocation_id}    # 二者其一；都省略 → 400 system.invalid_param
+POST /agent/cache/clear            # 存储库设置 / 客户端「缓存管理」
+  ↓ {repo_id} | {allocation_id} | {all:true}   # 省略/都空 → 400 system.invalid_param
   ↑ {cleared:bool, allocation_ids:[string]}
   # 清的是**缓存内容**（L1 内存缓存 + L2 文件两级一起丢），不是关缓存：
   # 门户监听、门户上的目标、iSCSI 会话与挂载都留着，后续读命令照常走缓存路径重新填充。
   # 已在飞的填充因分配号（epoch）被顶掉而作废，不会把旧数据写回新缓存（见 cache.Drop）。
-  # repo_id 与 allocation_id 只认本机**挂载记录**：界面手里只有库 ID，代理先经
-  #   ListMounts() 映射到该库本次挂载的分配；没挂载就没有缓存目标（直连，缓存压根不存在）
-  #   → cleared=false，**不是**错误（200）。库 ID 未知也一样是 200 + cleared=false：
-  #   没有缓存可清不该报错。
+  # repo_id 与 allocation_id 会先经本机挂载记录映射到活动目标；同时尝试删除按库键/分配键
+  # 落盘的 L1/L2 文件（未挂载但保留的预热缓存也可清）。all:true 清空所有活动目标与所有落盘文件。
+  # 没有活动目标、也没有落盘文件时 cleared=false，**不是**错误（200）。
   # allocation_ids 列出实际清掉的分配（一个库正常只有一条），便于界面确认与日志溯源。
 ```
 
@@ -824,14 +837,14 @@ UploadState = {
 GET   /agent/config
   ↑ {auto_mount:bool, default_mount_mode, default_mount_dir, default_download_dir, shortcut_dir,
      download_connections, language, start_at_login:bool, update_channel, server_alias,
-     cache_l1_bytes:int, cache_l2_bytes:int, cache_l2_dir:string,
+     cache_l1_bytes:int, cache_l2_bytes:int, cache_total_bytes:int, cache_l2_dir:string,
      repo_mounts:{<repo_id>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool,
                              direct_mode:bool, shortcut_enabled:bool}},
      group_mounts:{<group>:{mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool,
                             direct_mode:bool, shortcut_enabled:bool,
                             use_for_repos:bool, use_repos:[<repo_id>]}}}
 PATCH /agent/config
-  ↓ 上述字段的任意子集（不含 repo_mounts / group_mounts / default_mount_mode / default_mount_dir）
+  ↓ 上述字段的任意子集（不含 repo_mounts / group_mounts / default_mount_mode / default_mount_dir / update_channel）
   ↑ {config:{...}}
 POST  /agent/repo-mounts/{repo_id}
   ↓ {mount_mode, mount_dir, auto_mount:bool, cache_enabled:bool, direct_mode:bool,
@@ -931,6 +944,10 @@ POST  /agent/group-mounts
 - **取值范围**：L1 必须落在 `[64MiB, 64GiB]`；L2 允许 **0（= 关闭 L2，只做内存缓存）**，
   非 0 时必须落在 `[256MiB, 1TiB]`。越界时 PATCH 返回 `system.invalid_param`
   （args.field=`cache_l1_bytes` / `cache_l2_bytes`），界面在提交前就按同一口径拦下。
+- `cache_total_bytes` 是**所有库 L2 合计上限**（0 = 不额外限制，正数范围 `[256MiB, 4TiB]`）。
+  设置后每个库分到的 L2 配额不超过 `cache_total_bytes / 开缓存库数`，再与每库上限、库容量
+  取小；分到低于 256MiB 时该库直接关闭 L2（避免半残缓存）。它只控制最终磁盘规模，
+  不参与 L1 分摊，也不影响 L1。配额同样在挂载时定下，调小后要等各库重新挂载才完全收敛。
 
 **进程 RSS 与这个上限的关系**：存活堆实测是 L1 账本的 1.3~1.8 倍（块数据之外还有每个 entry
 的头、map 桶、FIFO 队列槽位，以及读缓冲/上传缓冲等 `sync.Pool` 的高水位），而 Go 默认

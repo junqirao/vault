@@ -238,18 +238,8 @@ func New(opt Options) (*Agent, error) {
 		a.hub.Publish(Event{Type: localManifestEventType, Data: st})
 	}
 	a.cache = newCacheManager(cfg, logger)
-	// 缓存文件按分配 ID 命名，回收时要能分清"还有挂载记录的分配"和"库早删掉留下的
-	// 旧文件"。以状态里的挂载记录为准：重启后、自动挂载前记录还在，预热缓存不会被删。
-	a.cache.liveAllocations = func() map[string]struct{} {
-		mounts := a.store.ListMounts()
-		out := make(map[string]struct{}, len(mounts))
-		for i := range mounts {
-			if id := strings.TrimSpace(mounts[i].AllocationID); id != "" {
-				out[id] = struct{}{}
-			}
-		}
-		return out
-	}
+	// 说明：L1/L2 数据文件现在只会在用户主动"清除缓存"时删除，启动/挂载/卸载都不会
+	// 自动删 .bin。启动时的 collectCacheFiles 只清理没有数据文件对应的孤立 .idx。
 	// 本机挂载卷用量：按挂载点量卷空间（Windows 走 Get-Volume，见 volume.Manager.SpaceUsageOf）。
 	a.usage = newVolumeUsageCache(state.ListMounts, a.vol.SpaceUsageOf)
 	// 把上次退出时没传完的上传摆回列表（一律暂停态，等用户按「继续」）：不摆的话，
@@ -328,9 +318,8 @@ func (a *Agent) Start(ctx context.Context) (string, error) {
 	// 但一旦打开，它必须活到进程退出 —— 用挂载请求的 ctx 会让门户在挂载返回后立刻死掉。
 	a.cache.Start(a.baseCtx)
 
-	// 开服顺手回收无主缓存文件（库已删、分配换新之后留下的 l2-/l1- 文件）。
-	// 判定以挂载记录为准（liveAllocations）：门户此时还没打开，但"重启后要恢复的
-	// 挂载"记录都在，对应的缓存文件不会被误删，所以这里可以无条件执行。
+	// 开服顺手清理孤立缓存索引（没有对应 .bin 的 .idx）。数据文件本身不在这里删：
+	// L2 要跨退出/卸载保留，只有用户主动清缓存才会删除 .bin。
 	a.wg.Add(1)
 	safeGo(a.logger, "cache_gc", func() {
 		defer a.wg.Done()
