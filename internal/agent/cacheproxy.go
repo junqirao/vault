@@ -1000,12 +1000,24 @@ func (m *cacheManager) releaseQuota(allocationID string) {
 	m.quotaMu.Unlock()
 }
 
+// cacheFileUsedSize 返回缓存文件实际占用的磁盘空间。
+//
+// L2 文件是稀疏文件：逻辑大小可能等于整个预算（几十 GiB），但只写了少量槽位。
+// 展示"占了多少"必须用实际分配大小；取不到时退回逻辑大小，至少不显示 0。
+func cacheFileUsedSize(path string, info os.FileInfo) int64 {
+	if size, err := fileAllocatedSize(path); err == nil && size >= 0 {
+		return size
+	}
+	return info.Size()
+}
+
 // cacheDirUsage 统计缓存目录里 L2/L1 文件的实际合计（目录不存在时为 0）。
 func (m *cacheManager) cacheDirUsage() (l2, l1 int64) {
 	if m == nil {
 		return 0, 0
 	}
-	entries, err := os.ReadDir(cacheStorageDir(m.cfg.Get().CacheL2Dir))
+	dir := cacheStorageDir(m.cfg.Get().CacheL2Dir)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, 0
 	}
@@ -1018,11 +1030,12 @@ func (m *cacheManager) cacheDirUsage() (l2, l1 int64) {
 		if err != nil {
 			continue
 		}
+		size := cacheFileUsedSize(filepath.Join(dir, name), info)
 		switch {
 		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".bin"):
-			l2 += info.Size()
+			l2 += size
 		case strings.HasPrefix(name, "l1-") && strings.HasSuffix(name, ".bin"):
-			l1 += info.Size()
+			l1 += size
 		}
 	}
 	return l2, l1
@@ -1051,18 +1064,20 @@ func (m *cacheManager) cacheFiles() []CacheFileStatus {
 			continue
 		}
 		name := e.Name()
+		size := cacheFileUsedSize(filepath.Join(dir, name), info)
+		lastUsed := info.ModTime().UnixNano()
 		var key string
 		var apply func(*CacheFileStatus)
 		switch {
 		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".bin"):
 			key = strings.TrimSuffix(strings.TrimPrefix(name, "l2-"), ".bin")
-			apply = func(st *CacheFileStatus) { st.L2Bytes += info.Size() }
+			apply = func(st *CacheFileStatus) { st.L2Bytes += size }
 		case strings.HasPrefix(name, "l2-") && strings.HasSuffix(name, ".idx"):
 			key = strings.TrimSuffix(strings.TrimPrefix(name, "l2-"), ".idx")
-			apply = func(st *CacheFileStatus) { st.L2IndexBytes += info.Size() }
+			apply = func(st *CacheFileStatus) { st.L2IndexBytes += size }
 		case strings.HasPrefix(name, "l1-") && strings.HasSuffix(name, ".bin"):
 			key = strings.TrimSuffix(strings.TrimPrefix(name, "l1-"), ".bin")
-			apply = func(st *CacheFileStatus) { st.L1Bytes += info.Size() }
+			apply = func(st *CacheFileStatus) { st.L1Bytes += size }
 		default:
 			continue
 		}
@@ -1073,6 +1088,9 @@ func (m *cacheManager) cacheFiles() []CacheFileStatus {
 		if st == nil {
 			st = &CacheFileStatus{Key: key}
 			byKey[key] = st
+		}
+		if lastUsed > st.LastUsed {
+			st.LastUsed = lastUsed
 		}
 		apply(st)
 	}
@@ -1094,6 +1112,72 @@ func (m *cacheManager) cacheFiles() []CacheFileStatus {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Key < out[j].Key })
 	return out
+}
+
+// EnforceCacheBudget 在「本地缓存上限」被调小、或卸载后出现新的保留文件时，
+// 按最后写入时间从旧到新淘汰**未挂载**的 L2 缓存，直到实际占用回到上限以内。
+//
+// 正在挂载的目标不能删文件；它们由各自的 L2 文件内部淘汰策略控制，
+// 这里只负责跨库的磁盘总预算。
+func (m *cacheManager) EnforceCacheBudget() {
+	if m == nil {
+		return
+	}
+	m.gcMu.Lock()
+	defer m.gcMu.Unlock()
+	m.enforceCacheBudgetLocked()
+}
+
+func (m *cacheManager) enforceCacheBudgetLocked() {
+	if m == nil {
+		return
+	}
+	limit := m.cfg.Get().CacheTotalBytes
+	if limit <= 0 {
+		return
+	}
+	files := m.cacheFiles()
+	var total int64
+	for _, f := range files {
+		total += f.L2Bytes
+	}
+	if total <= limit {
+		return
+	}
+
+	candidates := make([]CacheFileStatus, 0, len(files))
+	for _, f := range files {
+		if f.Active || f.L2Bytes <= 0 {
+			continue
+		}
+		candidates = append(candidates, f)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].LastUsed != candidates[j].LastUsed {
+			return candidates[i].LastUsed < candidates[j].LastUsed
+		}
+		return candidates[i].Key < candidates[j].Key
+	})
+
+	removed := 0
+	for _, f := range candidates {
+		if total <= limit {
+			break
+		}
+		if !m.RemoveCacheFiles(f.Key) {
+			continue
+		}
+		total -= f.L2Bytes
+		removed++
+	}
+	if removed > 0 {
+		m.logger.Info("本地缓存超过合计上限，已淘汰最旧的未挂载缓存",
+			"removed", removed, "remaining_bytes", total, "limit_bytes", limit)
+	}
+	if total > limit {
+		m.logger.Warn("本地缓存仍超过合计上限（剩余文件都在挂载中或无法删除）",
+			"remaining_bytes", total, "limit_bytes", limit)
+	}
 }
 
 // RemoveCacheFiles 删除某个稳定键对应的全部缓存文件（L1 快照、L2 数据与索引）。
@@ -1217,6 +1301,9 @@ func (m *cacheManager) collectCacheFiles() {
 	if removed > 0 {
 		m.logger.Info("已清理孤立缓存索引", "count", removed, "dir", dir)
 	}
+	// 空闲/退出后保留的 L2 文件也要受「本地缓存上限」约束：
+	// 超出时按最后写入时间淘汰最旧的未挂载缓存。
+	m.enforceCacheBudgetLocked()
 }
 
 // cacheRepoSize 是一个参与配额分摊的库。
@@ -1483,6 +1570,8 @@ type CacheFileStatus struct {
 	L1Bytes      int64  `json:"l1_bytes"`
 	L2Bytes      int64  `json:"l2_bytes"`
 	L2IndexBytes int64  `json:"l2_index_bytes"`
+	// LastUsed 是文件最近一次写入的时间（Unix 纳秒）；预算淘汰按它从旧到新清理。
+	LastUsed int64 `json:"last_used"`
 }
 
 // CacheTargetStatus 是单个库的缓存用量与命中情况。

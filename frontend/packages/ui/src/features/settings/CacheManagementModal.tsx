@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Input, Modal, Popconfirm, Space, Tag, Typography, message } from 'antd'
+import { Button, Input, Modal, Popconfirm, Space, Typography, message } from 'antd'
 import { SearchOutlined } from '@ant-design/icons'
 import { useQuery } from '@tanstack/react-query'
 
@@ -24,7 +24,6 @@ interface CacheManageRow {
   key: string
   repoId: string
   repoName: string
-  mounted: boolean
   target?: AgentCacheTargetStatus
   file?: AgentCacheFile
 }
@@ -87,7 +86,6 @@ export function CacheManagementModal({ open, onClose }: CacheManagementModalProp
         key: repo.id,
         repoId: repo.id,
         repoName: repo.name,
-        mounted: Boolean(mount),
         target: mount ? targetByAllocation.get(mount.allocation_id) : undefined,
         file: fileByKey.get(repo.id)
       })
@@ -100,7 +98,6 @@ export function CacheManagementModal({ open, onClose }: CacheManagementModalProp
         key: mount.repo_id,
         repoId: mount.repo_id,
         repoName: mount.repo_name || mount.repo_id,
-        mounted: true,
         target: targetByAllocation.get(mount.allocation_id),
         file: fileByKey.get(mount.repo_id)
       })
@@ -114,7 +111,6 @@ export function CacheManagementModal({ open, onClose }: CacheManagementModalProp
         key: file.key,
         repoId: file.key,
         repoName: file.key,
-        mounted: false,
         file
       })
     }
@@ -260,19 +256,6 @@ export function CacheManagementModal({ open, onClose }: CacheManagementModalProp
                   <Typography.Text strong ellipsis={{ tooltip: row.repoName }} style={{ flex: 1, minWidth: 0 }}>
                     {row.repoName}
                   </Typography.Text>
-                  {row.target?.cache_enabled ? (
-                    <Tag color="green" style={{ marginInlineEnd: 0 }}>
-                      {t('settings.cache.statusActive')}
-                    </Tag>
-                  ) : row.file ? (
-                    <Tag color="blue" style={{ marginInlineEnd: 0 }}>
-                      {t('settings.cache.statusPreserved')}
-                    </Tag>
-                  ) : (
-                    <Tag style={{ marginInlineEnd: 0 }}>
-                      {row.mounted ? t('settings.cache.statusOff') : t('settings.cache.statusUnmounted')}
-                    </Tag>
-                  )}
                 </div>
                 <div
                   title={

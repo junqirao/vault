@@ -723,6 +723,8 @@ func (a *Agent) handlePatchConfig(w http.ResponseWriter, r *http.Request) {
 	// L1 预算可能变了，软内存上限跟着走：否则用户把预算调大之后，GC 会一直按旧上限
 	// 收紧（抖动），把缓存的好处吃掉。
 	applyMemoryLimit(cfg, a.logger)
+	// L2 合计上限调小后，立即按“最旧的未挂载缓存先淘汰”收敛磁盘占用。
+	a.cache.EnforceCacheBudget()
 	a.writeJSON(w, http.StatusOK, map[string]any{"config": cfg})
 }
 

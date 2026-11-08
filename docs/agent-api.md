@@ -469,7 +469,8 @@ CacheFileStatus = {
   key,                          # 文件名里的稳定键：新版是库 ID（RepoID），旧版遗留为分配 ID
   active:bool,                  # 本进程门户里是否还有这个键的缓存目标
   allocation_id,                # active 时对应的挂载分配（排障用）
-  l1_bytes, l2_bytes, l2_index_bytes   # L1 快照 / L2 数据 / L2 索引的实际文件大小
+  l1_bytes, l2_bytes, l2_index_bytes,  # 实际磁盘占用（稀疏文件按已分配块，不是逻辑长度）
+  last_used                     # 文件最近写入时间（Unix 纳秒），预算淘汰按它从旧到新
 }
 
 CacheRecommend = {              # 逐库分到多少没有单一数字，看 targets[].*_limit_bytes
@@ -520,6 +521,12 @@ CacheTargetStatus = {
   打开「缓存管理」查看并清除这些缓存；`files[]` 同时覆盖未挂载的保留文件。
   自动清理**只删除没有同名 `.bin` 的孤立 `.idx`**，任何 L1/L2 `.bin` 都不会被自动删除；
   数据文件只在用户点「清除」/「全部清除」时删除。
+- **稀疏文件占用**：L2 数据/索引文件是稀疏文件，`disk_l2_bytes` / `files[].l2_bytes` 报的是
+  磁盘实际分配的字节数（Windows 用 `GetCompressedFileSize`，Unix 用 `st_blocks`），
+  不是逻辑文件长度 —— 否则一个只写了 5 GiB 的 40 GiB 预算文件会被误报成 40 GiB。
+- **总预算淘汰**：`cache_total_bytes` 超限时，启动、卸载或调小配置后会按 `last_used`
+  从旧到新淘汰**未挂载**的 L2 缓存文件；正在挂载的文件不能删，由各自 L2 文件的
+  第二机会（clock）策略在文件内部淘汰最久未读的 region。
 
 ```
 GET /agent/performance            # 我的存储库首页「性能指标」

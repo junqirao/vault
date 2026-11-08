@@ -622,10 +622,13 @@ export interface AgentCacheFile {
   active: boolean
   /** Active 时对应的挂载分配，便于排障。 */
   allocation_id?: string
+  /** 实际磁盘占用（稀疏文件按已分配块计算，不是逻辑长度）。 */
   l1_bytes: number
   l2_bytes: number
-  /** L2 索引文件的占用（新版把索引拆到了独立的 .idx）。 */
+  /** L2 索引文件的实际占用（新版把索引拆到了独立的 .idx）。 */
   l2_index_bytes: number
+  /** 文件最近一次写入时间（Unix 纳秒）；预算淘汰按它从旧到新清理。 */
+  last_used: number
 }
 
 /**
