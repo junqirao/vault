@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""打包 Vault 的 GitHub Release 产物。
+"""打包并（可选）发布 Vault 的 GitHub Release 产物。
 
 默认产出两个 zip（与 build.py --package-all 的结果一致）：
 
@@ -9,8 +9,8 @@
       SHA256SUMS.txt
       RELEASE_NOTES.md
 
-脚本只负责**准备**产物，不会自动发布。上传时把两个 zip 拖进 GitHub Release，
-或者直接复制脚本最后打印的 `gh release create` 命令。
+默认只**准备**产物并打印 `gh release create` 命令；加 `--publish` 才会真正调用
+GitHub REST API 创建 Release 并上传附件（不依赖本机安装 gh）。
 
 版本号有两套，互不影响：
   - 对外版本：RELEASE.json（本脚本读写，界面展示与发布产物命名）
@@ -22,18 +22,25 @@
     python release.py --skip-build
     python release.py --with-linux
     python release.py --build-arg=--no-bump
+    python release.py --skip-build --publish          # 整理现有产物并直接发布
+    python release.py --publish --draft               # 发成草稿
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import http.client
 import json
+import os
 import re
 import shutil
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -41,6 +48,7 @@ RELEASE_FILE = ROOT / "RELEASE.json"
 BUILD_SCRIPT = ROOT / "build.py"
 VERSION_FILE = ROOT / "VERSION"
 PACKAGE_DIR = ROOT / "dist" / "package"
+GITHUB_API = "https://api.github.com"
 
 SEMVER_RE = re.compile(r"^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 CHANNELS = ("stable", "beta", "rc", "alpha")
@@ -202,10 +210,168 @@ def print_publish_hint(out_dir: Path, release: dict, artifacts: list[Path], note
     info(f"\nGitHub 仓库：https://github.com/junqirao/vault/releases")
 
 
+def github_repo() -> str:
+    """从 git remote origin 解析 owner/repo。"""
+    try:
+        out = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            cwd=str(ROOT), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception as exc:
+        die(f"读取 git remote origin 失败：{exc}")
+    match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?/?$", out)
+    if not match:
+        die(f"无法从 remote 解析 GitHub 仓库：{out}")
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def github_token() -> str:
+    """取 GitHub token：环境变量 → gh → git credential（不打印 token 本身）。"""
+    for name in ("GH_TOKEN", "GITHUB_TOKEN"):
+        token = os.environ.get(name, "").strip()
+        if token:
+            return token
+    try:
+        out = subprocess.run(
+            ["gh", "auth", "token"], cwd=str(ROOT),
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        if out:
+            return out
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(
+            ["git", "credential", "fill"], cwd=str(ROOT),
+            input="protocol=https\nhost=github.com\n\n",
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except Exception as exc:
+        die(f"获取 GitHub token 失败：{exc}")
+    for line in out.splitlines():
+        if line.startswith("password="):
+            token = line[len("password="):].strip()
+            if token:
+                return token
+    die("未找到 GitHub token。请设置 GH_TOKEN / GITHUB_TOKEN、安装并登录 gh，或配置 git credential。")
+
+
+def github_request(method: str, url: str, token: str, payload: dict | None = None,
+                   allow_404: bool = False):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "vault-release.py",
+    }
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else None
+    except urllib.error.HTTPError as exc:
+        if allow_404 and exc.code == 404:
+            return None
+        body = exc.read().decode("utf-8", "replace")
+        die(f"GitHub API {method} {url} 失败（{exc.code}）：{body[:500]}")
+    except Exception as exc:
+        die(f"GitHub API {method} {url} 失败：{exc}")
+
+
+def asset_content_type(path: Path) -> str:
+    if path.suffix == ".zip":
+        return "application/zip"
+    if path.suffix == ".gz":
+        return "application/gzip"
+    if path.suffix in (".txt", ".md"):
+        return "text/plain"
+    return "application/octet-stream"
+
+
+def upload_asset(upload_url: str, token: str, path: Path) -> None:
+    """按 GitHub asset upload API 用原始二进制流上传，避免把 100MiB 读进内存。"""
+    base = upload_url.split("{", 1)[0]
+    query = urllib.parse.urlencode({"name": path.name})
+    parsed = urllib.parse.urlparse(f"{base}?{query}")
+    size = path.stat().st_size
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "vault-release.py",
+        "Content-Type": asset_content_type(path),
+        "Content-Length": str(size),
+    }
+    conn = http.client.HTTPSConnection(parsed.netloc, timeout=600)
+    try:
+        with path.open("rb") as handle:
+            conn.request("POST", parsed.path + "?" + parsed.query, body=handle, headers=headers)
+            resp = conn.getresponse()
+            raw = resp.read()
+        if resp.status >= 300:
+            die(f"上传 {path.name} 失败（{resp.status}）：{raw.decode('utf-8', 'replace')[:500]}")
+        info(f"  已上传 {path.name}（{human_size(size)}）")
+    finally:
+        conn.close()
+
+
+def publish_release(out_dir: Path, release: dict, artifacts: list[Path], notes: Path,
+                    draft: bool) -> None:
+    """把整理好的产物直接发到 GitHub Release；幂等：同名 Release/附件会先刷新。"""
+    token = github_token()
+    repo = github_repo()
+    tag = release_tag(release)
+    title = f'Vault {release["version"]}' + (
+        "" if release["channel"] == "stable" else f' {release["channel"].upper()}'
+    )
+    prerelease = release["channel"] != "stable"
+    body_text = notes.read_text(encoding="utf-8")
+
+    info(f"\n发布到 GitHub：{repo} / {tag}（{'草稿' if draft else '正式发布'}）")
+    repo_info = github_request("GET", f"{GITHUB_API}/repos/{repo}", token) or {}
+    target = repo_info.get("default_branch") or "master"
+
+    rel = github_request(
+        "GET", f"{GITHUB_API}/repos/{repo}/releases/tags/{tag}", token, allow_404=True
+    )
+    payload = {
+        "tag_name": tag,
+        "name": title,
+        "body": body_text,
+        "draft": draft,
+        "prerelease": prerelease,
+    }
+    if rel is None:
+        payload["target_commitish"] = target
+        rel = github_request("POST", f"{GITHUB_API}/repos/{repo}/releases", token, payload)
+        info(f"  已创建 Release：{tag}")
+    else:
+        github_request(
+            "PATCH", f"{GITHUB_API}/repos/{repo}/releases/{rel['id']}", token, payload
+        )
+        info(f"  已存在 Release：{tag}，刷新说明与附件")
+
+    # 要上传的附件：两个 zip + 校验文件（notes 已作为 Release 正文）。
+    files = list(artifacts) + [out_dir / "SHA256SUMS.txt"]
+    names = {path.name for path in files}
+    for asset in rel.get("assets", []):
+        if asset.get("name") in names:
+            github_request(
+                "DELETE", f"{GITHUB_API}/repos/{repo}/releases/assets/{asset['id']}", token
+            )
+    for path in files:
+        upload_asset(rel["upload_url"], token, path)
+
+    info(f"\nRelease 链接：{rel.get('html_url', f'https://github.com/{repo}/releases/tag/{tag}')}")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="release.py",
-        description="构建并整理 Vault 的 GitHub Release 产物（不会自动发布）",
+        description="构建并整理 Vault 的 GitHub Release 产物（加 --publish 才会自动发布）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", help="设置对外版本（形如 0.1.0），会写回 RELEASE.json")
@@ -220,6 +386,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="内部构建号不自动递增（透传给 build.py）")
     parser.add_argument("--build-arg", action="append", default=[],
                         help="额外透传给 build.py 的参数，可重复使用")
+    parser.add_argument("--publish", action="store_true",
+                        help="整理完产物后直接发布到 GitHub Release（需 GH_TOKEN/GITHUB_TOKEN、gh 或 git credential）")
+    parser.add_argument("--draft", action="store_true",
+                        help="配合 --publish：只创建草稿，不正式发布")
     args = parser.parse_args(argv)
 
     release = load_release()
@@ -279,6 +449,8 @@ def main(argv: list[str] | None = None) -> int:
     info(f"  {notes.name}")
     info(f"  SHA256SUMS.txt")
     print_publish_hint(out_dir, release, artifacts, notes)
+    if args.publish:
+        publish_release(out_dir, release, artifacts, notes, args.draft)
     return 0
 
 
