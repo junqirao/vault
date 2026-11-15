@@ -248,6 +248,8 @@ type MountState struct {
 	ServerName string `json:"server_name,omitempty"`
 	MountMode  string `json:"mount_mode"`
 	MountPath  string `json:"mount_path"`
+	// SteamManifestPath 是本机为 Steam 库生成的 appmanifest 路径；卸载时按它删除。
+	SteamManifestPath string `json:"steam_manifest_path,omitempty"`
 	// ShortcutPath 是本次挂载自动创建的快捷方式完整路径（为空表示没有自动创建）。
 	//
 	// 落盘是为了**卸载时能准确删掉那一个 .lnk**：快捷方式目录之后可能被用户改掉，

@@ -28,6 +28,35 @@ interface VaultAgentInfo {
   versionMismatch?: boolean
 }
 
+/** 本机 Steam 库条目（只含展示/选择所需字段，不含账号凭据）。 */
+interface LocalSteamGameInfo {
+  app_id: number
+  name: string
+  installed: boolean
+  has_image: boolean
+  has_icon: boolean
+  size_bytes?: number
+}
+
+interface LocalSteamLibraryInfo {
+  available: boolean
+  steam_root?: string
+  account_name?: string
+  games: LocalSteamGameInfo[]
+  error?: string
+}
+
+/** 本机 Steam 库路径（steamapps 所在目录）。 */
+interface SteamLibraryInfo {
+  path: string
+  label?: string
+  app_count: number
+  free_bytes?: number
+  total_bytes?: number
+  /** 是否是 Steam 安装目录本身（它同时也是一个 Steam 库）。 */
+  steam_root: boolean
+}
+
 /**
  * 正在运行的客户端**本体**版本（主进程通过 webPreferences.additionalArguments 注入）。
  *
@@ -91,6 +120,17 @@ const api = {
     ipcRenderer.invoke('vault:create-shortcut', input),
   openPath: (target: string): Promise<void> => ipcRenderer.invoke('vault:open-path', target),
   showItemInFolder: (target: string): Promise<void> => ipcRenderer.invoke('vault:show-item', target),
+  /** 扫描本机 Steam 库（只读本地元数据；不读取/上传登录凭据）。 */
+  steamLocalLibrary: (force?: boolean): Promise<LocalSteamLibraryInfo> =>
+    ipcRenderer.invoke('vault:steam-local-library', force === true),
+  /** 读取本机 Steam 缓存封面，返回 data URL；按 appID 懒加载。 */
+  steamLocalImage: (appID: number): Promise<string | null> =>
+    ipcRenderer.invoke('vault:steam-local-image', appID),
+  /** 读取本机 Steam 32×32 应用图标，返回 data URL。 */
+  steamLocalIcon: (appID: number): Promise<string | null> =>
+    ipcRenderer.invoke('vault:steam-local-icon', appID),
+  /** 列出本机 Steam 库路径（用于挂载到 Steam 库）。 */
+  steamLibraries: (): Promise<SteamLibraryInfo[]> => ipcRenderer.invoke('vault:steam-libraries'),
   quit: (): Promise<void> => ipcRenderer.invoke('vault:quit'),
   /** 立即重启客户端（用于让已激活的渲染层热更资源生效）。 */
   relaunch: (): Promise<void> => ipcRenderer.invoke('vault:relaunch'),

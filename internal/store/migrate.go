@@ -40,7 +40,18 @@ import (
 //	10 → uploads 新增 repo_id / disk_id / mount_root：上传改为**直接写母盘**（建会话时就建好
 //	    库与虚拟盘，挂载后把分块写进盘里），不再"先落暂存目录、完成时再整树拷一遍"。
 //	    这三列记下这次上传正在写的库/盘/挂载根；空 mount_root 表示升级前创建的旧会话。
-const currentSchemaVersion = 10
+//	11 → 新增 Steam 内容账号模块（steam_accounts / steam_account_apps / steam_account_leases）、
+//	    服务端分组 repo_groups 与游戏 games。账号凭据只以密文落库，且该模块仅用于
+//	    存储库下载/更新，不提供玩家登录或通用 Steam 命令入口。
+//	12 → repo_groups 新增 access_mode（all | selected）与 repo_group_members：
+//	    Steam 游戏库可配置"全部用户可挂载"或"仅指定用户可挂载"。
+//	13 → steam_accounts 新增 last_output：保存最近一次 SteamCMD 的脱敏输出，
+//	    用于登录/许可同步失败时的管理端诊断。
+//	14 → 新增 steam_apps：Steam 商店元数据缓存（名称/封面/平台），供"账号拥有的全部游戏"
+//	    列表一次性展示，避免用户按名称搜索。
+//	15 → steam_apps 新增 app_type：商店条目类型（0=game，4=dlc，6=software...），
+//	    用于只展示游戏本体、过滤 DLC/SDK/内置应用；-1 表示尚未解析。
+const currentSchemaVersion = 15
 
 // Migrate 建表并记录 schema 版本。
 //
@@ -122,6 +133,13 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("store: 提交迁移失败: %w", err)
 	}
+	// 版本 11：把现有 `repositories.meta.group` 去重登记为服务端分组实体，
+	// 保证老库升级后也能在「游戏组/分组设置」里看到并使用原有分组。
+	if applied < 11 {
+		if err := s.BackfillRepoGroups(ctx); err != nil {
+			return fmt.Errorf("store: 回填服务端分组失败: %w", err)
+		}
+	}
 	if applied < 8 {
 		// 口径从 accounted_bytes 回到 size_bytes 后已用量必须立刻重算：不重算的话
 		// 界面上还是旧口径算出来的小值，要等下一轮对账才收敛（用户会看到"已用"自己往上跳）。
@@ -176,6 +194,15 @@ func addColumns(ctx context.Context, q queryer, dialect Dialect) error {
 		{"uploads", "mount_root",
 			`ALTER TABLE uploads ADD COLUMN mount_root TEXT NOT NULL DEFAULT ''`,
 			`ALTER TABLE uploads ADD COLUMN mount_root VARCHAR(512) NOT NULL DEFAULT ''`},
+		{"repo_groups", "access_mode",
+			`ALTER TABLE repo_groups ADD COLUMN access_mode TEXT NOT NULL DEFAULT 'all'`,
+			`ALTER TABLE repo_groups ADD COLUMN access_mode VARCHAR(32) NOT NULL DEFAULT 'all'`},
+		{"steam_accounts", "last_output",
+			`ALTER TABLE steam_accounts ADD COLUMN last_output TEXT NOT NULL DEFAULT ''`,
+			`ALTER TABLE steam_accounts ADD COLUMN last_output LONGTEXT NOT NULL`},
+		{"steam_apps", "app_type",
+			`ALTER TABLE steam_apps ADD COLUMN app_type INTEGER NOT NULL DEFAULT -1`,
+			`ALTER TABLE steam_apps ADD COLUMN app_type INT NOT NULL DEFAULT -1`},
 	}
 	for _, c := range columns {
 		exists, err := columnExists(ctx, q, dialect, c.table, c.column)

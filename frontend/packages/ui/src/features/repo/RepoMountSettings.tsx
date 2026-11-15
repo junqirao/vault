@@ -1,9 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Alert, Button, Checkbox, Input, Modal, Pagination, Popconfirm, Radio, Space, Switch, Typography, message } from 'antd'
+import { Alert, Button, Checkbox, Input, Modal, Pagination, Popconfirm, Radio, Select, Space, Spin, Switch, Tag, Typography, message } from 'antd'
+import { useQuery } from '@tanstack/react-query'
 
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { SectionCard } from '../../components/SectionCard'
-import { agentApi, selectDirectory, supportsDirectoryPicker } from '../../api/agentClient'
+import { agentApi, fetchSteamLibraries, selectDirectory, supportsDirectoryPicker } from '../../api/agentClient'
 import type { AgentMountMode } from '../../api/agentTypes'
 import type { RepoDTO } from '../../api/types'
 import { useAgent } from '../../hooks/useAgent'
@@ -237,7 +238,14 @@ export function useRepoMountSettings(repoId: string, repoName: string, repoGroup
 }
 
 /** 各字段的展示：弹窗与详情页 tab 用同一份，避免两处配置长得不一样。 */
-function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Element {
+function RepoMountFields({
+  state,
+  steam = false
+}: {
+  state: RepoMountSettingsState
+  /** Steam 分组：挂载方式与落点由所选 Steam 库决定，不再展示挂载方式/目录。 */
+  steam?: boolean
+}): JSX.Element {
   const { t } = useI18n()
   const { mode, dir, autoMount, cacheEnabled, directMode, shortcutEnabled, disabled, previewLabel } = state
 
@@ -252,10 +260,10 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
         />
       ) : disabled ? (
         <Alert type="warning" showIcon message={t('settings.agent.notAvailable')} />
-      ) : (
-        <Alert type="info" showIcon message={t('repo.settings.defaultsHint')} />
-      )}
+      ) : null}
 
+      {!steam ? (
+      <>
       <div>
         <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
           {t('repo.settings.mountMode')}
@@ -307,6 +315,8 @@ function RepoMountFields({ state }: { state: RepoMountSettingsState }): JSX.Elem
             </Typography.Text>
           ) : null}
         </div>
+      ) : null}
+      </>
       ) : null}
 
       <div>
@@ -400,6 +410,9 @@ export interface GroupMountSettingsState extends RepoMountSettingsState {
   allReposSelected: boolean
   /** 切换全选。 */
   toggleAllRepos: (checked: boolean) => void
+  /** Steam 分组专用：目标 Steam 库路径；空串表示不使用。 */
+  steamLibrary: string
+  setSteamLibrary: (path: string) => void
 }
 
 /**
@@ -421,6 +434,7 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
   const effectiveDirect = Boolean(saved?.direct_mode)
   const effectiveShortcut = Boolean(saved?.shortcut_enabled)
   const effectiveUseForRepos = Boolean(saved?.use_for_repos)
+  const effectiveSteamLibrary = saved?.steam_library ?? ''
   // 空 = 全选：不用把当前组的库 ID 全存一遍，将来新加入组的库自动包含在内。
   const savedUseReposKey = (saved?.use_repos ?? []).join('|')
 
@@ -432,6 +446,7 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
   const [shortcutEnabled, setShortcutEnabled] = useState(effectiveShortcut)
   const [useForRepos, setUseForRepos] = useState(effectiveUseForRepos)
   const [useRepos, setUseRepos] = useState<string[]>(saved?.use_repos ?? [])
+  const [steamLibrary, setSteamLibrary] = useState(effectiveSteamLibrary)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<unknown>(null)
 
@@ -443,6 +458,7 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
     setDirectMode(effectiveDirect)
     setShortcutEnabled(effectiveShortcut)
     setUseForRepos(effectiveUseForRepos)
+    setSteamLibrary(effectiveSteamLibrary)
   }, [
     group,
     effectiveMode,
@@ -451,7 +467,8 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
     effectiveCache,
     effectiveDirect,
     effectiveShortcut,
-    effectiveUseForRepos
+    effectiveUseForRepos,
+    effectiveSteamLibrary
   ])
 
   // 勾选列表按库 ID 存（改库名不会让已勾选的库失效）；配置里换了列表就重填。
@@ -487,6 +504,7 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
         cache_enabled: cacheEnabled,
         direct_mode: directMode,
         shortcut_enabled: shortcutEnabled,
+        steam_library: steamLibrary.trim(),
         use_for_repos: useForRepos,
         // 全选就存空数组（新加入组的库也算上），只有部分勾选才存具体列表。
         // 注意别在这里"猜"：state 已经是配置里的值，组内库没加载出来时也照存不误。
@@ -522,6 +540,8 @@ export function useGroupMountSettings(group: string): GroupMountSettingsState {
     setUseRepos,
     allReposSelected,
     toggleAllRepos,
+    steamLibrary,
+    setSteamLibrary,
     saving,
     error,
     disabled: !agent.available,
@@ -655,16 +675,32 @@ export function GroupMountSettingsModal({
   group,
   repos,
   open,
+  isSteam = false,
   onClose
 }: {
   group: string
   /** 组内的库：用于"哪些库遵循分组配置"的勾选列表（默认全选）。 */
   repos: RepoDTO[]
   open: boolean
+  /** 仅 Steam 游戏分组显示"挂载到 Steam 库"。 */
+  isSteam?: boolean
   onClose: () => void
 }): JSX.Element {
   const { t } = useI18n()
   const state = useGroupMountSettings(group)
+  const librariesQuery = useQuery({
+    queryKey: ['steam', 'libraries'],
+    queryFn: () => fetchSteamLibraries(),
+    enabled: open && isSteam,
+    staleTime: 30_000
+  })
+  // Steam 分组固定走分组配置：界面上没有开关，打开时把它拉回 true，
+  // 顺带清空 use_repos（空 = 组内全选），否则保存后挂载按钮会一直置灰。
+  useEffect(() => {
+    if (!open || !isSteam) return
+    state.setUseForRepos(true)
+    state.setUseRepos([])
+  }, [open, isSteam])
 
   return (
     <Modal
@@ -683,18 +719,85 @@ export function GroupMountSettingsModal({
       }}
     >
       <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
-        <div>
-          <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
-            {t('repo.group.useForRepos')}
-          </Typography.Text>
-          <Switch checked={state.useForRepos} disabled={state.disabled} onChange={state.setUseForRepos} />
-          <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
-            {t('repo.group.useForReposHint')}
-          </Typography.Text>
-        </div>
+        {/* Steam 分组的库是分组级配置：组内游戏本来就只有「挂载分组」一个入口，
+            这里不再给「使用分组配置」开关，避免关了之后游戏无处可挂。 */}
+        {isSteam ? null : (
+          <div>
+            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+              {t('repo.group.useForRepos')}
+            </Typography.Text>
+            <Switch checked={state.useForRepos} disabled={state.disabled} onChange={state.setUseForRepos} />
+            <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+              {t('repo.group.useForReposHint')}
+            </Typography.Text>
+          </div>
+        )}
         {/* 只有真的要用分组配置时，才需要选"作用于哪些库" */}
-        {state.useForRepos ? <GroupReposPicker state={state} repos={repos} /> : null}
-        <RepoMountFields state={state} />
+        {state.useForRepos && !isSteam ? <GroupReposPicker state={state} repos={repos} /> : null}
+        {isSteam ? (
+          <div>
+            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
+              {t('repo.group.steamLibrary')}
+            </Typography.Text>
+            {state.steamLibrary.trim() === '' ? (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginBottom: spacing.xs }}
+                message={t('repo.group.steamLibraryRequired')}
+              />
+            ) : null}
+            <Select
+              allowClear
+              showSearch
+              optionFilterProp="value"
+              value={state.steamLibrary || undefined}
+              loading={librariesQuery.isFetching}
+              disabled={state.disabled}
+              placeholder={t('repo.group.steamLibraryPlaceholder')}
+              style={{ width: '100%' }}
+              notFoundContent={
+                librariesQuery.isFetching ? (
+                  <Spin size="small" />
+                ) : (
+                  <Typography.Text type="secondary">{t('repo.group.steamLibraryEmpty')}</Typography.Text>
+                )
+              }
+              options={(librariesQuery.data ?? []).map((library) => ({
+                value: library.path,
+                label: (
+                  <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
+                    <Typography.Text ellipsis style={{ flex: 1, minWidth: 0 }}>
+                      {library.path}
+                    </Typography.Text>
+                    {library.steam_root ? (
+                      <Tag style={{ marginInlineEnd: 0, flexShrink: 0 }}>
+                        {t('repo.group.steamLibrarySteamRoot')}
+                      </Tag>
+                    ) : null}
+                    <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, whiteSpace: 'nowrap' }}>
+                      {library.label ? `${library.label} · ` : ''}
+                      {library.free_bytes !== undefined && library.total_bytes !== undefined
+                        ? `${formatBytes(library.free_bytes)} / ${formatBytes(library.total_bytes)}`
+                        : t('repo.group.steamLibraryApps', { count: library.app_count })}
+                    </Typography.Text>
+                  </div>
+                )
+              }))}
+              onChange={(value?: string) => {
+                state.setSteamLibrary(value ?? '')
+                if (value) {
+                  state.setMode('directory')
+                  state.setUseForRepos(true)
+                }
+              }}
+            />
+            <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
+              {t('repo.group.steamLibraryHint')}
+            </Typography.Text>
+          </div>
+        ) : null}
+        <RepoMountFields state={state} steam={isSteam} />
       </Space>
     </Modal>
   )

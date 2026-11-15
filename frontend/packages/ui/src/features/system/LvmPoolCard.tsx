@@ -94,7 +94,6 @@ export function LvmPoolCard({ enabled, isSuperAdmin, loading }: LvmPoolCardProps
         ) : null
       }
     >
-      <Alert type="info" showIcon message={t('system.lvm.hint')} style={{ marginBottom: spacing.md }} />
       {error ? <ErrorNotice error={error} /> : null}
       {statusQuery.error ? <ErrorNotice error={statusQuery.error} /> : null}
       {healthBad ? (

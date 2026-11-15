@@ -337,3 +337,36 @@ update:
   # 低于此版本的客户端将被强制升级（留空表示不强制）。
   # 该值用于版本契约的展示与提示；真正的区间判定见上面的 client_compat。
   min_client_version: ""
+
+# Steam 内容账号模块（仅用于存储库内容下载/更新，不提供玩家登录或通用 Steam 命令入口）。
+# 账号密码 / TOTP secret / 长期 token 一律使用 security.master_key 派生密钥做 AES-GCM 加密后落库。
+steam:
+  # 是否启用。留空视为启用；设为 false 时隐藏账号/游戏组入口并停止自动更新。
+  enabled: true
+  # steamcmd 可执行文件路径。留空时从 PATH 查找（Windows 也尝试 steamcmd.exe）。
+  # Linux 例：/usr/bin/steamcmd；Windows 例：C:\SteamCMD\steamcmd.exe
+  steamcmd_path: ""
+  # 由系统自动安装 SteamCMD 的目标目录。留空 = 配置文件所在目录/steamcmd。
+  # 管理端「游戏组 → Steam 账号」里可一键安装；也可以手动放到该目录。
+  install_dir: ""
+  # 访问 Steam CDN / SteamCMD 使用的代理，例如 http://127.0.0.1:7890。
+  # 留空 = 自动读取 Windows 系统代理；读不到再继承环境变量 HTTP_PROXY / HTTPS_PROXY。
+  # 使用加速器时通常无需手填；如系统代理是 PAC 脚本，建议在这里显式填写。
+  proxy: ""
+  # 游戏更新暂存目录。留空 = 系统临时目录/vault-steam/staging。
+  # 建议放在容量足够的 SSD 上：SteamCMD 会把内容先写到这里，再通过差异盘合并进母盘。
+  staging_dir: ""
+  # 每个账号的 SteamCMD 会话目录根（保存 ssfn/config，减少重复 Steam Guard 验证）。
+  # 留空 = 配置文件所在目录下的 steam/sessions（不可用时回退系统临时目录）。
+  # 生产环境请放到持久化磁盘并做好权限保护。
+  session_root: ""
+  # 自动检查更新的周期（如 "15m"）。留空默认 15m。
+  auto_update_interval: "15m"
+  # 全局同时执行的游戏更新任务数。留空默认 2。
+  max_concurrent_updates: 2
+  # 更新前如果暂存内容超过母盘容量，自动扩容母盘。默认启用。
+  auto_expand: true
+  # 自动扩容时预留的额外空间百分比。默认 15。
+  expand_reserve_percent: 15
+  # 新建游戏库的默认容量（GB）。游戏变大后自动扩容。
+  default_repo_size_gb: 60

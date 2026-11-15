@@ -12,7 +12,8 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   SettingOutlined,
-  TeamOutlined
+  TeamOutlined,
+  CloudDownloadOutlined
 } from '@ant-design/icons'
 import { Alert, Avatar, Button, Dropdown, Layout, Menu, Popover, Space, Tag, Tooltip, Typography } from 'antd'
 import type { MenuProps } from 'antd'
@@ -163,6 +164,7 @@ export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
   const adminMenuItems: MenuProps['items'] = [
     { key: '/admin/users', icon: <TeamOutlined />, label: t('nav.users') },
     { key: '/admin/repos', icon: <AppstoreOutlined />, label: t('nav.repos') },
+    { key: '/admin/game-groups', icon: <CloudDownloadOutlined />, label: t('nav.gameGroups') },
     { key: '/admin/storages', icon: <DatabaseOutlined />, label: t('nav.storages') },
     { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
     // 审计日志与服务端日志已合并为一页，入口只留「服务日志」，页内用 Tab 切换。

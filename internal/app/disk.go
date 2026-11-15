@@ -152,6 +152,7 @@ func (s *DiskService) RegisterHandlers(w *job.Worker) {
 	w.Register(job.HandlerFunc{T: domain.JobCreateVHDXFromDir, F: s.runCreateVHDX})
 	w.Register(job.HandlerFunc{T: domain.JobCreateDiff, F: s.runCreateDiff})
 	w.Register(job.HandlerFunc{T: domain.JobCreateDiffFromDir, F: s.runCreateDiffFromDir})
+	w.Register(job.HandlerFunc{T: domain.JobSteamUpdate, F: s.runCreateDiffFromDir})
 	w.Register(job.HandlerFunc{T: domain.JobPlanClientDiff, F: s.runClientDiffPlan})
 	w.Register(job.HandlerFunc{T: domain.JobMergeDiff, F: s.runMergeDiff})
 	w.Register(job.HandlerFunc{T: domain.JobPrepareRepo, F: s.runPrepareRepo})

@@ -20,6 +20,7 @@ import {
   SystemSettings,
   UploadTaskPage,
   UserList,
+  GameGroupsPage,
   useAuth,
   useI18n,
   type Language,
@@ -163,6 +164,11 @@ export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.E
               onOpenStorages={() => navigate('/storages', { state: { from: '/my-repos' } })}
               // 配额只能由管理员在用户管理页查看/调整；普通用户看不到这个入口（见 QuotaOverview）。
               onOpenUsers={() => navigate('/admin/users')}
+              onManageSteamGroup={(groupID) =>
+                navigate(`/admin/game-groups?group=${encodeURIComponent(groupID)}`, {
+                  state: { from: '/my-repos' }
+                })
+              }
             />
           }
         />
@@ -212,6 +218,7 @@ export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.E
       >
         <Route index element={<Navigate to="/admin/users" replace />} />
         <Route path="users" element={<UserList />} />
+        <Route path="game-groups" element={<GameGroupsPage />} />
         <Route
           path="repos"
           element={

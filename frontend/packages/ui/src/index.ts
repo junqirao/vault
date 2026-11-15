@@ -125,6 +125,8 @@ export {
 } from './features/bootstrap/BootstrapWizard'
 export { ServerEndpointForm, type ServerEndpointFormProps } from './features/server/ServerEndpointForm'
 export { MyRepos, type MyReposProps } from './features/repo/MyRepos'
+export { SteamAccountsPage } from './features/steam/SteamAccountsPage'
+export { GameGroupsPage } from './features/steam/GameGroupsPage'
 export { RepoList, type RepoListProps } from './features/repo/RepoList'
 export { RepoCreateForm, type RepoCreateFormProps } from './features/repo/RepoCreateForm'
 export {

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Alert, Button, Form, Input, InputNumber, Modal, Space, Switch, Tag, Tooltip, Typography } from 'antd'
+import { Button, Form, Input, InputNumber, Modal, Space, Switch, Tag, Tooltip, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -429,8 +429,7 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
         maskClosable={false}
       >
         {error ? <ErrorNotice error={error} /> : null}
-        <Alert type="info" showIcon message={t('storage.resizeHint')} style={{ marginBottom: spacing.md }} />
-        <Form form={resizeForm} layout="vertical">
+          <Form form={resizeForm} layout="vertical">
           <Form.Item name="sizeGB" label={t('storage.sizeGb')} rules={[{ required: true }]}>
             <InputNumber min={0.1} precision={2} style={{ width: '100%' }} addonAfter="GB" />
           </Form.Item>

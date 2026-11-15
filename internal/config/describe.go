@@ -485,6 +485,85 @@ func DescribeFields() []FieldDef {
 			Editable: true,
 			Default:  "",
 		},
+
+		// ---- steam ----
+		{
+			Key: "steam.enabled", Section: "steam", Kind: KindBool, path: []string{"Steam", "Enabled"},
+			Desc:         "是否启用 Steam 内容账号/游戏更新模块；仅用于存储库下载/更新，不提供玩家登录。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      true,
+		},
+		{
+			Key: "steam.steamcmd_path", Section: "steam", Kind: KindString, path: []string{"Steam", "SteamCmdPath"},
+			Desc:         "steamcmd 可执行文件路径；留空从 PATH 查找。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      "",
+		},
+		{
+			Key: "steam.install_dir", Section: "steam", Kind: KindString, path: []string{"Steam", "InstallDir"},
+			Desc:         "由系统自动安装 SteamCMD 的目标目录；留空使用配置文件所在目录下的 steamcmd。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      "",
+		},
+		{
+			Key: "steam.proxy", Section: "steam", Kind: KindString, path: []string{"Steam", "Proxy"},
+			Desc:         "访问 Steam CDN / SteamCMD 使用的代理（如 http://127.0.0.1:7890）；留空继承 HTTP_PROXY/HTTPS_PROXY。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      "",
+		},
+		{
+			Key: "steam.staging_dir", Section: "steam", Kind: KindString, path: []string{"Steam", "StagingDir"},
+			Desc:         "游戏更新暂存目录；留空使用 source_roots/存储根下的 .vault-steam/staging。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      "",
+		},
+		{
+			Key: "steam.session_root", Section: "steam", Kind: KindString, path: []string{"Steam", "SessionRoot"},
+			Desc:         "每个账号的 SteamCMD 会话目录根（保存 ssfn/config）；留空使用系统临时目录。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      "",
+		},
+		{
+			Key: "steam.auto_update_interval", Section: "steam", Kind: KindDuration, path: []string{"Steam", "AutoUpdateInterval"},
+			Desc:         "自动检查更新的周期（如 15m）。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      "15m",
+		},
+		{
+			Key: "steam.max_concurrent_updates", Section: "steam", Kind: KindInt, path: []string{"Steam", "MaxConcurrentUpdates"},
+			Desc:         "全局同时执行的游戏更新任务数。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      2,
+		},
+		{
+			Key: "steam.auto_expand", Section: "steam", Kind: KindBool, path: []string{"Steam", "AutoExpand"},
+			Desc:         "更新前如果暂存内容超过母盘容量，自动扩容母盘；未配置视为启用。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      true,
+		},
+		{
+			Key: "steam.expand_reserve_percent", Section: "steam", Kind: KindInt, path: []string{"Steam", "ExpandReservePercent"},
+			Desc:         "自动扩容时预留的额外空间百分比（默认 15）。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      15,
+		},
+		{
+			Key: "steam.default_repo_size_gb", Section: "steam", Kind: KindInt, path: []string{"Steam", "DefaultRepoSizeGB"},
+			Desc:         "新建游戏库的默认容量（GB）；游戏变大后自动扩容。",
+			Editable:     true,
+			NeedsRestart: true,
+			Default:      60,
+		},
 	}
 }
 
@@ -511,6 +590,16 @@ func envVarOf(key string) string {
 		return "VAULT_LOG_DIR"
 	case "security.master_key":
 		return "VAULT_MASTER_KEY"
+	case "steam.steamcmd_path":
+		return "VAULT_STEAMCMD"
+	case "steam.install_dir":
+		return "VAULT_STEAMCMD_DIR"
+	case "steam.proxy":
+		return "VAULT_STEAM_PROXY"
+	case "steam.staging_dir":
+		return "VAULT_STEAM_STAGING_DIR"
+	case "steam.session_root":
+		return "VAULT_STEAM_SESSION_ROOT"
 	default:
 		return ""
 	}

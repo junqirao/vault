@@ -76,12 +76,13 @@ export class ApiClient {
     path: string,
     body?: unknown,
     query?: Record<string, QueryValue>,
-    allowRenew = true
+    allowRenew = true,
+    timeoutMs?: number
   ): Promise<T> {
     const { baseUrl, token } = this.config()
     const url = `${trimBase(baseUrl)}${path}${buildQuery(query)}`
     const controller = new AbortController()
-    const timeout = this.options.timeoutMs ?? 20000
+    const timeout = timeoutMs ?? this.options.timeoutMs ?? 20000
     const timer = setTimeout(() => controller.abort(), timeout)
 
     const headers: Record<string, string> = { Accept: 'application/json' }
@@ -99,11 +100,12 @@ export class ApiClient {
       })
     } catch (error) {
       if (isAbortError(error)) {
-        throw new ApiError({ kind: 'timeout', code: 'network.timeout' })
+        throw new ApiError({ kind: 'timeout', code: 'network.timeout', args: { method, path } })
       }
       throw new ApiError({
         kind: 'network',
         code: 'network.error',
+        args: { method, path },
         message: error instanceof Error ? error.message : undefined
       })
     } finally {

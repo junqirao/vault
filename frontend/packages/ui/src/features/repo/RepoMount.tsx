@@ -91,12 +91,22 @@ export interface RepoMountController {
 }
 
 /**
+ * 挂载钩子的可选行为。
+ *
+ * allowAllocate：共享 Steam 游戏库允许普通用户在"尚无分配"时直接点挂载，
+ * 由 mountRepo 幂等地创建自己的差异盘。普通存储库保持原逻辑（必须先有分配或归属）。
+ */
+export interface RepoMountOptions {
+  allowAllocate?: boolean
+}
+
+/**
  * 存储库卡片的一键挂载：解析本人在该库的分配 → 挂载/卸载 → 打开本地挂载目录。
  *
  * 分配解析复用 `['repo-allocations', repoId]` 缓存（与存储库详情页同键，不重复请求）；
  * 库主尚无分配时按需自建（服务端对「同库同用户」幂等，已有未释放分配会直接复用）。
  */
-export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountController {
+export function useRepoMount(repo: RepoDTO, currentUserId: string, options?: RepoMountOptions): RepoMountController {
   const api = useApi()
   const agent = useAgent()
   // 本库属于**当前活动**服务端：挂载请求必须说清归属台（分配 ID 只对那一台有意义）。
@@ -161,15 +171,18 @@ export function useRepoMount(repo: RepoDTO, currentUserId: string): RepoMountCon
   // 库必须 active 才能挂载：建库中（creating）时差异盘还没派生出来，此时"挂载"点了也只会
   // 换来一句对不上的报错（真实反馈："逻辑有误啊，creating 中的存储库不允许挂载啊"）。
   // 服务端同样拦住（RequestMount → repo.creating），这里只是提前把按钮置灰并说清原因。
-  const repoReady = repo.state === 'active'
-  const canUnmount = agent.available && (allocationId !== undefined || isOwner)
+  const repoReady = repo.state === 'active' && !(repo.mode === 'shared' && (repo.parent_condition === 'maintenance' || repo.parent_condition === 'temp_shared'))
+  const allowAllocate = Boolean(options?.allowAllocate)
+  const canUnmount = agent.available && (allocationId !== undefined || isOwner || allowAllocate)
   const canMount = canUnmount && repoReady
 
   const disabledReason = !agent.available
     ? t('agent.hostMissing')
-    : !repoReady
-      ? repo.state === 'importing'
-        ? placeholder
+    : repo.mode === 'shared' && (repo.parent_condition === 'maintenance' || repo.parent_condition === 'temp_shared')
+      ? t('repo.card.conditionBlocked')
+      : !repoReady
+        ? repo.state === 'importing'
+          ? placeholder
           // 占位库：本机还在传数据。只说一句"不能挂载"等于让人干等 —— 必须告诉他进度在哪看
           // （真实反馈："没有办法知道没有完成上传，且可以被挂载"）。入口就是这张卡片本身：
           // 整卡点击进「上传任务」页（见 RepoCards 的 useRepoCardClick），进度不再摊在卡片上。

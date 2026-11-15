@@ -1090,3 +1090,253 @@ export interface DiskImportResultDTO {
   skipped: DiskImportSkipDTO[]
   failed: DiskImportFailureDTO[]
 }
+
+// ---- Steam 内容账号（仅用于存储库下载/更新） ----
+
+export type SteamAccountStatus = 'active' | 'needs_2fa' | 'disabled' | 'error'
+export type SteamGuardType = 'none' | 'totp' | 'email'
+export type SteamCredentialKind = 'password' | 'refresh_token'
+
+/** 账号模块的对外视图；永远不包含凭据/令牌/Guard secret。 */
+export interface SteamAccountDTO {
+  id: string
+  username: string
+  display_name: string
+  status: SteamAccountStatus
+  credential_kind: SteamCredentialKind
+  has_credential: boolean
+  guard_type: SteamGuardType
+  has_guard_secret: boolean
+  session_state: string
+  max_concurrent: number
+  active_leases: number
+  last_login_at: number
+  last_checked_at: number
+  last_guard_at: number
+  last_error: string
+  last_output: string
+  session_home: string
+  cmd_root: string
+  created_at: number
+  updated_at: number
+}
+
+export interface CreateSteamAccountRequest {
+  username: string
+  display_name?: string
+  credential: string
+  credential_kind?: SteamCredentialKind
+  guard_type?: SteamGuardType
+  guard_secret?: string
+  max_concurrent?: number
+}
+
+export interface UpdateSteamAccountRequest {
+  display_name?: string
+  credential?: string
+  credential_kind?: SteamCredentialKind
+  guard_type?: SteamGuardType
+  guard_secret?: string
+  max_concurrent?: number
+  enabled?: boolean
+}
+
+export interface SteamAccountAppDTO {
+  app_id: number
+  source: string
+  verified_at: number
+}
+
+export interface SteamAccountAvailableDTO {
+  id: string
+  username: string
+  display_name: string
+  status: SteamAccountStatus
+  owns_app: boolean
+  busy: boolean
+  available: boolean
+  max_concurrent: number
+  reason: string
+}
+
+// ---- 服务端分组 / 游戏库 ----
+
+export type RepoGroupKind = 'general' | 'steam'
+
+export interface RepoGroupDTO {
+  id: string
+  name: string
+  kind: RepoGroupKind
+  description: string
+  steam_account_id?: string
+  target_platform: 'windows' | 'linux'
+  auto_update: boolean
+  update_schedule: string
+  update_window: string
+  max_concurrent: number
+  storage_id?: string
+  access_mode: 'all' | 'selected'
+  member_ids?: string[]
+  game_count: number
+  created_at: number
+  updated_at: number
+}
+
+export interface CreateRepoGroupRequest {
+  name: string
+  kind?: RepoGroupKind
+  description?: string
+  steam_account_id?: string
+  target_platform?: 'windows' | 'linux'
+  auto_update?: boolean
+  update_schedule?: string
+  update_window?: string
+  max_concurrent?: number
+  storage_id?: string
+  access_mode?: 'all' | 'selected'
+  member_ids?: string[]
+}
+
+export interface UpdateRepoGroupRequest {
+  name?: string
+  kind?: RepoGroupKind
+  description?: string
+  steam_account_id?: string
+  target_platform?: 'windows' | 'linux'
+  auto_update?: boolean
+  update_schedule?: string
+  update_window?: string
+  max_concurrent?: number
+  storage_id?: string
+  access_mode?: 'all' | 'selected'
+  member_ids?: string[]
+}
+
+export interface GameDTO {
+  id: string
+  group_id: string
+  repo_id?: string
+  app_id: number
+  app_name: string
+  install_dir: string
+  build_id: string
+  available_build_id: string
+  target_platform: 'windows' | 'linux' | ''
+  steam_account_id?: string
+  auto_update?: boolean
+  status: 'ready' | 'updating' | 'paused' | 'error'
+  /** 更新进度（仅 updating 阶段有值）。 */
+  progress_percent: number
+  progress_phase: 'checking' | 'downloading' | 'preparing' | 'diffing' | 'merging' | 'stopping' | ''
+  /** SteamCMD 原始状态（downloading / validating / reconfiguring 等）。 */
+  progress_stage: string
+  /** 字节进度；没有字节信息时为 0。 */
+  progress_bytes_done: number
+  progress_bytes_total: number
+  /** 由服务端按字节增量计算的速度（bytes/s）。 */
+  progress_speed: number
+  /** 当前阶段是否允许暂停/停止（Diff/Merge 阶段不可中断）。 */
+  can_stop: boolean
+  last_checked_at: number
+  last_updated_at: number
+  last_error: string
+  created_at: number
+  updated_at: number
+}
+
+export interface CreateGameRequest {
+  app_id: number
+  app_name?: string
+  repo_id?: string
+  repo_name?: string
+  install_dir?: string
+  create_repo?: boolean
+  size_bytes?: number
+  storage_id?: string
+  share_count?: number
+  target_platform?: 'windows' | 'linux' | ''
+  steam_account_id?: string
+  auto_update?: boolean
+}
+
+export interface UpdateGameRequest {
+  app_name?: string
+  install_dir?: string
+  target_platform?: 'windows' | 'linux' | ''
+  steam_account_id?: string
+  auto_update?: boolean
+}
+
+/** 普通用户游戏目录：共享 Steam 游戏库，可被任意登录用户挂载。 */
+export interface GameCatalogItemDTO {
+  id: string
+  group_id: string
+  repo_id: string
+  app_id: number
+  app_name: string
+  build_id: string
+  available_build_id: string
+  target_platform: 'windows' | 'linux' | ''
+  status: 'ready' | 'updating' | 'paused' | 'error'
+  last_updated_at: number
+  repo: RepoDTO
+}
+
+export interface GameCatalogGroupDTO {
+  id: string
+  name: string
+  description: string
+  games: GameCatalogItemDTO[]
+}
+
+/** 服务端 SteamCMD 安装状态。 */
+export interface SteamRuntimeStatusDTO {
+  installed: boolean
+  path: string
+  platform: string
+  install_dir: string
+  can_install: boolean
+  last_error: string
+  installing: boolean
+  phase: 'preparing' | 'downloading' | 'extracting' | 'bootstrapping' | 'done' | 'failed' | ''
+  progress: number
+  message: string
+  proxy: string
+  proxy_source: 'config' | 'system' | 'env' | 'pac' | 'none' | ''
+  proxy_hint: string
+}
+
+export interface SteamNetworkCheckDTO {
+  ok: boolean
+  url: string
+  status: number
+  latency_ms: number
+  error: string
+  proxy: string
+  proxy_source: 'config' | 'system' | 'env' | 'pac' | 'none' | ''
+  proxy_hint: string
+}
+
+/** Steam 游戏条目（账号已拥有列表 / 商店搜索结果 / 本机 Steam 库，用于批量添加时勾选）。 */
+export interface SteamStoreGameDTO {
+  app_id: number
+  name: string
+  image: string
+  platforms: Array<'windows' | 'macos' | 'linux'>
+  owned: boolean
+  /** 来自客户端本机 Steam 库时：是否已安装。 */
+  installed?: boolean
+  /** 本机 Steam 缓存里有封面，可通过 preload 的 steamLocalImage 懒加载。 */
+  has_local_image?: boolean
+}
+
+export interface BatchCreateGamesRequest {
+  size_bytes: number
+  storage_id?: string
+  games: Array<{ app_id: number; app_name: string }>
+}
+
+export interface BatchCreateGamesResultDTO {
+  created: GameDTO[]
+  failed: Array<{ app_id: number; app_name: string; code: string }>
+}

@@ -3,18 +3,45 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"time"
 
 	"vault/internal/config"
 	"vault/internal/domain"
 	"vault/internal/store"
 )
 
+// auditWriteTimeout 是审计落库的独立超时。
+//
+// 审计是旁路记录，不应该被业务操作的 context 牵连：SteamCMD 超时、客户端断开、
+// 长任务到达 deadline 时，业务 ctx 已经结束，但这条审计仍然应该写进去。
+const auditWriteTimeout = 5 * time.Second
+
 // writeAudit 落一条审计；失败仅告警，不影响主流程（避免审计异常导致业务失败）。
 func (d Deps) writeAudit(ctx context.Context, entry *domain.AuditLog) {
 	if d.Store == nil {
 		return
 	}
-	if err := d.Store.AppendAudit(ctx, entry); err != nil && d.Log != nil {
+	// 关键：审计写入必须脱离调用方 ctx 的取消/超时。
+	// context.WithoutCancel 保留 ctx 里的值（trace/principal 等），但不再继承取消信号；
+	// 再套一个独立超时，避免数据库异常时把调用方永久挂住。
+	base := context.Background()
+	if ctx != nil {
+		base = context.WithoutCancel(ctx)
+	}
+	auditCtx, cancel := context.WithTimeout(base, auditWriteTimeout)
+	defer cancel()
+	if err := d.Store.AppendAudit(auditCtx, entry); err != nil {
+		if d.Log == nil {
+			return
+		}
+		// 审计超时/取消不是业务错误，降级为 debug，避免每次长任务超时都多一条
+		// "写入审计失败: context canceled" 的伴生日志。
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			d.Log.Debug("写入审计超时（已忽略）", "action", entry.Action,
+				"resource", entry.Resource, "error", err)
+			return
+		}
 		d.Log.Warn("写入审计失败", "action", entry.Action, "resource", entry.Resource, "error", err)
 	}
 }

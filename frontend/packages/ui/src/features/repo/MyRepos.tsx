@@ -13,6 +13,8 @@ export interface MyReposProps {
   onOpenStorages?: () => void
   /** 首页「我的配额」标题后的箭头（仅超级管理员可见）：进入用户管理页。 */
   onOpenUsers?: () => void
+  /** Steam 分组详情里的「分组管理」入口。 */
+  onManageSteamGroup?: (groupID: string) => void
 }
 
 /** 用户功能：我的存储库（仅本人拥有或可访问的库，由服务端过滤）。 */
@@ -23,7 +25,8 @@ export function MyRepos({
   onOpenPerformance,
   onOpenUpload,
   onOpenStorages,
-  onOpenUsers
+  onOpenUsers,
+  onManageSteamGroup
 }: MyReposProps): JSX.Element {
   return (
     <RepoList
@@ -35,6 +38,7 @@ export function MyRepos({
       onOpenUpload={onOpenUpload}
       onOpenStorages={onOpenStorages}
       onOpenUsers={onOpenUsers}
+      onManageSteamGroup={onManageSteamGroup}
     />
   )
 }

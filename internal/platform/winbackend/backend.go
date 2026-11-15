@@ -136,6 +136,11 @@ func (b *Backend) Resize(ctx context.Context, ref string, sizeBytes int64) error
 	return b.VHD.Resize(ctx, ref, sizeBytes)
 }
 
+// ExtendPartition 把 VHDX 内最大的 NTFS 分区扩到磁盘最大可用容量。
+func (b *Backend) ExtendPartition(ctx context.Context, ref string) error {
+	return b.VHD.ExtendPartition(ctx, ref)
+}
+
 // ResetDiskIdentifier 重置 VHDX 磁盘标识。
 //
 // 无 Hyper-V 模块时 winvhd 会返回 platform.reset_disk_id_unavailable，

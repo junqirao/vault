@@ -31,7 +31,12 @@ type MountSpec struct {
 	RepoName string `json:"repo_name,omitempty"`
 	// RepoGroup 存储库分组（repo.meta.group）：客户端据此决定是否用"分组挂载配置"
 	// 覆盖该库自己的配置（见 agent 的 GroupMounts / use_for_repos）。
-	RepoGroup     string `json:"repo_group,omitempty"`
+	RepoGroup string `json:"repo_group,omitempty"`
+	// SteamAppID / SteamAppName / SteamBuildID 仅 Steam 游戏库有值：
+	// 客户端据此把游戏挂到 Steam 库并生成 appmanifest_<appid>.acf。
+	SteamAppID    int64  `json:"steam_app_id,omitempty"`
+	SteamAppName  string `json:"steam_app_name,omitempty"`
+	SteamBuildID  string `json:"steam_build_id,omitempty"`
 	TargetIQN     string `json:"target_iqn"`
 	PortalAddress string `json:"portal_address"`
 	PortalPort    int    `json:"portal_port"`
@@ -186,11 +191,22 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		}
 	}
 
+	var steamAppID int64
+	var steamAppName, steamBuildID string
+	if game, gErr := s.Store.GetGameByRepoID(ctx, repo.ID); gErr == nil && game != nil {
+		steamAppID = game.AppID
+		steamAppName = game.AppName
+		steamBuildID = game.BuildID
+	}
+
 	spec := &MountSpec{
 		ServerInstanceID: raw.Server.InstanceID,
 		ServerName:       raw.Server.Name,
 		RepoName:         repo.Name,
 		RepoGroup:        repo.Meta.Group,
+		SteamAppID:       steamAppID,
+		SteamAppName:     steamAppName,
+		SteamBuildID:     steamBuildID,
 		// 必须是**平台实际存储**的目标名：推导出来的 IQN 若与平台不一致，
 		// 客户端就是"TCP 3260 可达、但登录失败"（见 IscsiService.targetIQN 的说明）。
 		TargetIQN:        s.Iscsi.targetIQN(target),

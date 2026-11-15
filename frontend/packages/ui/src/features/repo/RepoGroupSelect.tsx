@@ -3,6 +3,7 @@ import { AutoComplete, Input } from 'antd'
 import { useQuery } from '@tanstack/react-query'
 
 import { useApi } from '../../api/provider'
+import { useAuth } from '../../hooks/useAuth'
 import { useI18n } from '../../i18n'
 
 export interface RepoGroupSelectProps {
@@ -20,14 +21,28 @@ export interface RepoGroupSelectProps {
 export function RepoGroupSelect({ value, onChange, disabled }: RepoGroupSelectProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
+  const { isSuperAdmin } = useAuth()
   const reposQuery = useQuery({
     queryKey: ['repos', 'groups'],
     queryFn: () => api.listRepos({ limit: 200 }),
     staleTime: 60_000
   })
+  // 服务端分组实体：管理员能看到尚未挂任何存储库的新分组（例如刚创建的 Steam 组）。
+  // 普通用户没有该接口权限，继续从自己可见的存储库里推导组名即可。
+  const groupsQuery = useQuery({
+    queryKey: ['repo-groups', 'for-select'],
+    queryFn: () => api.listRepoGroups(),
+    staleTime: 60_000,
+    retry: false,
+    enabled: isSuperAdmin
+  })
 
   const options = useMemo(() => {
     const seen = new Set<string>()
+    for (const group of groupsQuery.data?.items ?? []) {
+      const name = (group.name ?? '').trim()
+      if (name) seen.add(name)
+    }
     for (const repo of reposQuery.data?.items ?? []) {
       const group = (repo.group ?? '').trim()
       if (group) seen.add(group)
@@ -35,7 +50,7 @@ export function RepoGroupSelect({ value, onChange, disabled }: RepoGroupSelectPr
     return Array.from(seen)
       .sort((a, b) => a.localeCompare(b))
       .map((group) => ({ value: group, label: group }))
-  }, [reposQuery.data])
+  }, [groupsQuery.data, reposQuery.data])
 
   return (
     <AutoComplete

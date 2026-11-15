@@ -87,6 +87,10 @@ type App struct {
 	fs *FSService
 	// pool 负责存储池（LVM thin pool）与缓存设备的平台管理（Windows 下不可用）。
 	pool *PoolService
+	// Steam 内容账号模块：独立管理账号/凭据/许可/租约，只服务于存储库下载/更新。
+	steamAccounts *SteamAccountService
+	repoGroups    *RepoGroupService
+	steamGames    *SteamGameService
 
 	// reconcileMu 保护最近一次对账报告（HTTP 查询与定时任务并发访问）。
 	reconcileMu   sync.Mutex
@@ -124,6 +128,9 @@ func New(d Deps) *App {
 	a.storage = &StorageService{Deps: d}
 	a.fs = &FSService{Deps: d}
 	a.pool = &PoolService{Deps: d}
+	a.steamAccounts = &SteamAccountService{Deps: d}
+	a.repoGroups = &RepoGroupService{Deps: d, Accounts: a.steamAccounts}
+	a.steamGames = NewSteamGameService(d, a.repo, a.disk, a.repoGroups, a.steamAccounts)
 	return a
 }
 
@@ -156,6 +163,15 @@ func (a *App) FS() *FSService { return a.fs }
 
 // Pools 返回存储池（LVM thin pool / dm-cache）管理服务。
 func (a *App) Pools() *PoolService { return a.pool }
+
+// SteamAccounts 返回 Steam 内容账号服务（仅用于存储库下载/更新）。
+func (a *App) SteamAccounts() *SteamAccountService { return a.steamAccounts }
+
+// RepoGroups 返回服务端分组服务。
+func (a *App) RepoGroups() *RepoGroupService { return a.repoGroups }
+
+// SteamGames 返回 Steam 游戏内容更新服务。
+func (a *App) SteamGames() *SteamGameService { return a.steamGames }
 
 // JobWorker 返回任务执行器（供 API 层取消任务，见 Worker.Cancel）。
 //

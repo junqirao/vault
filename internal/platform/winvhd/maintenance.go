@@ -6,6 +6,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"vault/internal/apperr"
 	"vault/internal/platform/winps"
@@ -65,6 +66,35 @@ func (m *Manager) Resize(ctx context.Context, path string, sizeBytes int64) erro
 		return err
 	}
 	m.logger.Info("已扩容 VHDX", "path", path, "size_bytes", sizeBytes)
+	return nil
+}
+
+// ExtendPartition attaches the VHDX, grows the largest NTFS partition to the
+// maximum supported size, then detaches it. Resize-VHD alone leaves the guest
+// partition at its old size, which makes a later diff copy hit ENOSPC even
+// though the VHDX reports a larger virtual capacity.
+func (m *Manager) ExtendPartition(ctx context.Context, path string) error {
+	if strings.TrimSpace(path) == "" {
+		return apperr.InvalidParam("path")
+	}
+	if !m.hyperVAvailable {
+		return apperr.New(CodeResetDiskIDUnavailable, http.StatusInternalServerError).
+			WithArg("reason", "hyperv_unavailable")
+	}
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+	params := []winps.Param{winps.String("Path", path)}
+	var out struct {
+		Extended bool  `json:"extended"`
+		Size     int64 `json:"size_bytes"`
+	}
+	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVHDExtendPartition, params, &out); err != nil {
+		return err
+	}
+	if out.Extended {
+		m.logger.Info("已扩展 VHDX 分区", "path", path, "size_bytes", out.Size)
+	}
 	return nil
 }
 

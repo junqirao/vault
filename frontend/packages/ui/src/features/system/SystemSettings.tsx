@@ -71,7 +71,6 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
   return (
     <PageShell title={t('page.system.title')}>
       {/* 版本契约与能力探测仍是只读；服务端配置可在下方"服务端配置"里在线修改（不可改的项已置灰）。 */}
-      <Alert type="info" showIcon message={t('system.configHint')} style={{ marginBottom: 16 }} />
       {error ? <ErrorNotice error={error} /> : null}
       {infoQuery.error ? <ErrorNotice error={infoQuery.error} /> : null}
 

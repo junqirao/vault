@@ -143,6 +143,8 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 		r.writeError(w, req, err)
 		return
 	}
+	// 首次出现的组名登记为服务端分组实体，保证后续能在分组设置里配置 Steam 账号/平台。
+	_ = r.deps.App.RepoGroups().EnsureForRepo(req.Context(), repo, in.Group)
 	r.writeJSON(w, http.StatusCreated, map[string]any{
 		"repo": toRepoDTO(repo),
 		"disk": toDiskDTO(disk),
@@ -155,10 +157,22 @@ func (r *Router) handleCreateRepo(w http.ResponseWriter, req *http.Request) {
 // 界面需要这个等级才知道该收起哪些管理入口。
 func (r *Router) handleGetRepo(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")
-	_, perm, err := r.repoPerm(req, id, domain.PermRead)
+	p, perm, err := r.repoPerm(req, id, domain.PermRead)
+	publicGame := false
 	if err != nil {
-		r.writeError(w, req, err)
-		return
+		// 共享 Steam 游戏库：任意登录用户可读（用于用户游戏目录的挂载入口）。
+		if apperr.HTTPStatus(err) == http.StatusForbidden && r.isPublicGameRepo(req, id) {
+			p, err = r.principal(req)
+			if err != nil {
+				r.writeError(w, req, err)
+				return
+			}
+			perm = domain.PermRead
+			publicGame = true
+		} else {
+			r.writeError(w, req, err)
+			return
+		}
 	}
 	repo, err := r.deps.App.Repos().Get(req.Context(), id)
 	if err != nil {
@@ -166,6 +180,11 @@ func (r *Router) handleGetRepo(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 	dto := toRepoDTOWithPerm(repo, perm)
+	if publicGame && !p.IsSuperAdmin() {
+		// 公开游戏库只暴露挂载所需信息，不向普通用户下发管理备注/客户端配置。
+		dto.Note = ""
+		dto.ClientConfig = nil
+	}
 	// 详情页的「迁移」需要知道当前存储，才能把"原地不动"的选项藏掉。
 	if st, sErr := r.deps.App.Repos().StorageOf(req.Context(), repo); sErr == nil && st != nil {
 		dto.StorageID, dto.StorageName = st.ID, st.Name
@@ -196,6 +215,9 @@ func (r *Router) handleUpdateRepo(w http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		r.writeError(w, req, err)
 		return
+	}
+	if in.Group != nil {
+		_ = r.deps.App.RepoGroups().EnsureForRepo(req.Context(), repo, *in.Group)
 	}
 	r.writeJSON(w, http.StatusOK, toRepoDTO(repo))
 }
@@ -269,14 +291,33 @@ func (r *Router) handleSetMembers(w http.ResponseWriter, req *http.Request) {
 // handleListAllocations 列出存储库的分配。
 func (r *Router) handleListAllocations(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")
-	if _, err := r.requireRepoPerm(req, id, domain.PermRead); err != nil {
+	p, err := r.principal(req)
+	if err != nil {
 		r.writeError(w, req, err)
 		return
+	}
+	filterOwn := false
+	if _, _, permErr := r.repoPerm(req, id, domain.PermRead); permErr != nil {
+		if apperr.HTTPStatus(permErr) != http.StatusForbidden || !r.isPublicGameRepo(req, id) {
+			r.writeError(w, req, permErr)
+			return
+		}
+		// 共享游戏库：非所有者只能看到自己的分配，避免泄露其他用户的分配 ID。
+		filterOwn = true
 	}
 	allocs, err := r.deps.App.Repos().ListAllocations(req.Context(), id)
 	if err != nil {
 		r.writeError(w, req, err)
 		return
+	}
+	if filterOwn {
+		mine := make([]domain.Allocation, 0, len(allocs))
+		for i := range allocs {
+			if allocs[i].UserID == p.UserID {
+				mine = append(mine, allocs[i])
+			}
+		}
+		allocs = mine
 	}
 	r.writeJSON(w, http.StatusOK, map[string]any{"items": toAllocationDTOs(allocs)})
 }
@@ -289,7 +330,7 @@ type allocateRequest struct {
 // handleAllocate 创建分配（共享库派生差异盘 / 独享库建立映射）。
 func (r *Router) handleAllocate(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")
-	p, err := r.requireRepoPerm(req, id, domain.PermManage)
+	p, err := r.principal(req)
 	if err != nil {
 		r.writeError(w, req, err)
 		return
@@ -299,10 +340,28 @@ func (r *Router) handleAllocate(w http.ResponseWriter, req *http.Request) {
 		r.writeError(w, req, err)
 		return
 	}
+	selfService := false
+	if _, err := r.requireRepoPerm(req, id, domain.PermManage); err != nil {
+		if apperr.HTTPStatus(err) != http.StatusForbidden || !r.isPublicGameRepo(req, id) {
+			r.writeError(w, req, err)
+			return
+		}
+		// 共享游戏库：普通用户可以给自己分配差异盘，但不能替别人分配。
+		if in.UserID != "" && in.UserID != p.UserID {
+			r.writeError(w, req, apperrForbiddenReason("user_mismatch"))
+			return
+		}
+		selfService = true
+	}
+	userID := in.UserID
+	if userID == "" {
+		userID = p.UserID
+	}
 	alloc, err := r.deps.App.Repos().Allocate(req.Context(), app.AllocateInput{
-		RepoID:     id,
-		UserID:     in.UserID,
-		OperatorID: p.UserID,
+		RepoID:           id,
+		UserID:           userID,
+		OperatorID:       p.UserID,
+		AllowSelfService: selfService,
 	})
 	if err != nil {
 		r.writeError(w, req, err)
@@ -499,16 +558,53 @@ func (r *Router) handleCancelRepoMove(w http.ResponseWriter, req *http.Request) 
 // handleListRepoDisks 列出存储库下的磁盘。
 func (r *Router) handleListRepoDisks(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")
-	if _, err := r.requireRepoPerm(req, id, domain.PermRead); err != nil {
+	p, err := r.principal(req)
+	if err != nil {
 		r.writeError(w, req, err)
 		return
+	}
+	filterOwn := false
+	if _, err := r.requireRepoPerm(req, id, domain.PermRead); err != nil {
+		// 共享 Steam 游戏库：普通用户只能看到自己分配到的差异盘，
+		// 不能看到别人的盘，也不能看到母盘路径。
+		if apperr.HTTPStatus(err) != http.StatusForbidden || !r.isPublicGameRepo(req, id) {
+			r.writeError(w, req, err)
+			return
+		}
+		filterOwn = true
 	}
 	disks, err := r.deps.App.Disks().ListByRepo(req.Context(), id)
 	if err != nil {
 		r.writeError(w, req, err)
 		return
 	}
-	r.writeJSON(w, http.StatusOK, map[string]any{"items": toDiskDTOs(disks)})
+	if filterOwn {
+		allocs, err := r.deps.App.Repos().ListAllocations(req.Context(), id)
+		if err != nil {
+			r.writeError(w, req, err)
+			return
+		}
+		own := make(map[string]bool, len(allocs))
+		for i := range allocs {
+			if allocs[i].UserID == p.UserID && allocs[i].State != domain.AllocationStateReleased {
+				own[allocs[i].DiskID] = true
+			}
+		}
+		mine := make([]domain.Disk, 0, len(disks))
+		for i := range disks {
+			if own[disks[i].ID] {
+				mine = append(mine, disks[i])
+			}
+		}
+		disks = mine
+	}
+	items := toDiskDTOs(disks)
+	if filterOwn {
+		for i := range items {
+			items[i].VHDXPath = ""
+		}
+	}
+	r.writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 // handleListAllDisks 列出全部磁盘（仅超管）。
@@ -640,9 +736,26 @@ func safeContentDispositionName(name string) string {
 // handleReleaseAllocation 释放分配（异步删除差异盘）。
 func (r *Router) handleReleaseAllocation(w http.ResponseWriter, req *http.Request) {
 	id := chi.URLParam(req, "id")
-	if _, err := r.requireAllocationPerm(req, id, domain.PermManage); err != nil {
+	p, err := r.principal(req)
+	if err != nil {
 		r.writeError(w, req, err)
 		return
+	}
+	if _, err := r.requireAllocationPerm(req, id, domain.PermManage); err != nil {
+		if apperr.HTTPStatus(err) != http.StatusForbidden {
+			r.writeError(w, req, err)
+			return
+		}
+		alloc, aErr := r.deps.Store.GetAllocation(req.Context(), id)
+		if aErr != nil {
+			r.writeError(w, req, aErr)
+			return
+		}
+		// 共享游戏库：分配人只能释放自己的差异盘。
+		if alloc.UserID != p.UserID || !r.isPublicGameRepo(req, alloc.RepoID) {
+			r.writeError(w, req, err)
+			return
+		}
 	}
 	if err := r.deps.App.Repos().ReleaseAllocation(req.Context(), id); err != nil {
 		r.writeError(w, req, err)

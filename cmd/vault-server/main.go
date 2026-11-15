@@ -533,6 +533,20 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	})
 	application.RegisterJobHandlers()
 
+	// 单实例启动时，上一次进程遗留的活跃 Steam 账号租约一定是脏数据（SteamCMD 进程已不存在）。
+	// 不清掉会让账号在 TTL 内一直报 steam.account_busy，表现为"死活登录不上"。
+	if n, err := application.SteamAccounts().ResetStaleLeases(ctx); err != nil {
+		log.Warn("清理残留 Steam 账号租约失败", "error", err)
+	} else if n > 0 {
+		log.Info("已清理残留 Steam 账号租约", "count", n)
+	}
+
+	// Steam 游戏自动更新调度（仅用于存储库内容下载/更新）。
+	// 启动后延迟 2 分钟再首次检查，避免与启动对账/建库任务抢资源。
+	steamCtx, cancelSteam := context.WithCancel(context.Background())
+	defer cancelSteam()
+	application.StartSteamScheduler(steamCtx)
+
 	// 内置超级管理员：账号存放在数据库中，由初始化向导创建；
 	// 配置文件里的 super_admin_enabled 仅作为可用性开关（见 app/auth.go SyncSuperAdminSwitch）。
 	if err := application.Auth().SyncSuperAdminSwitch(ctx); err != nil {

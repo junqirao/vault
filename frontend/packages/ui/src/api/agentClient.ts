@@ -143,6 +143,33 @@ export interface DirectorySelection {
  * 代理相关的三个能力标为可选：它们是"能力探测"入口——浏览器 dev（无 preload）与
  * 早期 preload 都没有它们，此时自动回退到 HTTP 直连分支。
  */
+export interface LocalSteamGame {
+  app_id: number
+  name: string
+  installed: boolean
+  has_image: boolean
+  has_icon: boolean
+  size_bytes?: number
+}
+
+export interface LocalSteamLibrary {
+  available: boolean
+  steam_root?: string
+  account_name?: string
+  games: LocalSteamGame[]
+  error?: string
+}
+
+export interface SteamLibraryInfo {
+  path: string
+  label?: string
+  app_count: number
+  free_bytes?: number
+  total_bytes?: number
+  /** 是否是 Steam 安装目录本身（它同时也是一个 Steam 库）。 */
+  steam_root: boolean
+}
+
 export interface VaultBridge {
   getConfig: () => Promise<unknown>
   setConfig: (value: unknown) => Promise<boolean>
@@ -158,6 +185,12 @@ export interface VaultBridge {
   selectDirectory?: () => Promise<DirectorySelection>
   /** 创建指向本地挂载点的快捷方式（Electron/Windows 下才存在）。 */
   createShortcut?: (input: { target: string; name?: string; dir?: string }) => Promise<ShortcutResult>
+  /** 扫描本机 Steam 库（只读本地元数据；不读取/上传登录凭据）。 */
+  steamLocalLibrary?: (force?: boolean) => Promise<LocalSteamLibrary>
+  /** 读取本机 Steam 缓存封面，返回 data URL。 */
+  steamLocalImage?: (appID: number) => Promise<string | null>
+  steamLocalIcon?: (appID: number) => Promise<string | null>
+  steamLibraries?: () => Promise<SteamLibraryInfo[]>
   openPath: (path: string) => Promise<void>
   showItemInFolder: (path: string) => Promise<void>
   quit: () => Promise<void>
@@ -505,6 +538,67 @@ export async function relaunchClient(): Promise<void> {
   const relaunch = hostBridge()?.relaunch
   if (!relaunch) return
   await relaunch()
+}
+
+/**
+ * 扫描本机 Steam 库（Electron 下有效）。
+ *
+ * 只读取本地 appcache/appmanifest 元数据与封面，不读取或上传 Steam 凭据。
+ * 浏览器 dev / 没有 preload 时返回 null，调用方回退到服务端账号列表。
+ */
+export async function fetchLocalSteamLibrary(force = false): Promise<LocalSteamLibrary | null> {
+  const scan = hostBridge()?.steamLocalLibrary
+  if (!scan) return null
+  try {
+    return await scan(force)
+  } catch {
+    return null
+  }
+}
+
+/** 本机封面按 appID 缓存，避免分页/重渲染时反复跨 IPC 读取大图。 */
+const localSteamImageCache = new Map<number, string | null>()
+
+/** 读取本机 Steam 缓存封面（data URL）；没有缓存或非 Electron 时返回 null。 */
+export async function fetchLocalSteamImage(appID: number): Promise<string | null> {
+  if (localSteamImageCache.has(appID)) return localSteamImageCache.get(appID) ?? null
+  const read = hostBridge()?.steamLocalImage
+  if (!read) return null
+  try {
+    const value = await read(appID)
+    localSteamImageCache.set(appID, value)
+    return value
+  } catch {
+    return null
+  }
+}
+
+/** 本机 32×32 应用图标缓存。 */
+const localSteamIconCache = new Map<number, string | null>()
+
+/** 读取本机 Steam 应用图标（data URL）；没有缓存或非 Electron 时返回 null。 */
+export async function fetchLocalSteamIcon(appID: number): Promise<string | null> {
+  if (localSteamIconCache.has(appID)) return localSteamIconCache.get(appID) ?? null
+  const read = hostBridge()?.steamLocalIcon
+  if (!read) return null
+  try {
+    const value = await read(appID)
+    localSteamIconCache.set(appID, value)
+    return value
+  } catch {
+    return null
+  }
+}
+
+/** 列出本机 Steam 库路径；非 Electron/探测失败时返回空数组。 */
+export async function fetchSteamLibraries(): Promise<SteamLibraryInfo[]> {
+  const read = hostBridge()?.steamLibraries
+  if (!read) return []
+  try {
+    return await read()
+  } catch {
+    return []
+  }
 }
 
 /**

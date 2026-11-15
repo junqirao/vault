@@ -36,6 +36,7 @@ type Config struct {
 	Security     SecurityConfig     `yaml:"security"`
 	Update       UpdateConfig       `yaml:"update"`
 	Platform     PlatformConfig     `yaml:"platform"`
+	Steam        SteamConfig        `yaml:"steam"`
 }
 
 // ServerConfig 服务端自身标识。instance_id 用于多服务端场景下的身份识别。
@@ -302,6 +303,47 @@ type UpdateConfig struct {
 	// MinClientVersion 低于此版本的客户端将被强制升级（留空表示不强制）。
 	MinClientVersion string `yaml:"min_client_version"`
 }
+
+// SteamConfig 是 Steam 内容账号与游戏更新模块的配置。
+//
+// 该模块**只允许用于存储库内容下载/更新**：不提供玩家登录、不提供通用 Steam 命令执行入口。
+type SteamConfig struct {
+	// Enabled 是否启用 Steam 账号/游戏更新模块。nil 视为启用。
+	Enabled *bool `yaml:"enabled"`
+	// SteamCmdPath steamcmd 可执行文件路径；留空时从 PATH 查找（Windows 也接受 steamcmd.exe）。
+	SteamCmdPath string `yaml:"steamcmd_path"`
+	// InstallDir 由本系统自动安装 SteamCMD 的目标目录；留空时使用配置文件所在目录下的 steamcmd。
+	InstallDir string `yaml:"install_dir"`
+	// Proxy 访问 Steam CDN / SteamCMD 时使用的代理（如 http://127.0.0.1:7890）。
+	//
+	// 留空表示继承进程环境变量（HTTP_PROXY / HTTPS_PROXY）。Windows 的"系统代理"
+	// 是 WinINET 设置，Go 与 SteamCMD 都不会自动读取；使用加速器时请在这里显式填写。
+	Proxy string `yaml:"proxy"`
+	// StagingDir 游戏更新的服务端暂存目录。留空时使用系统临时目录下的 vault-steam/staging。
+	//
+	// 暂存目录会被 SteamCMD 直接写入，再通过现有 diff-from-dir + merge 流程写入母盘；
+	// 建议放在容量足够且与最终存储同盘的 SSD 上。
+	StagingDir string `yaml:"staging_dir"`
+	// SessionRoot 每个账号的 SteamCMD 会话目录根（保存 ssfn/config，减少重复 2FA）。
+	// 留空时使用配置文件所在目录下的 steam/sessions（不可用时回退系统临时目录）。
+	SessionRoot string `yaml:"session_root"`
+	// AutoUpdateInterval 自动检查更新的周期；留空默认 15 分钟。
+	AutoUpdateInterval Duration `yaml:"auto_update_interval"`
+	// MaxConcurrentUpdates 全局同时执行的游戏更新任务数；留空默认 2。
+	MaxConcurrentUpdates int `yaml:"max_concurrent_updates"`
+	// AutoExpand 更新前如果暂存内容超过母盘容量，是否自动扩容母盘。nil 视为启用。
+	AutoExpand *bool `yaml:"auto_expand"`
+	// ExpandReservePercent 自动扩容时预留的额外空间百分比（默认 15）。
+	ExpandReservePercent int `yaml:"expand_reserve_percent"`
+	// DefaultRepoSizeGB 新建游戏库时的默认容量（GB）；游戏变大后自动扩容。
+	DefaultRepoSizeGB int `yaml:"default_repo_size_gb"`
+}
+
+// EnabledOrDefault 返回是否启用（未配置视为启用）。
+func (s SteamConfig) EnabledOrDefault() bool { return s.Enabled == nil || *s.Enabled }
+
+// AutoExpandEnabled 返回是否启用自动扩容（未配置视为启用）。
+func (s SteamConfig) AutoExpandEnabled() bool { return s.AutoExpand == nil || *s.AutoExpand }
 
 // Duration 是支持 YAML 字符串（如 "120s"）的时长类型。
 type Duration time.Duration
@@ -733,6 +775,24 @@ func (c *Config) validate() error {
 			c.HTTP.TLS.KeyFile = filepath.Join("pki", "server.key")
 		}
 	}
+	// Steam 内容账号模块默认值：路径留空时由服务层按系统临时目录推导；
+	// 这里只补周期/并发，保证零配置也能工作。
+	if c.Steam.Enabled == nil {
+		enabled := true
+		c.Steam.Enabled = &enabled
+	}
+	if c.Steam.AutoUpdateInterval <= 0 {
+		c.Steam.AutoUpdateInterval = Duration(15 * time.Minute)
+	}
+	if c.Steam.MaxConcurrentUpdates <= 0 {
+		c.Steam.MaxConcurrentUpdates = 2
+	}
+	if c.Steam.ExpandReservePercent <= 0 {
+		c.Steam.ExpandReservePercent = 15
+	}
+	if c.Steam.DefaultRepoSizeGB <= 0 {
+		c.Steam.DefaultRepoSizeGB = 60
+	}
 	return nil
 }
 
@@ -813,6 +873,21 @@ func applyEnvOverrides(c *Config) {
 	}
 	if v := os.Getenv("VAULT_MASTER_KEY"); v != "" {
 		c.Security.MasterKey = v
+	}
+	if v := os.Getenv("VAULT_STEAMCMD"); v != "" {
+		c.Steam.SteamCmdPath = v
+	}
+	if v := os.Getenv("VAULT_STEAMCMD_DIR"); v != "" {
+		c.Steam.InstallDir = v
+	}
+	if v := os.Getenv("VAULT_STEAM_PROXY"); v != "" {
+		c.Steam.Proxy = v
+	}
+	if v := os.Getenv("VAULT_STEAM_STAGING_DIR"); v != "" {
+		c.Steam.StagingDir = v
+	}
+	if v := os.Getenv("VAULT_STEAM_SESSION_ROOT"); v != "" {
+		c.Steam.SessionRoot = v
 	}
 }
 

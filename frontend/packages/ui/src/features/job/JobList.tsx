@@ -35,6 +35,7 @@ const DISK_JOB_TYPES = new Set([
   'copy_vhdx',
   'create_diff',
   'create_diff_from_dir',
+  'steam_update',
   'plan_client_diff',
   'compact',
   'delete_disk',

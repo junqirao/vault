@@ -48,6 +48,33 @@ type AgentStreamMessage =
   | { kind: 'error' }
   | { kind: 'event'; type: string; data: string }
 
+interface LocalSteamGameInfo {
+  app_id: number
+  name: string
+  installed: boolean
+  has_image: boolean
+  has_icon: boolean
+  size_bytes?: number
+}
+
+interface LocalSteamLibraryInfo {
+  available: boolean
+  steam_root?: string
+  account_name?: string
+  games: LocalSteamGameInfo[]
+  error?: string
+}
+
+interface SteamLibraryInfo {
+  path: string
+  label?: string
+  app_count: number
+  free_bytes?: number
+  total_bytes?: number
+  /** 是否是 Steam 安装目录本身（它同时也是一个 Steam 库）。 */
+  steam_root: boolean
+}
+
 /** preload 暴露的最小 API（见 electron/preload.ts）。 */
 interface VaultBridge {
   /**
@@ -78,6 +105,14 @@ interface VaultBridge {
   }>
   openPath: (path: string) => Promise<void>
   showItemInFolder: (path: string) => Promise<void>
+  /** 扫描本机 Steam 库（只读本地元数据；不读取/上传登录凭据）。 */
+  steamLocalLibrary: (force?: boolean) => Promise<LocalSteamLibraryInfo>
+  /** 读取本机 Steam 缓存封面，返回 data URL。 */
+  steamLocalImage: (appID: number) => Promise<string | null>
+  /** 读取本机 Steam 32×32 应用图标，返回 data URL。 */
+  steamLocalIcon: (appID: number) => Promise<string | null>
+  /** 列出本机 Steam 库路径。 */
+  steamLibraries: () => Promise<SteamLibraryInfo[]>
   quit: () => Promise<void>
 }
 

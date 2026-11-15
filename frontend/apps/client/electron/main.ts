@@ -1,5 +1,5 @@
 import crypto from 'node:crypto'
-import { promises as fs } from 'node:fs'
+import { mkdirSync, promises as fs, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { BrowserWindow, Menu, Tray, app, dialog, ipcMain, nativeImage, shell } from 'electron'
 
@@ -11,6 +11,7 @@ import {
   type StartupUpdateOutcome,
   type StartupUpdateStatus
 } from './clientUpdate'
+import { listLocalSteamLibrary, listSteamLibraries, readLocalSteamIcon, readLocalSteamImage } from './steamLocal'
 import { agentDataDir, resolveBundledVersion, resolveWebappEntry } from './webapp'
 
 /**
@@ -30,6 +31,14 @@ import { agentDataDir, resolveBundledVersion, resolveWebappEntry } from './webap
 const CONFIG_DIR = path.join(app.getPath('appData'), 'Vault')
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json')
 const WINDOW_STATE_FILE = path.join(CONFIG_DIR, 'window-state.json')
+/**
+ * 最近一次窗口形态（显示 / 仅托盘）。
+ *
+ * 更新重启时不能只看"这次进程是怎么启动的"：开机自启带着 `--hidden`，但用户后来
+ * 从托盘打开了窗口，重启后应当继续显示窗口。这里在每次显示/隐藏时落盘，更新器拉起的
+ * 新进程读取它来决定窗口形态。
+ */
+const WINDOW_VISIBLE_FILE = path.join(CONFIG_DIR, 'window-visible.json')
 /** 记录"上次清理渲染缓存时的应用版本"（与用户配置同目录，不受缓存清理影响）。 */
 const CACHE_VERSION_FILE = path.join(CONFIG_DIR, 'renderer-cache-version.json')
 /** 内置渲染层入口（随 exe 打包）：热更层不可用、或加载失败时的兜底。 */
@@ -105,13 +114,6 @@ function wantsHiddenStart(argv: readonly string[], env: NodeJS.ProcessEnv): bool
   return env[CLIENT_HIDDEN_ENV] === '1'
 }
 
-let startHidden = !DEV_SERVER_URL && wantsHiddenStart(process.argv, process.env)
-
-// 把"这次是后台启动"写回环境变量：本机代理（agent.ts 的 spawn 没传 env）等子进程靠继承，
-// 它们再拉起客户端（切换器 / 代理侧切换器）时不至于把这个语义弄丢。只写不删：值为 '1' 才是
-// 隐藏，其余一律显示，残留的 '0' 无害。
-if (startHidden) process.env[CLIENT_HIDDEN_ENV] = '1'
-
 /**
  * 本次启动是否由更新器刚刚拉起。
  *
@@ -121,6 +123,60 @@ if (startHidden) process.env[CLIENT_HIDDEN_ENV] = '1'
  */
 const launchedByUpdater = process.env[SKIP_UPDATE_ENV] === '1'
 if (launchedByUpdater) delete process.env[SKIP_UPDATE_ENV]
+
+let startHidden = !DEV_SERVER_URL && wantsHiddenStart(process.argv, process.env)
+
+/**
+ * 更新器拉起的新实例：以**旧实例退出前的窗口形态**为准。
+ *
+ * 只依赖命令行/环境变量会把"开机自启（--hidden）→ 用户后来打开窗口 → 更新重启"
+ * 误判成仍然隐藏；反过来，从托盘隐藏状态下更新也不能突然弹出窗口。旧实例会在
+ * handleSwitching / vault:relaunch 前把当前形态写入 WINDOW_VISIBLE_FILE。
+ */
+if (launchedByUpdater && !DEV_SERVER_URL) {
+  const lastVisible = readLastWindowVisible()
+  if (lastVisible !== null) startHidden = !lastVisible
+}
+
+// 把"这次是后台启动"写回环境变量：本机代理（agent.ts 的 spawn 没传 env）等子进程靠继承，
+// 它们再拉起客户端（切换器 / 代理侧切换器）时不至于把这个语义弄丢。只写 '1' 才是隐藏；
+// 显示启动时显式清掉继承来的旧值，避免后续重启又被当成后台启动。
+if (startHidden) process.env[CLIENT_HIDDEN_ENV] = '1'
+else delete process.env[CLIENT_HIDDEN_ENV]
+
+/** 本次进程期望的窗口形态（true = 应该显示窗口）。 */
+let desiredWindowVisible = !startHidden
+
+interface WindowVisibleState {
+  visible: boolean
+  at: number
+}
+
+/** 同步读取上次窗口形态；文件缺失/损坏时返回 null。 */
+function readLastWindowVisible(): boolean | null {
+  try {
+    const parsed = JSON.parse(readFileSync(WINDOW_VISIBLE_FILE, 'utf8')) as Partial<WindowVisibleState>
+    return typeof parsed.visible === 'boolean' ? parsed.visible : null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 记录窗口形态。
+ *
+ * 用同步写：显示/隐藏事件可能连续触发（例如 show 后立刻 hide），异步写会让落盘顺序
+ * 变得不确定；这个文件很小，同步写不会造成可感知的卡顿。
+ */
+function persistWindowVisible(visible: boolean): void {
+  desiredWindowVisible = visible
+  try {
+    mkdirSync(path.dirname(WINDOW_VISIBLE_FILE), { recursive: true })
+    writeFileSync(WINDOW_VISIBLE_FILE, JSON.stringify({ visible, at: Date.now() }, null, 2), 'utf8')
+  } catch (error) {
+    console.warn(`[vault] 记录窗口形态失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+}
 /**
  * 是否正在切换渲染层。
  *
@@ -671,14 +727,35 @@ function registerIpc(): void {
     if (typeof target === 'string' && target) shell.showItemInFolder(target)
     return true
   })
+  // 本机 Steam 库：只读取本地 appcache/appmanifest 元数据与封面，不读取/上传凭据。
+  ipcMain.handle('vault:steam-local-library', async (_event, force: unknown) =>
+    listLocalSteamLibrary(force === true)
+  )
+  ipcMain.handle('vault:steam-local-image', async (_event, appID: unknown) => {
+    if (typeof appID !== 'number' || !Number.isSafeInteger(appID) || appID <= 0) return null
+    return readLocalSteamImage(appID)
+  })
+  ipcMain.handle('vault:steam-local-icon', async (_event, appID: unknown) => {
+    if (typeof appID !== 'number' || !Number.isSafeInteger(appID) || appID <= 0) return null
+    return readLocalSteamIcon(appID)
+  })
+  ipcMain.handle('vault:steam-libraries', async () => listSteamLibraries())
   ipcMain.handle('vault:quit', async () => {
     await quitGracefully()
   })
   // 立即重启客户端，让已激活的渲染层热更资源生效（见 resolveWebappEntry）。
   ipcMain.handle('vault:relaunch', async () => {
     await agent.shutdown()
+    // 重启后的窗口形态跟随"当前"形态，而不是最初启动参数：
+    // 自启时带 --hidden，但用户后来打开过窗口，重启后仍应显示窗口。
+    const visible = desiredWindowVisible
+    persistWindowVisible(visible)
+    const args = process.argv
+      .slice(1)
+      .filter((arg) => arg !== CLIENT_HIDDEN_ARG && arg !== '--window' && arg !== '--show')
+    args.push(visible ? '--window' : CLIENT_HIDDEN_ARG)
     quitting = true
-    app.relaunch()
+    app.relaunch({ args })
     app.exit(0)
   })
   // 让"刚刚激活的热更渲染层"立刻生效：重新解析热更目录并加载，无需重启整个客户端。
@@ -816,6 +893,9 @@ async function handleSwitching(): Promise<void> {
   if (switchingForUpdate) return
   switchingForUpdate = true
   logClientUpdate('切换器已接手：隐藏窗口、停止本地代理、退出自身，由切换器启动新版本')
+  // 先落盘"更新前"的窗口形态，再隐藏窗口。隐藏事件本身会触发一次 false 记录，
+  // switchingForUpdate 会让监听器跳过，避免把"用户本来开着窗口"记成托盘状态。
+  persistWindowVisible(desiredWindowVisible)
   try {
     mainWindow?.hide()
   } catch {
@@ -866,6 +946,23 @@ async function createWindow(): Promise<void> {
   // 自动挂载都发生在渲染层与本地代理里，不需要窗口可见；用户双击启动则照常显示。
   mainWindow.once('ready-to-show', () => {
     if (!startHidden) mainWindow?.show()
+    // 首次就记录一次：自启隐藏时写 false，手动启动写 true。
+    // 后续更新重启读取的就是这个"当前形态"，而不是最初命令行参数。
+    persistWindowVisible(!startHidden)
+  })
+
+  mainWindow.on('show', () => {
+    if (!switchingForUpdate && !quittingStarted) persistWindowVisible(true)
+  })
+  mainWindow.on('hide', () => {
+    if (!switchingForUpdate && !quittingStarted && !quitting) persistWindowVisible(false)
+  })
+  // 最小化仍算"窗口还开着"：更新重启后应恢复成正常窗口，而不是缩进托盘。
+  mainWindow.on('minimize', () => {
+    if (!switchingForUpdate && !quittingStarted) persistWindowVisible(true)
+  })
+  mainWindow.on('restore', () => {
+    if (!switchingForUpdate && !quittingStarted) persistWindowVisible(true)
   })
 
   const persistState = async (): Promise<void> => {
@@ -1142,6 +1239,7 @@ function showWindow(): void {
   if (quittingStarted) return
   // 用户主动要窗口：此后的重建（关闭 → 托盘 → 再打开）都照常显示。
   startHidden = false
+  persistWindowVisible(true)
   if (!mainWindow) {
     void createWindow()
     return
@@ -1375,7 +1473,13 @@ if (gotLock) {
       // 旧实例已结束：重启自身一次，让新进程干净地取得单实例锁。
       // 本进程已提权（requireAdministrator），创建同样要求的子进程不会再弹 UAC。
       process.env[TAKEOVER_DONE_ENV] = '1'
-      app.relaunch()
+      const visible = desiredWindowVisible
+      persistWindowVisible(visible)
+      const args = process.argv
+        .slice(1)
+        .filter((arg) => arg !== CLIENT_HIDDEN_ARG && arg !== '--window' && arg !== '--show')
+      args.push(visible ? '--window' : CLIENT_HIDDEN_ARG)
+      app.relaunch({ args })
       app.exit(0)
       return
     }

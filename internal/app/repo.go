@@ -135,6 +135,10 @@ type AllocateInput struct {
 	// 旧分配与旧差异盘立即从用户身上摘掉，旧盘标记 deleting 后交给后台
 	// JobDeleteDisk 销毁；新分配不等待旧盘删完就能返回。
 	Replace bool
+	// AllowSelfService 允许普通用户为自己分配"共享 Steam 游戏库"。
+	//
+	// 只由 game-catalog 的挂载入口设置；普通存储库仍要求 owner/manage 权限。
+	AllowSelfService bool
 }
 
 // Create 创建存储库。
@@ -779,6 +783,9 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 		if in.Replace && !repo.IsShared() {
 			return apperr.New("repo.not_shared", 409).WithArg("mode", string(repo.Mode))
 		}
+		if in.AllowSelfService && !repo.IsShared() {
+			return apperr.New("repo.not_shared", 409).WithArg("mode", string(repo.Mode))
+		}
 		if repo.State != domain.RepoStateActive {
 			return apperr.New("repo.state_invalid", 409).WithArg("state", string(repo.State))
 		}
@@ -795,10 +802,14 @@ func (s *RepoService) Allocate(ctx context.Context, in AllocateInput) (*domain.A
 			return apperr.New("user.disabled", 409).WithArg("user_id", userID)
 		}
 		if repo.OwnerID != operatorID && !op.IsSuperAdmin() {
-			if m, mErr := tx.GetRepoMember(ctx, repo.ID, operatorID); mErr != nil {
-				return mErr
-			} else if m == nil || m.Perm != domain.PermManage {
-				return apperr.AuthForbidden().WithArg("reason", "manage_required")
+			// 共享 Steam 游戏库：允许登录用户为自己创建差异盘（自服务挂载）。
+			// 这是唯一放宽点，且必须严格满足"操作者 == 被分配用户"。
+			if !(in.AllowSelfService && userID == operatorID) {
+				if m, mErr := tx.GetRepoMember(ctx, repo.ID, operatorID); mErr != nil {
+					return mErr
+				} else if m == nil || m.Perm != domain.PermManage {
+					return apperr.AuthForbidden().WithArg("reason", "manage_required")
+				}
 			}
 		}
 
@@ -1508,6 +1519,31 @@ func (s *RepoService) TransitionParent(ctx context.Context, repoID string, actio
 	return nil, nil
 }
 
+// AbortMaintenance 在更新流水线失败时退出维护态，但**不自增母盘版本**。
+//
+// 与 TransitionParent(ParentActionFinishMaint) 的区别：后者表示"母盘内容确实变了"，
+// 会把 parent_version +1 并清理旧差异盘；更新在真正合并前失败时母盘并未改变，
+// 不能无端升版本。该方法只做状态收尾与目标清理，供内部流水线使用。
+func (s *RepoService) AbortMaintenance(ctx context.Context, repoID, operatorID string) error {
+	repo, err := s.Store.GetRepository(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if repo.Condition() != domain.ParentMaintenance {
+		return nil
+	}
+	if err := s.endParentShare(ctx, repo, false, ParentActionFinishMaint, operatorID); err != nil {
+		return err
+	}
+	s.emit("repo", map[string]any{
+		"action":           "abort_maintenance",
+		"repo_id":          repoID,
+		"parent_condition": string(domain.ParentIdle),
+		"operator_id":      operatorID,
+	})
+	return nil
+}
+
 // endParentShare 把库从临时共享 / 维护态改回 idle，并**尽力而为**地入队目标清理。
 //
 // 顺序刻意是"先改状态、再入队清理"：改状态是纯 DB/本地动作，快且必成功；平台清理可能因
@@ -1721,8 +1757,15 @@ func (s *RepoService) ResizeParentDisk(ctx context.Context, repoID string, sizeB
 	if s.Disk == nil {
 		return nil, errNotImplemented
 	}
+	s.UnmountParentVolume(ctx, repoID)
 	if err := s.Disk.Resize(ctx, parent.VHDXPath, sizeBytes); err != nil {
 		return nil, err
+	}
+	// Resize-VHD 只改 VHDX 虚拟大小；必须同时扩展 guest 分区，否则内部卷仍是旧容量。
+	if ext, ok := s.Disk.(platform.PartitionExtender); ok {
+		if err := ext.ExtendPartition(ctx, parent.VHDXPath); err != nil {
+			return nil, err
+		}
 	}
 	parent.SizeBytes = sizeBytes
 	if err := s.Store.UpdateDisk(ctx, parent); err != nil {
@@ -1744,6 +1787,63 @@ func (s *RepoService) ResizeParentDisk(ctx context.Context, repoID string, sizeB
 }
 
 // startTempShare 创建临时共享的占位分配与目标记录，并提交发布任务。
+// ensureParentPartition extends the guest partition of an existing parent disk to
+// the VHDX maximum. It repairs repos created by older versions where only the VHDX
+// was resized, leaving the mounted NTFS volume at its old size.
+func (s *RepoService) ensureParentPartition(ctx context.Context, repoID string) error {
+	ext, ok := s.Disk.(platform.PartitionExtender)
+	if !ok || s.Disk == nil {
+		return nil
+	}
+	repo, err := s.Store.GetRepository(ctx, repoID)
+	if err != nil {
+		return err
+	}
+	if repo.ParentDiskID == nil {
+		return apperr.New("repo.disk_missing", 500)
+	}
+	parent, err := s.Store.GetDisk(ctx, *repo.ParentDiskID)
+	if err != nil {
+		return err
+	}
+	// Parent partition metadata must not be changed while child differencing
+	// disks exist: they reference the same base blocks. The update pipeline
+	// extends each child before writing, and the merge carries that partition
+	// table back to the parent.
+	if n, countErr := s.Store.CountDiffDisks(ctx, parent.ID); countErr == nil && n > 0 {
+		return nil
+	}
+	// Extending a partition needs exclusive access to the VHDX; detach the
+	// server-side parent mount and any iSCSI target that still references it.
+	s.UnmountParentVolume(ctx, repoID)
+	if s.IscsiSvc != nil {
+		s.IscsiSvc.TeardownDiskTargets(ctx, parent.ID)
+	}
+	if err := ext.ExtendPartition(ctx, parent.VHDXPath); err != nil {
+		// Windows without Hyper-V cannot resize/extend VHDX; leave the old
+		// behaviour intact instead of blocking every update.
+		if apperr.CodeOf(err) == "platform.reset_disk_id_unavailable" {
+			if s.Log != nil {
+				s.Log.Warn("扩展母盘分区失败（缺少 Hyper-V），继续", "repo_id", repoID, "error", err)
+			}
+			return nil
+		}
+		return err
+	}
+	// Extending the guest partition rewrites the partition table and changes the
+	// VHDX head/mtime; refresh the parent fingerprint or reconcile will treat it
+	// as an out-of-band modification and disable every child target.
+	if fp, fpErr := s.Disk.Fingerprint(parent.VHDXPath); fpErr == nil {
+		parent.ContentFingerprint = fp
+		if err := s.Store.UpdateDisk(ctx, parent); err != nil && s.Log != nil {
+			s.Log.Warn("扩展分区后刷新母盘指纹失败", "repo_id", repoID, "error", err)
+		}
+	} else if s.Log != nil {
+		s.Log.Warn("扩展分区后计算母盘指纹失败", "repo_id", repoID, "error", fpErr)
+	}
+	return nil
+}
+
 func (s *RepoService) startTempShare(ctx context.Context, repo *domain.Repository, operatorID string) error {
 	// 临时只读共享要预下发目标：其它客户端随后自行连接，没有"挂载"这个显式动作来触发下发。
 	if err := s.publishParentTarget(ctx, repo, true, true); err != nil {

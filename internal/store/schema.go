@@ -256,6 +256,112 @@ var sqliteSchema = []string{
 		updated_at  INTEGER NOT NULL
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_storage_volumes_state ON storage_volumes(state)`,
+
+	// ---- Steam 内容账号（仅用于存储库下载/更新；凭据全部密文存储） ----
+	`CREATE TABLE IF NOT EXISTS steam_accounts (
+		id                    TEXT PRIMARY KEY,
+		username              TEXT NOT NULL UNIQUE,
+		display_name          TEXT NOT NULL DEFAULT '',
+		status                TEXT NOT NULL DEFAULT 'needs_2fa',
+		credential_cipher     BLOB NOT NULL,
+		credential_kind       TEXT NOT NULL DEFAULT 'password',
+		auth_token_cipher     BLOB,
+		token_updated_at      INTEGER NOT NULL DEFAULT 0,
+		session_state         TEXT NOT NULL DEFAULT 'none',
+		guard_type            TEXT NOT NULL DEFAULT 'none',
+		guard_secret_cipher   BLOB,
+		last_guard_at         INTEGER NOT NULL DEFAULT 0,
+		max_concurrent        INTEGER NOT NULL DEFAULT 1,
+		last_login_at         INTEGER NOT NULL DEFAULT 0,
+		last_checked_at       INTEGER NOT NULL DEFAULT 0,
+		last_error            TEXT NOT NULL DEFAULT '',
+		last_output           TEXT NOT NULL DEFAULT '',
+		session_home          TEXT NOT NULL DEFAULT '',
+		created_at            INTEGER NOT NULL,
+		updated_at            INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_steam_accounts_status ON steam_accounts(status)`,
+
+	`CREATE TABLE IF NOT EXISTS steam_account_apps (
+		account_id  TEXT NOT NULL REFERENCES steam_accounts(id) ON DELETE CASCADE,
+		app_id      INTEGER NOT NULL,
+		source      TEXT NOT NULL DEFAULT '',
+		verified_at INTEGER NOT NULL,
+		PRIMARY KEY (account_id, app_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_steam_account_apps_app ON steam_account_apps(app_id)`,
+
+	`CREATE TABLE IF NOT EXISTS steam_apps (
+		app_id     INTEGER PRIMARY KEY,
+		name       TEXT NOT NULL DEFAULT '',
+		image      TEXT NOT NULL DEFAULT '',
+		platforms  TEXT NOT NULL DEFAULT '',
+		app_type   INTEGER NOT NULL DEFAULT -1,
+		updated_at INTEGER NOT NULL
+	)`,
+
+	`CREATE TABLE IF NOT EXISTS steam_account_leases (
+		id          TEXT PRIMARY KEY,
+		account_id  TEXT NOT NULL REFERENCES steam_accounts(id) ON DELETE CASCADE,
+		holder      TEXT NOT NULL DEFAULT '',
+		holder_id   TEXT NOT NULL DEFAULT '',
+		state       TEXT NOT NULL,
+		acquired_at INTEGER NOT NULL,
+		expires_at  INTEGER NOT NULL,
+		released_at INTEGER NOT NULL DEFAULT 0,
+		last_error  TEXT NOT NULL DEFAULT ''
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_steam_leases_account ON steam_account_leases(account_id, state)`,
+
+	// ---- 服务端分组（Steam 组绑定账号、平台与自动更新） ----
+	`CREATE TABLE IF NOT EXISTS repo_groups (
+		id               TEXT PRIMARY KEY,
+		name             TEXT NOT NULL UNIQUE,
+		kind             TEXT NOT NULL DEFAULT 'general',
+		description      TEXT NOT NULL DEFAULT '',
+		steam_account_id TEXT,
+		target_platform  TEXT NOT NULL DEFAULT 'windows',
+		auto_update      INTEGER NOT NULL DEFAULT 0,
+		update_schedule  TEXT NOT NULL DEFAULT '',
+		update_window    TEXT NOT NULL DEFAULT '',
+		max_concurrent   INTEGER NOT NULL DEFAULT 1,
+		storage_id       TEXT NOT NULL DEFAULT '',
+		access_mode      TEXT NOT NULL DEFAULT 'all',
+		created_at       INTEGER NOT NULL,
+		updated_at       INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_repo_groups_kind ON repo_groups(kind)`,
+
+	`CREATE TABLE IF NOT EXISTS repo_group_members (
+		group_id   TEXT NOT NULL REFERENCES repo_groups(id) ON DELETE CASCADE,
+		user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+		created_at INTEGER NOT NULL,
+		PRIMARY KEY (group_id, user_id)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_repo_group_members_user ON repo_group_members(user_id)`,
+
+	// ---- 游戏（一个 AppID 绑定一个共享存储库） ----
+	`CREATE TABLE IF NOT EXISTS games (
+		id                 TEXT PRIMARY KEY,
+		group_id           TEXT NOT NULL REFERENCES repo_groups(id) ON DELETE CASCADE,
+		repo_id            TEXT UNIQUE,
+		app_id             INTEGER NOT NULL,
+		app_name           TEXT NOT NULL DEFAULT '',
+		install_dir        TEXT NOT NULL DEFAULT '',
+		build_id           TEXT NOT NULL DEFAULT '',
+		available_build_id TEXT NOT NULL DEFAULT '',
+		target_platform    TEXT NOT NULL DEFAULT '',
+		steam_account_id   TEXT,
+		auto_update        INTEGER,
+		status             TEXT NOT NULL DEFAULT 'ready',
+		last_checked_at    INTEGER NOT NULL DEFAULT 0,
+		last_updated_at    INTEGER NOT NULL DEFAULT 0,
+		last_error         TEXT NOT NULL DEFAULT '',
+		created_at         INTEGER NOT NULL,
+		updated_at         INTEGER NOT NULL
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_games_group ON games(group_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_games_app ON games(app_id)`,
 }
 
 // mysqlSchema 是 MySQL 的等价建表语句。
@@ -508,5 +614,109 @@ var mysqlSchema = []string{
 		created_at  BIGINT NOT NULL,
 		updated_at  BIGINT NOT NULL,
 		KEY idx_storage_volumes_state (state)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+	// ---- Steam 内容账号（仅用于存储库下载/更新；凭据全部密文存储） ----
+	`CREATE TABLE IF NOT EXISTS steam_accounts (
+		id                    VARCHAR(64) PRIMARY KEY,
+		username              VARCHAR(190) NOT NULL UNIQUE,
+		display_name          VARCHAR(190) NOT NULL DEFAULT '',
+		status                VARCHAR(32) NOT NULL DEFAULT 'needs_2fa',
+		credential_cipher     LONGBLOB NOT NULL,
+		credential_kind       VARCHAR(32) NOT NULL DEFAULT 'password',
+		auth_token_cipher     LONGBLOB NULL,
+		token_updated_at      BIGINT NOT NULL DEFAULT 0,
+		session_state         VARCHAR(32) NOT NULL DEFAULT 'none',
+		guard_type            VARCHAR(16) NOT NULL DEFAULT 'none',
+		guard_secret_cipher   LONGBLOB NULL,
+		last_guard_at         BIGINT NOT NULL DEFAULT 0,
+		max_concurrent        INT NOT NULL DEFAULT 1,
+		last_login_at         BIGINT NOT NULL DEFAULT 0,
+		last_checked_at       BIGINT NOT NULL DEFAULT 0,
+		last_error            LONGTEXT NOT NULL,
+		last_output           LONGTEXT NOT NULL,
+		session_home          VARCHAR(512) NOT NULL DEFAULT '',
+		created_at            BIGINT NOT NULL,
+		updated_at            BIGINT NOT NULL,
+		KEY idx_steam_accounts_status (status)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+	`CREATE TABLE IF NOT EXISTS steam_account_apps (
+		account_id  VARCHAR(64) NOT NULL,
+		app_id      BIGINT NOT NULL,
+		source      VARCHAR(64) NOT NULL DEFAULT '',
+		verified_at BIGINT NOT NULL,
+		PRIMARY KEY (account_id, app_id),
+		KEY idx_steam_account_apps_app (app_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+	`CREATE TABLE IF NOT EXISTS steam_apps (
+		app_id     BIGINT PRIMARY KEY,
+		name       VARCHAR(255) NOT NULL DEFAULT '',
+		image      VARCHAR(1024) NOT NULL DEFAULT '',
+		platforms  VARCHAR(64) NOT NULL DEFAULT '',
+		app_type   INT NOT NULL DEFAULT -1,
+		updated_at BIGINT NOT NULL
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+	`CREATE TABLE IF NOT EXISTS steam_account_leases (
+		id          VARCHAR(64) PRIMARY KEY,
+		account_id  VARCHAR(64) NOT NULL,
+		holder      VARCHAR(64) NOT NULL DEFAULT '',
+		holder_id   VARCHAR(190) NOT NULL DEFAULT '',
+		state       VARCHAR(32) NOT NULL,
+		acquired_at BIGINT NOT NULL,
+		expires_at  BIGINT NOT NULL,
+		released_at BIGINT NOT NULL DEFAULT 0,
+		last_error  LONGTEXT NOT NULL,
+		KEY idx_steam_leases_account (account_id, state)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+	`CREATE TABLE IF NOT EXISTS repo_groups (
+		id               VARCHAR(64) PRIMARY KEY,
+		name             VARCHAR(190) NOT NULL UNIQUE,
+		kind             VARCHAR(32) NOT NULL DEFAULT 'general',
+		description      LONGTEXT NOT NULL,
+		steam_account_id VARCHAR(64) NULL,
+		target_platform  VARCHAR(32) NOT NULL DEFAULT 'windows',
+		auto_update      TINYINT(1) NOT NULL DEFAULT 0,
+		update_schedule  VARCHAR(128) NOT NULL DEFAULT '',
+		update_window    VARCHAR(128) NOT NULL DEFAULT '',
+		max_concurrent   INT NOT NULL DEFAULT 1,
+		storage_id       VARCHAR(64) NOT NULL DEFAULT '',
+		access_mode      VARCHAR(32) NOT NULL DEFAULT 'all',
+		created_at       BIGINT NOT NULL,
+		updated_at       BIGINT NOT NULL,
+		KEY idx_repo_groups_kind (kind)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+	`CREATE TABLE IF NOT EXISTS repo_group_members (
+		group_id   VARCHAR(64) NOT NULL,
+		user_id    VARCHAR(64) NOT NULL,
+		created_at BIGINT NOT NULL,
+		PRIMARY KEY (group_id, user_id),
+		KEY idx_repo_group_members_user (user_id)
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
+
+	`CREATE TABLE IF NOT EXISTS games (
+		id                 VARCHAR(64) PRIMARY KEY,
+		group_id           VARCHAR(64) NOT NULL,
+		repo_id            VARCHAR(64) NULL UNIQUE,
+		app_id             BIGINT NOT NULL,
+		app_name           VARCHAR(255) NOT NULL DEFAULT '',
+		install_dir        VARCHAR(512) NOT NULL DEFAULT '',
+		build_id           VARCHAR(64) NOT NULL DEFAULT '',
+		available_build_id VARCHAR(64) NOT NULL DEFAULT '',
+		target_platform    VARCHAR(32) NOT NULL DEFAULT '',
+		steam_account_id   VARCHAR(64) NULL,
+		auto_update        TINYINT(1) NULL,
+		status             VARCHAR(32) NOT NULL DEFAULT 'ready',
+		last_checked_at    BIGINT NOT NULL DEFAULT 0,
+		last_updated_at    BIGINT NOT NULL DEFAULT 0,
+		last_error         LONGTEXT NOT NULL,
+		created_at         BIGINT NOT NULL,
+		updated_at         BIGINT NOT NULL,
+		KEY idx_games_group (group_id),
+		KEY idx_games_app (app_id)
 	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci`,
 }

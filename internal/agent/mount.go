@@ -549,6 +549,15 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 		return fail("mount_point", err)
 	}
 
+	// Steam 分组选择"挂载到 Steam 库"时，写入 appmanifest 让 Steam 发现游戏。
+	steamManifestPath := ""
+	if hasPref && strings.TrimSpace(pref.SteamLibrary) != "" && spec != nil && spec.SteamAppID > 0 {
+		steamManifestPath, err = writeSteamAppManifest(spec, pref.SteamLibrary, mountPath)
+		if err != nil {
+			return fail("steam_manifest", err)
+		}
+	}
+
 	// post_script 失败不阻塞挂载（见 5.5 步骤 h）。
 	e.setPhase(allocationID, MountPhasePostScript)
 	e.runPostScript(ctx, spec.PostScript, spec, serverKey, mountPath, ms.RepoName)
@@ -577,6 +586,7 @@ func (e *mountEngine) mount(ctx context.Context, req MountRequest, keepRecordOnF
 	e.a.store.UpdateMount(allocationID, func(m *MountState, r *mountRuntime) {
 		m.MountPath = mountPath
 		m.ShortcutPath = shortcutPath
+		m.SteamManifestPath = steamManifestPath
 		m.State = MountStateMounted
 		// 挂载完成：清掉阶段（阶段只在 mounting 期间有含义）。
 		m.Phase = ""
@@ -1018,6 +1028,12 @@ func (e *mountEngine) finishUnmount(parent context.Context, tail *unmountTail) {
 	if err := e.a.removeRepoShortcut(ctx, ms.ShortcutPath); err != nil {
 		e.a.logger.Warn("删除存储库快捷方式失败（本地已卸载）",
 			"allocation_id", allocationID, "shortcut_path", ms.ShortcutPath, "error", err)
+	}
+	if strings.TrimSpace(ms.SteamManifestPath) != "" {
+		if err := os.Remove(ms.SteamManifestPath); err != nil && !os.IsNotExist(err) {
+			e.a.logger.Warn("删除 Steam appmanifest 失败（不影响卸载）",
+				"allocation_id", allocationID, "manifest", ms.SteamManifestPath, "error", err)
+		}
 	}
 
 	// ② 磁盘 Offline —— Disconnect 的前置条件（否则 Disconnect-IscsiTarget 报 0xefff0040）。
@@ -1597,6 +1613,88 @@ func volumeLabelOf(repoName string) string {
 // volumeLabelInvalidChars 是 Windows 卷标不允许包含的字符（Set-Volume 会直接报错）。
 const volumeLabelInvalidChars = `\/:*?"<>|,;+=[]`
 
+// steamLibraryRoot 把 Steam 库路径归一成库根目录。
+//
+// 用户/旧配置可能选到了 <root>\steamapps\common 或 <root>\steamapps；
+// 挂载点与 appmanifest 都应以库根为基准，否则会拼成 ...\steamapps\common\steamapps\common。
+func steamLibraryRoot(raw string) string {
+	root := filepath.Clean(strings.TrimSpace(raw))
+	if root == "." || root == "" {
+		return ""
+	}
+	lower := strings.ToLower(root)
+	for _, suffix := range []string{
+		strings.ToLower(filepath.Join("steamapps", "common")),
+		"steamapps",
+	} {
+		if strings.HasSuffix(lower, suffix) {
+			root = strings.TrimRight(root[:len(root)-len(suffix)], `\/`)
+			break
+		}
+	}
+	if root == "" {
+		return ""
+	}
+	return root
+}
+
+// writeSteamAppManifest 在 Steam 库的 steamapps 下写入 appmanifest，让 Steam 把
+// 挂载目录当作已安装游戏发现。返回清单路径，供卸载时删除。
+func writeSteamAppManifest(spec *MountSpec, library, mountPath string) (string, error) {
+	if spec == nil || spec.SteamAppID <= 0 {
+		return "", nil
+	}
+	lib := steamLibraryRoot(strings.TrimSpace(library))
+	if lib == "" {
+		return "", nil
+	}
+	steamapps := filepath.Join(lib, "steamapps")
+	if err := os.MkdirAll(steamapps, 0o755); err != nil {
+		return "", err
+	}
+	installdir := filepath.Base(filepath.Clean(mountPath))
+	build := strings.TrimSpace(spec.SteamBuildID)
+	if build == "" {
+		build = "0"
+	}
+	content := fmt.Sprintf(`"AppState"
+{
+	"appid"	"%d"
+	"Universe"	"1"
+	"name"	"%s"
+	"StateFlags"	"4"
+	"installdir"	"%s"
+	"LastUpdated"	"%d"
+	"SizeOnDisk"	"%d"
+	"StagingSize"	"0"
+	"buildid"	"%s"
+	"LastOwner"	"0"
+	"UpdateResult"	"0"
+	"BytesToDownload"	"0"
+	"BytesDownloaded"	"0"
+	"AutoUpdateBehavior"	"0"
+	"AllowOtherDownloadsWhileRunning"	"0"
+	"ScheduledAutoUpdate"	"0"
+}
+`, spec.SteamAppID, vdfEscape(spec.SteamAppName), vdfEscape(installdir),
+		time.Now().Unix(), spec.DiskSizeBytes, vdfEscape(build))
+	path := filepath.Join(steamapps, fmt.Sprintf("appmanifest_%d.acf", spec.SteamAppID))
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	_ = os.Remove(path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return path, nil
+}
+
+func vdfEscape(value string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`)
+}
+
 // repoNameOf 解析存储库名称：本地请求优先，其次服务端下发值。
 func repoNameOf(req MountRequest, spec *MountSpec) string {
 	if name := strings.TrimSpace(req.RepoName); name != "" {
@@ -1933,6 +2031,10 @@ func (e *mountEngine) mountModeSatisfied(req MountRequest, ms MountState) bool {
 // 前者可以推翻既有挂载，后者不能（见 mountModeSatisfied）。
 func (e *mountEngine) explicitMode(req MountRequest, spec *MountSpec) string {
 	if gp, ok := e.groupOverride(req, spec); ok {
+		// Steam 库挂载必须是目录挂载：盘符模式无法让 Steam 按库目录发现游戏。
+		if strings.TrimSpace(gp.SteamLibrary) != "" {
+			return mountModeDirectory
+		}
 		if mode := normalizeMountMode(gp.MountMode); mode != "" {
 			return mode
 		}
@@ -1949,6 +2051,9 @@ func (e *mountEngine) explicitMode(req MountRequest, spec *MountSpec) string {
 // explicitMountDir 返回**配置里明确表态**的目录模式父目录（分组 > 请求 > 每库配置）。
 func (e *mountEngine) explicitMountDir(req MountRequest, spec *MountSpec) string {
 	if gp, ok := e.groupOverride(req, spec); ok {
+		if strings.TrimSpace(gp.SteamLibrary) != "" {
+			return filepath.Join(steamLibraryRoot(gp.SteamLibrary), "steamapps", "common")
+		}
 		if dir := strings.TrimSpace(gp.MountDir); dir != "" {
 			return dir
 		}

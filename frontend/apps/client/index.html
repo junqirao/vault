@@ -6,10 +6,11 @@
     <!--
       CSP：仅允许本地资源与内联样式/脚本（Vite dev 需要内联脚本）；
       禁止加载任何外部来源的脚本，connect-src 放开以便访问任意服务端地址。
+      封面允许 Steam 公共图片 CDN：本机没有缓存时用于补齐 DLC/内置应用的 header。
     -->
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src *; font-src 'self' data:;"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://cdn.cloudflare.steamstatic.com https://shared.akamai.steamstatic.com https://shared.fastly.steamstatic.com; connect-src *; font-src 'self' data:;"
     />
     <title>Vault</title>
     <style>

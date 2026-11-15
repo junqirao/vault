@@ -184,7 +184,7 @@ CREATE TABLE steam_accounts (
   last_checked_at       INTEGER,
   last_error            TEXT,
 
-  -- SteamCMD 持久化目录（每账号独立，保存 ssfn/config）
+  -- 账号持久化目录（每账号独立：<session_home>/steamcmd 是独立的 SteamCMD 副本）
   session_home          TEXT,
 
   created_at            INTEGER NOT NULL,
@@ -195,7 +195,7 @@ CREATE TABLE steam_accounts (
 说明：
 
 - `credential_cipher` / `guard_secret_cipher` 永不通过 API 返回。
-- `session_home` 用于保存 SteamCMD 的 `ssfn*`、`config`，减少重复 2FA。
+- `session_home` 是该账号的持久化根目录；SteamCMD 副本位于 `<session_home>/steamcmd`，登录态 `config/config.vdf`、`ssfn*` 都在这个副本里，跨重启保留。
 - `max_concurrent` 默认 1；大于 1 时租约层按计数控制。
 
 ### 6.2 steam_account_apps
@@ -381,7 +381,7 @@ MVP 先做 `password + TOTP`，`refresh_token` 作为后续能力。
 - 优先使用 `totp`。
 - `email` 模式只允许手动验证，不允许在创建流程里等待。
 - 验证码失败要退避，避免触发 Steam 风控。
-- 每个账号使用独立 `session_home`，持久化 `ssfn*`，减少验证频率。
+- 每个账号使用独立 `session_home` 和独立的 SteamCMD 副本；登录态不会跨账号覆盖。
 
 ### 8.4 权限
 
@@ -427,17 +427,48 @@ type UpdateRequest struct {
 
 平台由调用方传入，账号模块只负责把它拼进 SteamCMD 参数。
 
-### 9.2 登录注入
+### 9.2 登录注入与登录态
 
 账号模块负责：
 
 - 解密凭据；
-- 生成 TOTP（如需要）；
+- 生成 Steam Guard 验证码（如需要）；
+- 选择该账号的 SteamCMD 副本；
 - 注入 `+login`；
-- 管理 `session_home`；
 - 申请/释放租约。
 
 调用方只关心 `AppID`、`Platform`、`InstallDir`。
+
+#### 9.2.1 每账号一份 SteamCMD
+
+SteamCMD 的登录态**永远写在可执行文件所在目录**的 `config/config.vdf` 中，不受 `cwd`、`HOME`、
+`USERPROFILE`、`XDG_CONFIG_HOME` 影响（已实测确认）。因此：
+
+```text
+<session_root>/<account_id>/steamcmd/          SteamCMD 副本（含独立 config）
+<session_root>/<account_id>/steamcmd-account.txt  最近一次成功登录的账号名
+```
+
+- 账号第一次使用时，从主安装目录复制一份 SteamCMD；之后永久复用。
+- 每份副本自更新后约 156 MB；`session_root` 需要按账号数量预留空间，并挂成持久卷。
+- 复制时跳过 `config`、`logs`、`appcache`、`depotcache`、`steamapps`、`userdata`、`*.old`。
+- 同一账号同一时刻只运行一个 SteamCMD 进程（按安装根加锁）。
+- 不同账号使用不同安装根，**可以并行**下载/更新，不再需要全局串行。
+- 账号禁用不删除副本，重新启用后仍可复用登录态。
+
+#### 9.2.2 登录态复用
+
+- 登录成功后在 `session_home/steamcmd-account.txt` 写入用户名。
+- 只有标记匹配当前账号时才使用 `+login <username>`（不传密码）复用缓存 token。
+- 缓存失效时自动回退到密码 + Steam Guard。
+- 登录测试成功后不再立即发起第二次 SteamCMD 去同步许可，避免一次性邮箱验证码被第二次登录打回 `needs_2fa`。
+
+#### 9.2.3 Steam Guard 注意事项
+
+- Steam 手机令牌不是标准 6 位 TOTP，而是 **5 位 Steam 字符表验证码**（如 `PV9M4`）。
+- 密钥接受 base32，以及 SteamDesktopAuthenticator / steamguard-cli 使用的 base64 `shared_secret`。
+- SteamCMD 不消费手机 App 的“批准登录”动作；应使用 App 里的“显示 Steam Guard 代码”。
+- 同一 Steam 账号不要同时登录桌面客户端和 SteamCMD，否则可能互相踢下线。
 
 ### 9.3 命令示例
 
@@ -445,6 +476,7 @@ type UpdateRequest struct {
 
 ```bash
 steamcmd \
+  +@NoPromptForPassword 1 \
   +@sSteamCmdForcePlatformType windows \
   +login "$STEAM_USER" "$STEAM_PASS" "$GUARD_CODE" \
   +app_info_print 1091500 \
@@ -455,8 +487,20 @@ steamcmd \
 
 ```bash
 steamcmd \
+  +@NoPromptForPassword 1 \
   +@sSteamCmdForcePlatformType windows \
   +login "$STEAM_USER" "$STEAM_PASS" "$GUARD_CODE" \
+  +force_install_dir /srv/steam-stage/1091500 \
+  +app_update 1091500 \
+  +quit
+```
+
+已有缓存登录态时：
+
+```bash
+steamcmd \
+  +@NoPromptForPassword 1 \
+  +login "$STEAM_USER" \
   +force_install_dir /srv/steam-stage/1091500 \
   +app_update 1091500 \
   +quit
@@ -466,6 +510,7 @@ steamcmd \
 
 ```bash
 steamcmd \
+  +@NoPromptForPassword 1 \
   +login "$STEAM_USER" "$STEAM_PASS" "$GUARD_CODE" \
   +licenses_print \
   +quit
@@ -473,9 +518,10 @@ steamcmd \
 
 要求：
 
-- 一个账号同一时刻只允许一个 SteamCMD 进程。
+- 同一个 SteamCMD 安装根同一时刻只允许一个进程。
+- 不同账号的安装根互相独立，可以并行。
 - 一个进程只更新一个 AppID（平台参数是进程级全局配置）。
-- 密码/验证码通过进程参数传递时注意进程列表泄露风险；如平台支持，优先使用环境变量或临时凭据文件，并在使用后清理。
+- 密码/验证码通过进程参数传递时注意进程列表泄露风险；服务端不记录 argv，输出中的密码/验证码会被抹掉。
 
 ---
 
@@ -1024,7 +1070,7 @@ steam.account_lease_expired
 ### Phase 2：SteamCMD 自动化
 
 - SteamCMD Runner：登录、`app_info_print`、`app_update`、`licenses_print`。
-- TOTP 支持、独立 `session_home`。
+- TOTP 支持、每账号独立 SteamCMD 副本与登录态。
 - 许可同步与可用账号查询。
 - 租约与健康检查。
 

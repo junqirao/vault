@@ -7,8 +7,8 @@ Vault 项目一体化构建脚本。
 --------
 1. **一条命令构建全项目**：前端（React/Vite）+ 两个 Go 产物
    （Vault-Server / Vault-Agent）。
-2. **自动版本管理**：以"客户端源码指纹"为准，检测到客户端相关源码有变动时
-   自动递增版本号，并把版本号写入 `VERSION`、前端 package.json 与 Go 产物。
+2. **自动版本管理**：以"客户端 / 服务端源码指纹"为准，检测到任一侧相关源码有变动时
+   自动递增版本号，并把版本号写入 `VERSION`、前端 package.json 与所有 Go 产物。
 3. **自动生成客户端更新包**：调用 `Vault-Server sign release` 用发布方私钥签名，
    产出 manifest.json / manifest.json.sig / artifacts/，并复制到服务端
    `update.artifacts_dir`（默认为 `updates/`）——即服务端镜像目录。
@@ -16,6 +16,9 @@ Vault 项目一体化构建脚本。
 5. **自动清理旧版本残留**：每次构建都清掉 `dist/` 中**不属于本次版本**的产物
    （顶层的 `Vault-Web-<旧版本>.zip`、`dist/package/` 下旧版本的目录与压缩包），
    避免越积越多、也避免误把旧产物当成这次的发布物。
+6. **尽可能并发**：前端（typecheck / 主进程 tsc / 渲染层 vite）与 Go 产物互不依赖，
+   两条链路同时跑；四个 Go 产物、三个部署包的压缩也各自并行（见 `_run_parallel`）。
+   以前这些全部串行，二十多核的机器也只用一个核，整体耗时几乎等于各步骤之和。
 
 关于 TLS 证书（重要）
 ---------------------
@@ -44,6 +47,7 @@ SAN 主机集合变化时自动重签。因此部署时无需任何外部证书�
     python build.py --package            # 额外生成服务端部署包（Windows zip + Linux tar.gz）
     python build.py --package-all        # 服务端（Windows + Linux）+ 客户端部署包
     python build.py --package-only       # 只打包（dist/ 已构建过时最快）
+    python build.py --windows-only       # 只出 Windows 产物（跳过 Linux 交叉编译与 Linux 包）
 """
 
 from __future__ import annotations
@@ -57,9 +61,12 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any, Callable
 
 # ---------------------------------------------------------------------------
 # 常量与路径
@@ -99,7 +106,8 @@ GO_TARGETS = [
 LINUX_SERVER_TARGET = "vault-server-linux-amd64"
 
 # 决定"客户端版本是否变化"的源码范围。
-# 只覆盖会影响 Vault-Agent 行为与其依赖的路径 —— 服务端专属改动不应触发客户端版本递增。
+# 只覆盖会影响 Vault-Agent 行为与其依赖的路径；服务端改动由 SERVER_SOURCE_PATHS 负责
+# （两者**都参与**版本递增决策，见 decide_version）。
 # 客户端自带的两个后台程序必须以 **GUI 子系统**链接：它们是控制台程序的话，双击/被
 # Electron 拉起时 Windows 会先创建控制台窗口，再等 Go 代码去隐藏——用户能看到黑窗口一闪。
 # Vault-Agent 的 AGENT_READY 与更新器的 JSON Lines 都走 Electron 建立的管道，GUI 子系统
@@ -117,15 +125,33 @@ CLIENT_SOURCE_PATHS = [
     "cmd/vault-updator",
 ]
 
-# 服务端专属路径：仅用于提示"服务端有改动但版本未变"，不参与版本递增决策。
+# 服务端源码范围：服务端专属包 + 两端共用的内部包 + 会打进服务端包的资源。
+#
+# 它**同样参与版本递增决策**：后端改动也必须换一个新版本号。否则服务端升级后版本号
+# 还是旧的，运维无法从版本号判断线上跑的是不是新构建，客户端侧的更新清单也会显得
+# "没变化"；Go 依赖（go.mod/go.sum）变化会影响两端产物，归到服务端一侧即可
+# （同一次构建只有一个版本号）。
 SERVER_SOURCE_PATHS = [
     "internal/api",
     "internal/app",
     "internal/store",
-    "internal/config",
+    "internal/job",
     "internal/cert",
+    "internal/config",
     "internal/domain",
+    "internal/secret",
+    "internal/semver",
+    "internal/apperr",
+    "internal/lock",
+    "internal/logging",
+    "internal/version",
+    "internal/signtool",
     "cmd/vault-server",
+    "go.mod",
+    "go.sum",
+    # 会被原样打进服务端部署包的内容：改了它们同样意味着"这一版服务端变了"。
+    "config.example.yaml",
+    "scripts",
 ]
 
 # 指纹计算时跳过的目录名与文件后缀。
@@ -173,24 +199,95 @@ def c(text: str, color: str) -> str:
     return f"{color}{text}{C.RESET}" if _COLOR else text
 
 
+# 并发任务的日志会落在同一块终端上：加锁保证每一行不被别的任务截断，
+# 再用线程局部变量给每行加上 `[任务名]` 前缀，避免"这行到底是谁输出的"。
+_PRINT_LOCK = threading.Lock()
+_LOG_STATE = threading.local()
+
+
+def _label() -> str:
+    label = getattr(_LOG_STATE, "label", "")
+    return c(f"[{label}] ", C.BLUE) if label else ""
+
+
+def _emit(text: str, stream=None) -> None:
+    with _PRINT_LOCK:
+        if stream is None:
+            print(text)
+        else:
+            print(text, file=stream)
+
+
+def _call_with_label(label: str, fn: Callable[..., Any], *args) -> Any:
+    """在线程里跑 fn 并给它的日志加前缀；返回 fn 的返回值。"""
+    previous = getattr(_LOG_STATE, "label", "")
+    _LOG_STATE.label = label
+    try:
+        return fn(*args)
+    finally:
+        _LOG_STATE.label = previous
+
+
+def _run_parallel(tasks: list[tuple[str, Callable[[], Any]]]) -> dict[str, Any]:
+    """并发执行一组**互不依赖**的任务，返回 {任务名: 返回值}（保持传入顺序）。
+
+    构建里存在大量彼此独立的链路（前端 typecheck / 主进程 tsc / 渲染层 vite、
+    四个 Go 产物、三个部署包……），串行时每个环节都只吃一个核。这里用一个任务
+    一个线程：这些任务绝大部分时间在等子进程，真正 CPU 密集的 go build / tsc /
+    esbuild / zlib 自己就会吃满多核。
+
+    任一任务失败（包括 die() 抛出的 SystemExit）都会取消尚未开始的任务，并把
+    该异常抛回主线程 —— 失败路径与串行执行时完全一致。
+    """
+    results: dict[str, Any] = {}
+    if not tasks:
+        return results
+    if len(tasks) == 1:
+        label, fn = tasks[0]
+        results[label] = _call_with_label(label, fn)
+        return results
+
+    errors: list[tuple[str, BaseException]] = []
+    with ThreadPoolExecutor(max_workers=len(tasks),
+                            thread_name_prefix="vault-build") as pool:
+        futures = {pool.submit(_call_with_label, label, fn): label
+                   for label, fn in tasks}
+        for fut in as_completed(futures):
+            label = futures[fut]
+            try:
+                results[label] = fut.result()
+            except BaseException as exc:  # SystemExit / 普通异常都算失败
+                errors.append((label, exc))
+                for other in futures:
+                    other.cancel()
+
+    if errors:
+        label, exc = errors[0]
+        if isinstance(exc, SystemExit):
+            raise exc
+        fail(f"并行任务失败：{label}（{exc}）")
+        raise SystemExit(1)
+    return results
+
+
 def step(msg: str) -> None:
-    print(f"\n{c('▶', C.BLUE)} {c(msg, C.BOLD)}")
+    _emit(f"\n{c('▶', C.BLUE)} {_label()}{c(msg, C.BOLD)}")
 
 
 def info(msg: str) -> None:
-    print(f"  {msg}")
+    _emit(f"  {_label()}{msg}")
 
 
 def ok(msg: str) -> None:
-    print(f"  {c('✓', C.GREEN)} {msg}")
+    _emit(f"  {_label()}{c('✓', C.GREEN)} {msg}")
 
 
 def warn(msg: str) -> None:
-    print(f"  {c('!', C.YELLOW)} {msg}")
+    _emit(f"  {_label()}{c('!', C.YELLOW)} {msg}")
 
 
 def fail(msg: str) -> None:
-    print(f"  {c('✗', C.RED)} {msg}", file=sys.stderr)
+    _emit(f"  {_label()}{c('✗', C.RED)} {msg}", file=sys.stderr)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -239,12 +336,13 @@ def run(cmd: list[str], cwd: Path | None = None, capture: bool = True,
         raise
 
     if capture and not quiet:
-        # 仅回显尾部，避免刷屏
+        # 仅回显尾部，避免刷屏（并发时一次性整块输出，避免两个任务的日志串行交错）
+        lines: list[str] = []
         for stream in (proc.stdout, proc.stderr):
             if stream and stream.strip():
-                tail = stream.strip().splitlines()[-12:]
-                for line in tail:
-                    print(f"    {line}")
+                lines.extend(f"    {line}" for line in stream.strip().splitlines()[-12:])
+        if lines:
+            _emit("\n".join(lines))
 
     if check and proc.returncode != 0:
         die(f"命令失败（exit={proc.returncode}）：{' '.join(cmd)}")
@@ -533,6 +631,9 @@ def write_version_everywhere(version: str) -> None:
 def decide_version(args, state: dict) -> tuple[str, str, bool, str]:
     """决定本次构建使用的版本号。
 
+    客户端与服务端**任一侧**源码有变化都递增：一次构建只有一个版本号，两端产物
+    都注入它；后端改了却不涨版本号，线上就无法从版本号判断是否已更新。
+
     返回 (新版本, 旧版本, 是否递增, 递增原因)
     """
     current = read_version()
@@ -543,20 +644,33 @@ def decide_version(args, state: dict) -> tuple[str, str, bool, str]:
             die(f"--version 非法（需形如 1.2.3）：{target!r}")
         return target, current, target != current, "显式指定版本"
 
-    client_fp = source_fingerprint(CLIENT_SOURCE_PATHS)
-    last_fp = str(state.get("client_fingerprint") or "")
+    sides = [
+        ("客户端", "client_fingerprint", source_fingerprint(CLIENT_SOURCE_PATHS)),
+        ("服务端", "server_fingerprint", source_fingerprint(SERVER_SOURCE_PATHS)),
+    ]
+    last = {key: str(state.get(key) or "") for _, key, _ in sides}
 
-    if not last_fp:
+    if not any(last.values()):
         return current, current, False, "首次构建，沿用当前版本"
 
-    if client_fp == last_fp:
-        return current, current, False, "客户端源码无变化"
+    changes: list[str] = []
+    for label, key, fp in sides:
+        before = last[key]
+        # 老状态文件可能只记录了客户端指纹：缺失的一侧按"首次记录"处理，不触发递增。
+        if before and fp != before:
+            changes.append(f"{label} {before[:12]} → {fp[:12]}")
+    if not changes:
+        return current, current, False, "客户端与服务端源码均无变化"
+
+    changed_sides = [part.split(" ")[0] for part in changes]
+    what = f"{'、'.join(changed_sides)}源码有变化"
+    detail = "；".join(changes)
 
     if args.no_bump:
-        return current, current, False, "客户端源码有变化，但已用 --no-bump 抑制递增"
+        return current, current, False, f"{what}，但已用 --no-bump 抑制递增（{detail}）"
 
     target = bump_version(current, args.bump)
-    return target, current, True, f"检测到客户端源码变化（客户端指纹 {last_fp[:12]} → {client_fp[:12]}）"
+    return target, current, True, f"检测到{what}（{detail}）"
 
 
 # ---------------------------------------------------------------------------
@@ -688,18 +802,30 @@ def _frontend_deps_ready() -> bool:
     pnpm = which("pnpm") or which("pnpm.cmd")
     if not pnpm:
         return False
-    for pkg in ("packages/ui", "apps/client"):
+
+    def probe(pkg: str) -> bool:
         cwd = FRONTEND_DIR / pkg
         if not (cwd / "package.json").is_file():
-            continue
+            return True
         try:
             proc = subprocess.run([pnpm, "exec", "tsc", "--version"], cwd=str(cwd),
                                   capture_output=True, text=True, **_NO_WINDOW)
         except OSError:
             return False
-        if proc.returncode != 0 or not proc.stdout.strip():
-            return False
-    return True
+        return proc.returncode == 0 and bool(proc.stdout.strip())
+
+    # 两个包各起一次 pnpm/tsc（每次约 1s），并发探测省掉一半等待。
+    packages = [pkg for pkg in ("packages/ui", "apps/client")
+                if (FRONTEND_DIR / pkg / "package.json").is_file()]
+    if not packages:
+        return True
+    results = _run_parallel([(pkg, lambda p=pkg: probe(p)) for pkg in packages])
+    return all(results.values())
+
+
+# 本次进程是否真的构建过前端（渲染层 + 主进程产物）。
+# build_client_app 据此跳过 package 脚本里重复的 `tsc && vite build`（约 10s）。
+_frontend_built = False
 
 
 def build_frontend(args) -> None:
@@ -725,8 +851,21 @@ def build_frontend(args) -> None:
                 "在 frontend/.npmrc 写入 node-linker=hoisted，然后删除 frontend/node_modules、"
                 "frontend/packages/ui/node_modules、frontend/apps/client/node_modules 后重跑")
 
-    run([pnpm, "-r", "typecheck"], cwd=FRONTEND_DIR, capture=False)
-    run([pnpm, "--filter", "@vault/client", "build"], cwd=FRONTEND_DIR, capture=False)
+    # 三条链路互不依赖，并发跑（以前是 typecheck → build 串行，占了整个构建的大头）：
+    #   1. typecheck：pnpm -r 会分别检查 ui 与 client（client 含渲染层与主进程两套配置）；
+    #   2. build:electron：主进程 tsc，产出 dist-electron/main.js；
+    #   3. build:renderer：vite build，产出渲染层 dist/。
+    # 刻意用 package.json 里已命名的脚本（而不是 pnpm run build 或直接调 tsc/vite），
+    # 这样脚本内部怎么变都不会让这里失效。渲染层输出保留实时透传，其余捕获后回显尾部。
+    global _frontend_built
+    _run_parallel([
+        ("typecheck", lambda: run([pnpm, "-r", "typecheck"], cwd=FRONTEND_DIR)),
+        ("electron", lambda: run([pnpm, "--filter", "@vault/client", "run", "build:electron"],
+                                 cwd=FRONTEND_DIR)),
+        ("renderer", lambda: run([pnpm, "--filter", "@vault/client", "run", "build:renderer"],
+                                 cwd=FRONTEND_DIR, capture=False)),
+    ])
+    _frontend_built = True
     ok("前端构建完成")
 
 
@@ -770,6 +909,23 @@ def build_server_exe(version: str) -> None:
     ok("Vault-Server.exe（用于 Vault-Server sign）已就绪")
 
 
+def _go_build_task(go: str, env: dict[str, str], out_name: str, pkg: str,
+                   ldflags: str, extra: str) -> Callable[[], None]:
+    """返回"编译单个 Go 产物并打印体积"的闭包（供 _run_parallel 并发调用）。"""
+    out_path = DIST_DIR / out_name
+
+    def _task() -> None:
+        run([
+            go, "build", "-trimpath",
+            "-ldflags", ldflags,
+            "-o", str(out_path), pkg,
+        ], env=env, quiet=True)
+        size = out_path.stat().st_size if out_path.is_file() else 0
+        ok(f"{out_name:<20} {size:>12,} 字节 {extra}".rstrip())
+
+    return _task
+
+
 def build_go(version: str, public_key: str | None, args, prebuilt: set[str] | None = None) -> None:
     step(f"构建 Go 产物（版本 {version}）")
     go = go_bin()
@@ -780,6 +936,7 @@ def build_go(version: str, public_key: str | None, args, prebuilt: set[str] | No
     build_time = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     prebuilt = prebuilt or set()
 
+    tasks: list[tuple[str, Callable[[], Any]]] = []
     for out_name, pkg, needs_pubkey in GO_TARGETS:
         out_path = DIST_DIR / out_name
         if out_name in prebuilt and out_path.is_file():
@@ -791,38 +948,26 @@ def build_go(version: str, public_key: str | None, args, prebuilt: set[str] | No
         ldflags = _ldflags(version, commit, build_time, public_key if needs_pubkey else None)
         if out_name in GUI_SUBSYSTEM_TARGETS:
             ldflags += " -H=windowsgui"
-
-        run([
-            go, "build", "-trimpath",
-            "-ldflags", ldflags,
-            "-o", str(out_path), pkg,
-        ], env=env, quiet=True)
-
-        size = out_path.stat().st_size if out_path.is_file() else 0
         extra = "（已注入发布方公钥）" if needs_pubkey else ""
-        ok(f"{out_name:<20} {size:>12,} 字节 {extra}")
+        tasks.append((out_name, _go_build_task(go, env, out_name, pkg, ldflags, extra)))
 
-    build_linux_server(go, env, version, commit, build_time)
+    # Linux 服务端交叉编译（GOOS=linux GOARCH=amd64）。
+    # 零 cgo（go_env 已置 CGO_ENABLED=0），因此交叉编译无需任何交叉工具链。
+    # 仅构建服务端：Vault-Agent 是 Windows 专属程序，不可跨操作系统目标编译。
+    # `--windows-only` 时整段跳过（只出 Windows 产物，省掉一次完整编译）。
+    if getattr(args, "no_linux", False):
+        info("已跳过 Linux 服务端（--windows-only）")
+    else:
+        tasks.append((LINUX_SERVER_TARGET, _go_build_task(
+            go, {**env, "GOOS": "linux", "GOARCH": "amd64"},
+            LINUX_SERVER_TARGET, "./cmd/vault-server",
+            _ldflags(version, commit, build_time, None), "（linux/amd64）")))
+
+    # 四个产物彼此独立，并发编译：依赖刚变过、Go 构建缓存冷时收益最明显
+    # （以前四个 go build 串行，冷缓存时每个都要几十秒）。
+    _run_parallel(tasks)
 
     info(f"commit={commit}  build_time={build_time}")
-
-
-def build_linux_server(go: str, env: dict[str, str], version: str, commit: str, build_time: str) -> None:
-    """交叉编译 Linux 服务端（GOOS=linux GOARCH=amd64）。
-
-    零 cgo（go_env 已置 CGO_ENABLED=0），因此交叉编译无需任何交叉工具链。
-    仅构建服务端：Vault-Agent 是 Windows 专属程序，不可跨操作系统目标编译。
-    """
-    out_path = DIST_DIR / LINUX_SERVER_TARGET
-    ldflags = _ldflags(version, commit, build_time, None)
-    run([
-        go, "build", "-trimpath",
-        "-ldflags", ldflags,
-        "-o", str(out_path), "./cmd/vault-server",
-    ], env={**env, "GOOS": "linux", "GOARCH": "amd64"}, quiet=True)
-
-    size = out_path.stat().st_size if out_path.is_file() else 0
-    ok(f"{LINUX_SERVER_TARGET:<20} {size:>12,} 字节 （linux/amd64）")
 
 
 def _electron_env() -> dict[str, str]:
@@ -852,6 +997,9 @@ def _electron_env() -> dict[str, str]:
 # 会失败在"删除旧目录"这一步。重试时改用备用输出目录 release-alt，并把结果记在这里，
 # 后续 package_client 就不会再回到那个被占用、内容陈旧的旧目录。
 _client_app_dir: Path | None = None
+
+# electron-builder 会清空输出目录，同一份程序目录**绝不能**被并发打包。
+_CLIENT_APP_LOCK = threading.Lock()
 
 
 REQUIRED_APP_FILES = ("Vault.exe", "resources/app.asar", "icudtl.dat", "Vault-Agent.exe", "Vault-Updator.exe")
@@ -1023,7 +1171,16 @@ def _fallback_output_dirs() -> list[str]:
 
 
 def build_client_app(args) -> Path | None:
-    """用 electron-builder 产出客户端程序目录（可选，依赖网络下载 Electron 运行时）。"""
+    """用 electron-builder 产出客户端程序目录（可选，依赖网络下载 Electron 运行时）。
+
+    加锁的原因：更新包与部署包两条链路都可能在"程序目录陈旧"时触发重打，
+    electron-builder 会先清空输出目录，并发跑同一份目录一定会互相破坏。
+    """
+    with _CLIENT_APP_LOCK:
+        return _build_client_app(args)
+
+
+def _build_client_app(args) -> Path | None:
     step("打包客户端（electron-builder）")
     pnpm = which("pnpm") or which("pnpm.cmd")
     if not pnpm:
@@ -1049,9 +1206,17 @@ def build_client_app(args) -> Path | None:
         shutil.copy2(src, staged)
         info(f"已暂存 {name} → {staged.relative_to(ROOT)}")
 
-    proc = run([pnpm, "--filter", "@vault/client", "run", "package"],
-               cwd=FRONTEND_DIR, capture=False, check=False,
-               env=_electron_env())
+    if _frontend_built:
+        # 本次构建刚产出 dist/ 与 dist-electron/，`package` 脚本里的 `tsc && vite build`
+        # 是纯粹的重复劳动（约 10s），直接调 electron-builder。
+        proc = run([pnpm, "exec", "electron-builder", "--config", "electron-builder.yml"],
+                   cwd=CLIENT_APP_DIR, capture=False, check=False,
+                   env=_electron_env())
+    else:
+        # 没在本进程构建过前端（如 --skip-frontend）：交给 package 脚本先构建再打包。
+        proc = run([pnpm, "--filter", "@vault/client", "run", "package"],
+                   cwd=FRONTEND_DIR, capture=False, check=False,
+                   env=_electron_env())
     app_dir = find_client_app_dir()
     if proc.returncode == 0 and is_complete_app_dir(app_dir):
         return app_dir
@@ -1224,8 +1389,13 @@ def _find_artifact_ci(artifacts_dir: Path, name: str) -> Path | None:
     return None
 
 
-def make_update_package(version: str, channel: str, out_dir: Path, args) -> bool:
-    """生成并签名更新包，然后复制到服务端 artifacts_dir。"""
+def make_update_package(version: str, channel: str, out_dir: Path, args,
+                        client_app: Path | None = None) -> bool:
+    """生成并签名更新包，然后复制到服务端 artifacts_dir。
+
+    client_app 非空表示"本次已经用 electron-builder 打过客户端程序目录"（见 main），
+    此时不再重复打包，直接复用它产出 client 产物。
+    """
     step("生成客户端更新包")
     server_exe = DIST_DIR / "Vault-Server.exe"
     if not server_exe.is_file():
@@ -1254,12 +1424,26 @@ def make_update_package(version: str, channel: str, out_dir: Path, args) -> bool
     if args.min_supported_version:
         cmd += ["-min-supported-version", args.min_supported_version]
 
-    client_artifact = None
-    if args.with_client:
+    def _prepare_client_artifact() -> Path | None:
         # 先确保程序目录是本次构建的（必要时重打），再整体打成 zip 放进更新清单。
         # 客户端本体自动更新靠的就是这份产物（见 internal/agent/updateclient.go）。
-        build_client_app(args)
-        client_artifact = build_client_artifact(version)
+        app_dir = client_app
+        if app_dir is None or not is_complete_app_dir(app_dir):
+            app_dir = build_client_app(args)
+        if app_dir is None:
+            return None
+        return build_client_artifact(version)
+
+    # 客户端程序目录 zip 与渲染层 zip 互不依赖，且都很吃 CPU（一个压 200+ MB 的
+    # Electron 目录、一个压 vite 产物），并发压完再签名。
+    tasks: list[tuple[str, Callable[[], Any]]] = [
+        ("client_web", lambda: build_client_web_artifact(version)),
+    ]
+    if args.with_client:
+        tasks.append(("client", _prepare_client_artifact))
+    prepared = _run_parallel(tasks)
+
+    client_artifact = prepared.get("client") if args.with_client else None
     if client_artifact:
         cmd += ["-artifact", f"client={client_artifact}"]
     else:
@@ -1268,8 +1452,7 @@ def make_update_package(version: str, channel: str, out_dir: Path, args) -> bool
         warn("更新清单中不含客户端产物（client）：本次发布**不会**自动更新客户端本体；"
              "需要客户端本体自动更新时请加 --with-client")
 
-    # 渲染层资源包（client_web）：热更 Electron 的渲染层（Vite 产出的 dist/），不替换本体。
-    web_artifact = build_client_web_artifact(version)
+    web_artifact = prepared.get("client_web")
     if web_artifact:
         cmd += ["-artifact", f"client_web={web_artifact}"]
 
@@ -1281,9 +1464,9 @@ def make_update_package(version: str, channel: str, out_dir: Path, args) -> bool
     if verify.returncode != 0:
         fail("发布目录自检失败，已中止（不复制到服务端目录）")
         if verify.stdout:
-            print(verify.stdout)
+            _emit(verify.stdout)
         if verify.stderr:
-            print(verify.stderr, file=sys.stderr)
+            _emit(verify.stderr, file=sys.stderr)
         return False
     ok("发布目录自检通过（签名 + 产物 sha256）")
 
@@ -1776,20 +1959,27 @@ def run_package(version: str, want_server: bool, want_client: bool,
                 include_updates: bool, args=None) -> list[Path]:
     """执行打包，返回生成的包列表。
 
-    服务端**两个平台一起产出**（Windows zip + Linux tar.gz）：
+    服务端默认**两个平台一起产出**（Windows zip + Linux tar.gz）：
     Linux 服务端本来就会交叉编译，若只打 Windows 包，发布时必然漏 Linux 部署包。
+    `--windows-only` 时只打 Windows 包。
+
+    三个包各自写自己的目录/压缩包，互相不引用，因此并发压缩（输出顺序保持稳定）。
     """
-    results: list[Path] = []
+    no_linux = bool(getattr(args, "no_linux", False))
+    tasks: list[tuple[str, Callable[[], Path | None]]] = []
     if want_server:
-        for pkg in (package_server(version, include_updates),
-                    package_server(version, include_updates, linux=True)):
-            if pkg:
-                results.append(pkg)
+        tasks.append(("server-win", lambda: package_server(version, include_updates)))
+        if no_linux:
+            info("已跳过 Linux 部署包（--windows-only）")
+        else:
+            tasks.append(("server-linux",
+                          lambda: package_server(version, include_updates, linux=True)))
     if want_client:
-        z = package_client(version, args)
-        if z:
-            results.append(z)
-    return results
+        tasks.append(("client-pkg", lambda: package_client(version, args)))
+    if not tasks:
+        return []
+    done = _run_parallel(tasks)
+    return [pkg for pkg in done.values() if pkg]
 
 
 def print_summary(version: str, channel: str, out_dir: Path | None, bumped: bool) -> None:
@@ -1853,14 +2043,18 @@ def run_check(version: str, state: dict) -> int:
     else:
         warn("发布方私钥不存在：构建更新包时将自动生成（仅适合联调）")
 
-    client_fp = source_fingerprint(CLIENT_SOURCE_PATHS)
-    last_fp = str(state.get("client_fingerprint") or "")
-    if not last_fp:
-        info("客户端指纹：无历史记录（首次构建将沿用当前版本）")
-    elif client_fp == last_fp:
-        ok("客户端源码未变化（下次构建不会递增版本）")
-    else:
-        warn("客户端源码已变化（下次构建将递增版本）")
+    for label, key, paths in (
+        ("客户端", "client_fingerprint", CLIENT_SOURCE_PATHS),
+        ("服务端", "server_fingerprint", SERVER_SOURCE_PATHS),
+    ):
+        fp = source_fingerprint(paths)
+        last_fp = str(state.get(key) or "")
+        if not last_fp:
+            info(f"{label}指纹：无历史记录（下次构建会先记录它，不递增）")
+        elif fp == last_fp:
+            ok(f"{label}源码未变化（不会因它递增版本）")
+        else:
+            warn(f"{label}源码已变化（下次构建将递增版本）")
 
     cfg_file = CONFIG_FILE if CONFIG_FILE.is_file() else CONFIG_EXAMPLE_FILE
     info(f"读取的配置：{cfg_file.name}")
@@ -1883,7 +2077,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--bump", choices=["patch", "minor", "major"], default="patch",
                    help="自动递增级别，默认 patch")
     p.add_argument("--no-bump", action="store_true",
-                   help="检测到客户端源码变化时也不递增版本")
+                   help="检测到客户端/服务端源码变化时也不递增版本")
     p.add_argument("--skip-frontend", action="store_true", help="跳过前端构建")
     p.add_argument("--skip-go", action="store_true", help="跳过 Go 构建")
     p.add_argument("--skip-update", action="store_true", help="不生成更新包")
@@ -1899,6 +2093,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="生成服务端（Windows + Linux）与客户端部署包")
     p.add_argument("--package-only", action="store_true",
                    help="只打包不构建（等价于 --skip-frontend --skip-go --skip-update --package）")
+    p.add_argument("--windows-only", "--no-linux", dest="no_linux", action="store_true",
+                   help="只处理 Windows：不交叉编译 Linux 服务端，也不打 Linux 部署包")
     p.add_argument("--package-with-updates", action="store_true",
                    help="把当前已签名的客户端更新包一并放进服务端部署包")
     p.add_argument("--key", help="发布方私钥路径（默认 keys/update-private.pem）")
@@ -1961,13 +2157,16 @@ def main(argv: list[str] | None = None) -> int:
     # 每次构建都把 dist 里不属于本次版本的旧产物清掉（--clean 已整体清空时无事可做）。
     clean_stale_dist_artifacts(version)
 
-    # ---- 2) 前端 ----
+    # ---- 2) 前端 + 3) Go 产物：两条链路完全独立，并发执行 ----
+    # 前端（typecheck / 主进程 tsc / 渲染层 vite）与 Go 产物之间没有任何依赖，
+    # 以前先跑完前端再跑 Go，Go 构建缓存冷时（改过依赖/首次构建）要多等几十秒。
+    frontend_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vault-frontend")
+    frontend_future = None
     if args.skip_frontend:
         warn("已跳过前端构建（--skip-frontend）")
     else:
-        build_frontend(args)
+        frontend_future = frontend_pool.submit(_call_with_label, "前端", build_frontend, args)
 
-    # ---- 3) Go 产物 ----
     # 注意：agent 需要注入公钥，若公钥尚未生成需先产出 Vault-Server（其 sign 子命令负责 keygen），
     # 再用它生成公钥，最后回来构建 agent。
     public_key: str | None = None
@@ -1977,45 +2176,79 @@ def main(argv: list[str] | None = None) -> int:
     else:
         warn("尚无发布方公钥，Vault-Agent 将回退到内置开发公钥（其私钥不在仓库，任何更新都会验签失败）")
 
-    if not args.skip_go:
-        if public_key is None and not args.skip_update:
-            # 先生成密钥，再构建（保证 agent 内置的是本仓库对应的公钥）。
-            step("准备发布方密钥")
-            build_server_exe(version)
-            prebuilt.add("Vault-Server.exe")
-            ensure_signing_keys(DIST_DIR / "Vault-Server.exe", args.key, allow_generate=not args.no_keygen)
-            public_key = read_public_key()
-            ok("发布方密钥就绪")
+    try:
+        if not args.skip_go:
+            if public_key is None and not args.skip_update:
+                # 先生成密钥，再构建（保证 agent 内置的是本仓库对应的公钥）。
+                step("准备发布方密钥")
+                build_server_exe(version)
+                prebuilt.add("Vault-Server.exe")
+                ensure_signing_keys(DIST_DIR / "Vault-Server.exe", args.key,
+                                    allow_generate=not args.no_keygen)
+                public_key = read_public_key()
+                ok("发布方密钥就绪")
 
-        build_go(version, public_key, args, prebuilt)
-    else:
-        warn("已跳过 Go 构建（--skip-go）")
+            build_go(version, public_key, args, prebuilt)
+        else:
+            warn("已跳过 Go 构建（--skip-go）")
+    except BaseException:
+        # Go 侧失败时不必再等前端跑完（与串行执行时的失败速度一致）。
+        frontend_pool.shutdown(wait=False, cancel_futures=True)
+        raise
 
-    # ---- 4) 更新包 ----
+    if frontend_future is not None:
+        # 两条链路在这里汇合；前端失败会在这里抛出，报错与串行时完全一致。
+        frontend_future.result()
+    frontend_pool.shutdown(wait=True)
+
+    # ---- 4) 客户端程序目录（一次打包，更新包与客户端部署包共用） ----
+    # 只打一次的核心原因：electron-builder 是整条链路里最慢的一步，而更新包里的
+    # client 产物与 dist/package 下的客户端部署包用的是**同一份**程序目录。
+    client_app: Path | None = None
+    if args.with_client:
+        client_app = build_client_app(args)
+
+    # ---- 5) 更新包 + 客户端部署包 ----
+    # 更新包（签名清单 + 同步服务端镜像目录）与客户端部署包（把程序目录再打一次 zip）
+    # 互不依赖，并发执行；服务端部署包要读更新包产出的 manifest，必须等更新包完成。
     update_ok = True
+    packages: list[Path] = []
+    jobs: list[tuple[str, Callable[[], Any]]] = []
     if args.skip_update:
         warn("已跳过更新包生成（--skip-update）")
     else:
-        update_ok = make_update_package(version, channel, out_dir, args)
-        if not update_ok:
-            fail("更新包生成失败")
-            return 1
+        jobs.append(("更新包",
+                     lambda: make_update_package(version, channel, out_dir, args, client_app)))
+    if args.package_all:
+        # 程序目录刚打过就用 args=None 禁止它再触发一次 electron-builder；
+        # 若上次打包失败则需要重试，此时仍把 args 传进去。
+        jobs.append(("客户端包",
+                     lambda: package_client(version, None if client_app else args)))
+    if jobs:
+        done = _run_parallel(jobs)
+        if not args.skip_update:
+            update_ok = bool(done.get("更新包", False))
+            if not update_ok:
+                fail("更新包生成失败")
+                return 1
+        client_zip = done.get("客户端包")
+        if client_zip:
+            packages.append(client_zip)
 
-    # ---- 5) 部署打包 ----
-    packages: list[Path] = []
+    # ---- 6) 服务端部署包 ----
     if args.package or args.package_all:
         # 服务端包默认内联"当前已签名的发布目录内容"：否则开箱部署的服务端 updates/ 为空，
         # 永远无法对外分发更新（客户端报 update.no_manifest）。仅当发布目录确无 manifest 时才退化为空目录。
         updates_ready = (out_dir / "manifest.json").is_file()
-        packages = run_package(
+        packages.extend(run_package(
             version,
             want_server=True,
-            want_client=bool(args.package_all),
+            want_client=False,  # client 包已在上面与更新包并发产出
             include_updates=updates_ready or bool(args.package_with_updates),
             args=args,
-        )
+        ))
 
-    # ---- 6) 记录构建状态 ----
+    # ---- 7) 记录构建状态 ----
     state.update({
         "version": version,
         "channel": channel,

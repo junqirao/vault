@@ -219,6 +219,47 @@ func (r *Router) routes() {
 		g.Get("/v1/repos/{id}/disks", r.handleListRepoDisks)
 		g.Get("/v1/repos/{id}/iscsi", r.handleListRepoIscsi)
 
+		// 用户游戏目录：共享 Steam 游戏库可被任意登录用户挂载（每人一份差异盘）。
+		// 只暴露游戏与共享库，不暴露 Steam 账号/凭据。
+		g.Get("/v1/game-catalog", r.handleGameCatalog)
+
+		// ---- Steam 内容账号（独立模块；仅用于存储库下载/更新） ----
+		// 账号凭据/许可/租约只对超级管理员开放；任何登录用户都不能读取或使用账号凭据。
+		g.With(r.requireSuperAdminMW).Get("/v1/steam/accounts", r.handleListSteamAccounts)
+		g.With(r.requireSuperAdminMW).Post("/v1/steam/accounts", r.handleCreateSteamAccount)
+		g.With(r.requireSuperAdminMW).Get("/v1/steam/runtime", r.handleSteamRuntimeStatus)
+		g.With(r.requireSuperAdminMW).Post("/v1/steam/runtime/install", r.handleInstallSteamCmd)
+		g.With(r.requireSuperAdminMW).Post("/v1/steam/runtime/check", r.handleCheckSteamNetwork)
+		g.With(r.requireSuperAdminMW).Get("/v1/steam/store/search", r.handleSearchSteamStore)
+		g.With(r.requireSuperAdminMW).Get("/v1/steam/accounts/available", r.handleListAvailableSteamAccounts)
+		g.With(r.requireSuperAdminMW).Get("/v1/steam/accounts/{id}", r.handleGetSteamAccount)
+		g.With(r.requireSuperAdminMW).Patch("/v1/steam/accounts/{id}", r.handleUpdateSteamAccount)
+		g.With(r.requireSuperAdminMW).Delete("/v1/steam/accounts/{id}", r.handleDeleteSteamAccount)
+		g.With(r.requireSuperAdminMW).Post("/v1/steam/accounts/{id}/test-login", r.handleTestSteamLogin)
+		g.With(r.requireSuperAdminMW).Post("/v1/steam/accounts/{id}/sync-licenses", r.handleSyncSteamLicenses)
+		g.With(r.requireSuperAdminMW).Post("/v1/steam/accounts/{id}/release-leases", r.handleReleaseSteamLeases)
+		g.With(r.requireSuperAdminMW).Get("/v1/steam/accounts/{id}/apps", r.handleListSteamAccountApps)
+		g.With(r.requireSuperAdminMW).Get("/v1/steam/accounts/{id}/games", r.handleListSteamOwnedGames)
+		g.With(r.requireSuperAdminMW).Post("/v1/steam/accounts/{id}/games/import", r.handleImportSteamClientGames)
+
+		// ---- 服务端分组与游戏库（创建时只选择账号；不在此处绑定凭据） ----
+		g.With(r.requireSuperAdminMW).Get("/v1/repo-groups", r.handleListRepoGroups)
+		g.With(r.requireSuperAdminMW).Post("/v1/repo-groups", r.handleCreateRepoGroup)
+		g.With(r.requireSuperAdminMW).Get("/v1/repo-groups/{id}", r.handleGetRepoGroup)
+		g.With(r.requireSuperAdminMW).Patch("/v1/repo-groups/{id}", r.handleUpdateRepoGroup)
+		g.With(r.requireSuperAdminMW).Delete("/v1/repo-groups/{id}", r.handleDeleteRepoGroup)
+		g.With(r.requireSuperAdminMW).Get("/v1/repo-groups/{id}/games", r.handleListGroupGames)
+		g.With(r.requireSuperAdminMW).Post("/v1/repo-groups/{id}/games", r.handleCreateGame)
+		g.With(r.requireSuperAdminMW).Post("/v1/repo-groups/{id}/games/batch", r.handleBatchCreateGames)
+		g.With(r.requireSuperAdminMW).Post("/v1/repo-groups/{id}/check-updates", r.handleCheckGroupUpdates)
+		g.With(r.requireSuperAdminMW).Get("/v1/games/{id}", r.handleGetGame)
+		g.With(r.requireSuperAdminMW).Get("/v1/games/{id}/output", r.handleGameOutput)
+		g.With(r.requireSuperAdminMW).Patch("/v1/games/{id}", r.handleUpdateGame)
+		g.With(r.requireSuperAdminMW).Delete("/v1/games/{id}", r.handleDeleteGame)
+		g.With(r.requireSuperAdminMW).Post("/v1/games/{id}/update", r.handleTriggerGameUpdate)
+		g.With(r.requireSuperAdminMW).Post("/v1/games/{id}/pause-update", r.handlePauseGameUpdate)
+		g.With(r.requireSuperAdminMW).Post("/v1/games/{id}/stop-update", r.handleStopGameUpdate)
+
 		// iSCSI 目标授权与会话路由（见 docs/implementation.md 5.3 / 5.8）
 		g.Get("/v1/iscsi/targets/{id}", r.handleGetIscsiTarget)
 		g.Put("/v1/iscsi/targets/{id}/authorization", r.handleReplaceAuthorization)
@@ -346,6 +387,19 @@ func (r *Router) requireAllocationPerm(req *http.Request, allocationID string, m
 		return nil, err
 	}
 	return r.requireRepoPerm(req, alloc.RepoID, min)
+}
+
+// isPublicGameRepo 判断存储库是否是 Steam 共享游戏库。
+//
+// 共享游戏库对普通用户开放"读取 + 自建分配 + 挂载"的最小权限；其它存储库仍走
+// 原有 owner/member 权限模型。Steam 账号只用于服务端更新，与客户端挂载无关。
+func (r *Router) isPublicGameRepo(req *http.Request, repoID string) bool {
+	p, err := r.principal(req)
+	if err != nil {
+		return false
+	}
+	ok, err := r.deps.App.SteamGames().IsGameRepo(req.Context(), repoID, p.UserID, p.IsSuperAdmin())
+	return err == nil && ok
 }
 
 // routePattern 返回当前请求命中的路由模板，用于访问日志与审计。

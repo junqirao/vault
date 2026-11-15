@@ -384,7 +384,6 @@ export function DiskImport({ onBack }: DiskImportProps): JSX.Element {
       {scanQuery.error ? <ErrorNotice error={scanQuery.error} /> : null}
       {renderResult()}
 
-      <Alert type="info" showIcon message={t('diskImport.hint')} style={{ marginBottom: spacing.sm }} />
       <Alert type="warning" showIcon message={t('diskImport.capacityHint')} style={{ marginBottom: spacing.md }} />
 
       {skipped.length > 0 ? (

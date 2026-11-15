@@ -599,9 +599,25 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
             </Typography.Text>
           )}
           <div>
-            <Typography.Text style={{ display: 'block', marginBottom: spacing.xs }}>
-              {t('settings.cache.l2Dir')}
-            </Typography.Text>
+            <div
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: spacing.xs,
+                flexWrap: 'wrap',
+                marginBottom: spacing.xs
+              }}
+            >
+              <Typography.Text>{t('settings.cache.l2Dir')}</Typography.Text>
+              {l2MediaType && l2MediaType !== 'unknown' ? (
+                <Space size={4}>
+                  <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+                    {t('settings.cache.l2DirMedia')}
+                  </Typography.Text>
+                  <MediaTypeTag mediaType={l2MediaType} />
+                </Space>
+              ) : null}
+            </div>
             <Space.Compact style={{ width: '100%', maxWidth: 520 }}>
               <Input
                 value={config?.cache_l2_dir ?? ''}
@@ -619,14 +635,6 @@ export function ClientSettings({ language, onLanguageChange }: ClientSettingsPro
             <Typography.Text type="secondary" style={{ display: 'block', fontSize: fontSize.xs }}>
               {t('settings.cache.l2DirHint')}
             </Typography.Text>
-            {l2MediaType && l2MediaType !== 'unknown' ? (
-              <Space size={spacing.xs} style={{ marginTop: spacing.xxs }}>
-                <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-                  {t('settings.cache.l2DirMedia')}
-                </Typography.Text>
-                <MediaTypeTag mediaType={l2MediaType} />
-              </Space>
-            ) : null}
             {l2MediaType === 'hdd' ? (
               <Alert
                 type="warning"

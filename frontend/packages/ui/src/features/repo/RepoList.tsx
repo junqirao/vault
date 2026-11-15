@@ -10,6 +10,7 @@ import {
   Skeleton,
   Space,
   Spin,
+  Tag,
   Tooltip,
   Typography,
   message
@@ -88,6 +89,8 @@ export interface RepoListProps {
    * 用户端没有存储根的概念，放它只会让人误以为能"导入别人的盘"。
    */
   onImport?: () => void
+  /** Steam 分组详情里的「分组管理」入口：跳到 Steam 游戏分组管理页。 */
+  onManageSteamGroup?: (groupID: string) => void
 }
 
 /**
@@ -99,6 +102,8 @@ export interface RepoListProps {
 interface RepoListEntry {
   repo: RepoDTO
   upload?: UploadState
+  /** Steam 游戏库对应的 AppID：用于在列表行左侧显示应用图标。 */
+  steamAppID?: number
 }
 
 /** 用户端展示形式：卡片网格（默认，一眼扫过多块盘）/ 整页宽度的列表（一库一行，便于横向比对）。 */
@@ -484,6 +489,12 @@ interface RepoSectionProps {
   currentUserId: string
   /** 标题行右侧的附加内容（形态切换）；只由列表页交给第一个分组。 */
   headerExtra?: ReactNode
+  /** Steam 游戏分组：允许普通用户直接创建自己的差异盘并挂载。 */
+  allowAllocate?: boolean
+  /** 是否显示库卡片上的「配置」入口。 */
+  showConfigure?: boolean
+  /** 是否显示单库挂载/卸载动作（Steam 分组由分组按钮统一挂载）。 */
+  showMountActions?: boolean
   onOpen: (repoId: string) => void
   onConfigure: (repo: RepoDTO) => void
   onOpenUpload?: (uploadId: string) => void
@@ -501,6 +512,9 @@ function RepoSection({
   viewMode,
   currentUserId,
   headerExtra,
+  allowAllocate,
+  showConfigure,
+  showMountActions,
   onOpen,
   onConfigure,
   onOpenUpload
@@ -520,13 +534,17 @@ function RepoSection({
       {title || headerExtra ? <RepoGroupHeader title={title} count={items.length} extra={headerExtra} /> : null}
       {viewMode === 'card' ? (
         <Row gutter={[spacing.md, spacing.md]}>
-          {visible.map(({ repo, upload }) => (
+          {visible.map(({ repo, upload, steamAppID }) => (
             <Col key={repo.id} xs={24} sm={12} xl={8} xxl={6}>
               <RepoCard
                 repo={repo}
                 upload={upload}
                 onOpenUpload={onOpenUpload}
                 currentUserId={currentUserId}
+                allowAllocate={allowAllocate}
+                showConfigure={showConfigure}
+                showMountActions={showMountActions}
+                steamAppID={steamAppID}
                 onOpen={onOpen}
                 onConfigure={onConfigure}
               />
@@ -535,13 +553,17 @@ function RepoSection({
         </Row>
       ) : (
         <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
-          {visible.map(({ repo, upload }) => (
+          {visible.map(({ repo, upload, steamAppID }) => (
             <RepoRow
               key={repo.id}
               repo={repo}
               upload={upload}
               onOpenUpload={onOpenUpload}
               currentUserId={currentUserId}
+              allowAllocate={allowAllocate}
+              showConfigure={showConfigure}
+              showMountActions={showMountActions}
+              steamAppID={steamAppID}
               onOpen={onOpen}
               onConfigure={onConfigure}
             />
@@ -588,6 +610,18 @@ interface RepoGroupBucket {
   key: string
   title: string
   items: RepoListEntry[]
+  /** Steam 游戏分组：卡片上加标识，并允许普通用户直接分配差异盘。 */
+  steam: boolean
+  /** Steam 分组 ID（用于跳转分组管理）；非 Steam 分组为空。 */
+  steamGroupID: string
+  /** 组内是否有可更新版本。 */
+  steamHasUpdate: boolean
+}
+
+/** Steam 分组的更新状态，按分组名索引。 */
+interface SteamGroupState {
+  id: string
+  hasUpdate: boolean
 }
 
 /** 分组容量：组内各库标称容量之和（用于「大小」排序与分组卡片口径）。 */
@@ -610,7 +644,8 @@ function sortRepoEntries(entries: RepoListEntry[], sortMode: RepoSortMode): Repo
 function buildGroups(
   entries: RepoListEntry[],
   ungroupedLabel: string,
-  sortMode: RepoSortMode = 'name'
+  sortMode: RepoSortMode = 'name',
+  steamGroups?: Map<string, SteamGroupState>
 ): RepoGroupBucket[] {
   const map = new Map<string, RepoListEntry[]>()
   for (const entry of entries) {
@@ -619,12 +654,18 @@ function buildGroups(
     if (list) list.push(entry)
     else map.set(key, [entry])
   }
-  const buckets = Array.from(map.entries()).map(([key, items]) => ({
-    key,
-    // 分组名**没有**变化：key 就是服务端 meta.group 原值（空串 = 未分组）。
-    title: key || ungroupedLabel,
-    items
-  }))
+  const buckets = Array.from(map.entries()).map(([key, items]) => {
+    const steam = key !== '' ? steamGroups?.get(key) : undefined
+    return {
+      key,
+      // 分组名**没有**变化：key 就是服务端 meta.group 原值（空串 = 未分组）。
+      title: key || ungroupedLabel,
+      items,
+      steam: Boolean(steam),
+      steamGroupID: steam?.id ?? '',
+      steamHasUpdate: Boolean(steam?.hasUpdate)
+    }
+  })
   buckets.sort((a, b) => {
     if (a.key === '') return 1
     if (b.key === '') return -1
@@ -720,7 +761,7 @@ function useGroupOpState(key: string): GroupOpState {
  * 本机），服务端只下发目标；分组只是一个标签。因此这里按组遍历，每个库都复用单库挂载那一套
  * 语义（没有分配先建、再交给代理），只是把"逐个等待"换成"最多 N 个同时在跑"。
  */
-function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string) {
+function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string, allowAllocate = false) {
   const api = useApi()
   const agent = useAgent()
   const { active } = useServerConfig()
@@ -743,7 +784,7 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
         let allocation = allocations.items.find(
           (item) => item.user_id === currentUserId && item.state !== 'released'
         )
-        if (!allocation && repo.owner_id === currentUserId) {
+        if (!allocation && (repo.owner_id === currentUserId || allowAllocate)) {
           allocation = await api.allocate(repo.id, currentUserId)
         }
         if (!allocation) throw new Error(t('repo.card.notAllocated'))
@@ -772,7 +813,7 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
     setGroupOp(groupKey, GROUP_OP_IDLE)
     if (fail > 0) message.warning(t('repo.group.mountPartial', { ok, fail }))
     else message.success(t('repo.group.mountDone', { count: ok }))
-  }, [active?.baseUrl, active?.key, agent, api, currentUserId, groupKey, queryClient, repos, t])
+  }, [active?.baseUrl, active?.key, agent, allowAllocate, api, currentUserId, groupKey, queryClient, repos, t])
 
   const unmountAll = useCallback(async (): Promise<void> => {
     if (groupOps.get(groupKey)?.busy) return
@@ -821,24 +862,38 @@ function GroupMetric({
   value,
   percent,
   color,
-  loading
+  loading,
+  valueWidth = 0
 }: {
   label: string
-  value: string
+  value: ReactNode
   percent: number
   color?: string
   loading?: boolean
+  /** 数值列固定宽度：让不同分组的标签、进度条落在同一竖线上。 */
+  valueWidth?: number
 }): JSX.Element {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xxs, flexShrink: 0 }}>
       <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, whiteSpace: 'nowrap' }}>
         {label}
       </Typography.Text>
-      <Typography.Text
-        style={{ fontSize: fontSize.xs, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}
+      <div
+        style={{
+          // 数值紧跟标签左对齐：固定宽度只用于让各行的进度条落在同一条竖线上，
+          // 余量留在数值与进度条之间，不再撑在「标签 → 数值」中间形成大空隙。
+          minWidth: valueWidth,
+          display: 'flex',
+          justifyContent: 'flex-start',
+          alignItems: 'baseline',
+          gap: 2,
+          fontSize: fontSize.xs,
+          fontVariantNumeric: 'tabular-nums',
+          whiteSpace: 'nowrap'
+        }}
       >
         {value}
-      </Typography.Text>
+      </div>
       {/* 64 → 77（+20%）：分组卡片里这根条之前太短，几乎看不出占比差异 */}
       <UsageBar percent={percent} color={color} loading={loading} style={{ width: 77, marginTop: 0 }} />
     </div>
@@ -861,7 +916,12 @@ function RepoGroupCard({
   const api = useApi()
   const agent = useAgent()
   const repos = bucket.items.map((entry) => entry.repo)
-  const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
+  const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(
+    bucket.key,
+    repos,
+    currentUserId,
+    bucket.steam
+  )
   const mounts = agent.state?.mounts ?? []
   const mountedRepos = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined)
   const mountedCount = mountedRepos.length
@@ -922,15 +982,12 @@ function RepoGroupCard({
   // 操作开始后按固定的 kind 出文案：挂载过程中 mountedCount 会增长，
   // 不能再用它判断"这一次到底是在挂载还是卸载"。
   const activeKind = kind ?? (mountedCount > 0 ? 'unmount' : 'mount')
+  const steamGroupPref = bucket.steam ? agent.config?.group_mounts?.[bucket.key] : undefined
+  const steamMountReady =
+    !bucket.steam || Boolean(steamGroupPref?.use_for_repos && (steamGroupPref?.steam_library ?? '').trim())
   // 条的比例同样按容量算（分母 = 分组内全部库的容量）：全组都挂上就是 100%。
   const mountedPercent = totalCapacity > 0 ? Math.min(100, Math.round((mountedCapacity / totalCapacity) * 100)) : 0
   const diffPercent = diffUsage.total > 0 ? Math.min(100, Math.round((diffUsage.used / diffUsage.total) * 100)) : 0
-  // 组内没有一块"我的盘"（全独享库 / 我在这些共享库上还没分配）时不写 `0 B / 0 B`：
-  // 那是"上限未知"，不是"上限为 0"，与用量格写 `-` 的既有口径一致。
-  const diffValue =
-    diffLoading || diffUsage.total <= 0
-      ? '-'
-      : `${formatBytes(diffUsage.used)} / ${formatBytes(diffUsage.total)}`
 
   return (
     <Card
@@ -966,9 +1023,21 @@ function RepoGroupCard({
       </div>
 
       <div style={{ minWidth: 0, flex: '1 1 120px' }}>
-        <Typography.Text strong ellipsis style={{ display: 'block', fontSize: fontSize.lg }}>
-          {bucket.title}
-        </Typography.Text>
+        <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, minWidth: 0 }}>
+          <Typography.Text strong ellipsis style={{ minWidth: 0, fontSize: fontSize.lg }}>
+            {bucket.title}
+          </Typography.Text>
+          {bucket.steam ? (
+            <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+              {t('repo.group.steam')}
+            </Tag>
+          ) : null}
+          {bucket.steamHasUpdate ? (
+            <Tag color="orange" style={{ marginInlineEnd: 0 }}>
+              {t('repo.group.steamHasUpdate')}
+            </Tag>
+          ) : null}
+        </div>
         <Typography.Text
           type="secondary"
           ellipsis
@@ -986,32 +1055,49 @@ function RepoGroupCard({
         percent={mountedPercent}
         // 已挂载容量不是"用量"，不随占比变色：一路主色蓝。
         color={palette.accent}
+        valueWidth={43}
       />
       <GroupMetric
         label={t('repo.group.usedSpace')}
-        value={diffValue}
+        value={
+          diffLoading || diffUsage.total <= 0
+            ? '- GB / - GB'
+            : `${formatBytes(diffUsage.used)} / ${formatBytes(diffUsage.total)}`
+        }
         percent={diffPercent}
         loading={diffLoading}
+        valueWidth={107}
       />
 
       {/* 动作放最右：挂载/卸载一个按钮，设置只留图标、不要边框。 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xxs, flexShrink: 0 }}>
-        <Button
-          size="small"
-          type={activeKind === 'unmount' ? 'default' : 'primary'}
-          loading={busy}
-          disabled={repos.length === 0 || (activeKind === 'mount' && activeCount === 0)}
-          onClick={(event) => {
-            event.stopPropagation()
-            void (activeKind === 'unmount' ? unmountAll() : mountAll())
-          }}
+        <Tooltip
+          title={
+            activeKind === 'mount' && !steamMountReady ? t('repo.group.steamLibraryRequired') : undefined
+          }
         >
-          {busy && progress.total > 0
-            ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
-            : activeKind === 'unmount'
-              ? t('repo.group.unmountAll')
-              : t('repo.group.mountAll')}
-        </Button>
+          <span>
+            <Button
+              size="small"
+              type={activeKind === 'unmount' ? 'default' : 'primary'}
+              loading={busy}
+              disabled={
+                repos.length === 0 ||
+                (activeKind === 'mount' && (activeCount === 0 || !steamMountReady))
+              }
+              onClick={(event) => {
+                event.stopPropagation()
+                void (activeKind === 'unmount' ? unmountAll() : mountAll())
+              }}
+            >
+              {busy && progress.total > 0
+                ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
+                : activeKind === 'unmount'
+                  ? t('repo.group.unmountAll')
+                  : t('repo.group.mountAll')}
+            </Button>
+          </span>
+        </Tooltip>
         {/* 未分组没有分组名，无法承载分组配置；不给设置入口。 */}
         {bucket.key ? (
           <Tooltip title={t('repo.group.settings')}>
@@ -1086,7 +1172,8 @@ function RepoGroupDetail({
   onOpen,
   onConfigure,
   onOpenUpload,
-  onSettings
+  onSettings,
+  onManageSteamGroup
 }: {
   bucket: RepoGroupBucket
   /** 当前要展示的条目（搜索时是组内匹配结果；为空时展示空态）。 */
@@ -1101,21 +1188,32 @@ function RepoGroupDetail({
   onConfigure: (repo: RepoDTO) => void
   onOpenUpload?: (uploadId: string) => void
   onSettings: () => void
+  onManageSteamGroup?: (groupID: string) => void
 }): JSX.Element {
   const { t } = useI18n()
   const agent = useAgent()
+  const { isSuperAdmin: canManageSteam } = usePermission()
   // 防误触：进入分组的那一次点击如果是双击的第二下（或手速很快），会正好落在
   // 刚出现的「返回」按钮上，表现为"一点进去就弹回总览"。这里忽略挂载后极短时间内的返回。
   const mountedAt = useRef(Date.now())
   // 分组级动作始终作用于**整个分组**：搜索只是缩小展示范围，不该让"挂载分组"
   // 悄悄变成只挂载搜索命中的那几块库。
   const repos = bucket.items.map((entry) => entry.repo)
-  const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(bucket.key, repos, currentUserId)
+  const { busy, kind, progress, mountAll, unmountAll } = useGroupMount(
+    bucket.key,
+    repos,
+    currentUserId,
+    bucket.steam
+  )
   const mounts = agent.state?.mounts ?? []
   const mountedCount = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined).length
   const activeCount = repos.filter((repo) => repo.state === 'active').length
   // 与总览卡片同一处修复：操作期间固定 kind，避免按钮文案随 mountedCount 翻转。
   const activeKind = kind ?? (mountedCount > 0 ? 'unmount' : 'mount')
+  // Steam 分组必须先选好 Steam 库才能挂载：否则游戏没有落点，Steam 也发现不了。
+  const steamGroupPref = bucket.steam ? agent.config?.group_mounts?.[bucket.key] : undefined
+  const steamMountReady =
+    !bucket.steam || Boolean(steamGroupPref?.use_for_repos && (steamGroupPref?.steam_library ?? '').trim())
 
   return (
     <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
@@ -1131,24 +1229,47 @@ function RepoGroupDetail({
         </Button>
         <FolderOutlined style={{ color: palette.accent }} />
         <Typography.Text strong>{bucket.title}</Typography.Text>
+        {bucket.steam ? <Tag color="blue">{t('repo.group.steam')}</Tag> : null}
         <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
           {items.length === bucket.items.length ? bucket.items.length : `${items.length} / ${bucket.items.length}`}
         </Typography.Text>
         <span style={{ marginLeft: 'auto' }}>
           <Space wrap>
-            <Button
-              type={activeKind === 'unmount' ? 'default' : 'primary'}
-              size="small"
-              loading={busy}
-              disabled={repos.length === 0 || (activeKind === 'mount' && activeCount === 0)}
-              onClick={() => void (activeKind === 'unmount' ? unmountAll() : mountAll())}
+            {bucket.steam && canManageSteam && bucket.steamGroupID && onManageSteamGroup ? (
+              <Button
+                size="small"
+                icon={<AppstoreOutlined />}
+                onClick={() => onManageSteamGroup(bucket.steamGroupID)}
+              >
+                {t('repo.group.manageSteam')}
+              </Button>
+            ) : null}
+            <Tooltip
+              title={
+                activeKind === 'mount' && !steamMountReady
+                  ? t('repo.group.steamLibraryRequired')
+                  : undefined
+              }
             >
-              {busy && progress.total > 0
-                ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
-                : activeKind === 'unmount'
-                  ? t('repo.group.unmountAll')
-                  : t('repo.group.mountAll')}
-            </Button>
+              <span>
+                <Button
+                  type={activeKind === 'unmount' ? 'default' : 'primary'}
+                  size="small"
+                  loading={busy}
+                  disabled={
+                    repos.length === 0 ||
+                    (activeKind === 'mount' && (activeCount === 0 || !steamMountReady))
+                  }
+                  onClick={() => void (activeKind === 'unmount' ? unmountAll() : mountAll())}
+                >
+                  {busy && progress.total > 0
+                    ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
+                    : activeKind === 'unmount'
+                      ? t('repo.group.unmountAll')
+                      : t('repo.group.mountAll')}
+                </Button>
+              </span>
+            </Tooltip>
             {bucket.key ? (
               <Tooltip title={t('repo.group.settings')}>
                 <Button
@@ -1173,6 +1294,9 @@ function RepoGroupDetail({
           items={sortRepoEntries(items, sortMode)}
           viewMode={viewMode}
           currentUserId={currentUserId}
+          allowAllocate={bucket.steam}
+          showConfigure={!bucket.steam}
+          showMountActions={!bucket.steam}
           onOpen={onOpen}
           onConfigure={onConfigure}
           onOpenUpload={onOpenUpload}
@@ -1192,7 +1316,8 @@ export function RepoList({
   onOpenUpload,
   onOpenStorages,
   onOpenUsers,
-  onImport
+  onImport,
+  onManageSteamGroup
 }: RepoListProps): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
@@ -1245,6 +1370,45 @@ export function RepoList({
     queryKey: ['repos', isSuperAdmin ? 'all' : 'mine'],
     queryFn: () => api.listRepos({ limit: 200 })
   })
+
+  // Steam 游戏分组的目录：普通用户看不到管理员名下的游戏库，需要用它把
+  // 「游戏分组」以普通分组的身份补进同一个列表，而不是另起一块区域。
+  const steamCatalogQuery = useQuery({
+    queryKey: ['game-catalog'],
+    queryFn: () => api.getGameCatalog(),
+    refetchInterval: (query) => {
+      const groups = query.state.data?.items ?? []
+      return groups.some((group) => group.games.some((game) => game.status === 'updating')) ? 5000 : false
+    }
+  })
+  const steamCatalogGroups = useMemo(
+    () => steamCatalogQuery.data?.items ?? [],
+    [steamCatalogQuery.data]
+  )
+  const steamGroupState = useMemo(() => {
+    const map = new Map<string, SteamGroupState>()
+    for (const group of steamCatalogGroups) {
+      const hasUpdate = group.games.some(
+        (game) => game.available_build_id !== '' && game.available_build_id !== game.build_id
+      )
+      map.set(group.name, { id: group.id, hasUpdate })
+    }
+    return map
+  }, [steamCatalogGroups])
+  const steamRepoIDs = useMemo(() => {
+    const ids = new Set<string>()
+    for (const group of steamCatalogGroups) {
+      for (const game of group.games) ids.add(game.repo.id)
+    }
+    return ids
+  }, [steamCatalogGroups])
+  const steamAppIDByRepoID = useMemo(() => {
+    const map = new Map<string, number>()
+    for (const group of steamCatalogGroups) {
+      for (const game of group.games) map.set(game.repo.id, game.app_id)
+    }
+    return map
+  }, [steamCatalogGroups])
 
   const usersQuery = useQuery({
     queryKey: ['users', 'options'],
@@ -1312,7 +1476,11 @@ export function RepoList({
           }
         }
       }
-      return { repo: next, upload: upload && next.state !== 'active' ? upload : undefined }
+      return {
+        repo: next,
+        upload: upload && next.state !== 'active' ? upload : undefined,
+        steamAppID: steamAppIDByRepoID.get(next.id)
+      }
     })
 
     // 服务端还没有的（扫描 / 建会话 / 传数据三个阶段）：合成一条，让它和其他库一样出现在
@@ -1323,8 +1491,20 @@ export function RepoList({
       merged.push({ repo: uploadPlaceholderRepo(upload, user?.id ?? ''), upload })
     }
 
+    // Steam 游戏分组：把目录里的库并进同一份分组数据。
+    // 已经有 /v1/repos 记录时以它为准（权限、状态更完整），这里只补看不到的共享游戏库。
+    const knownRepoIDs = new Set(merged.map((entry) => entry.repo.id))
+    for (const group of steamCatalogGroups) {
+      for (const game of group.games) {
+        if (knownRepoIDs.has(game.repo.id)) continue
+        knownRepoIDs.add(game.repo.id)
+        // 目录接口的库不代表当前用户可管理；标记为只读，详情页据此收起管理入口。
+        merged.push({ repo: { ...game.repo, permission: game.repo.permission ?? 'read' }, steamAppID: game.app_id })
+      }
+    }
+
     return merged
-  }, [reposQuery.data, activeUploads, user?.id, agent.repoEvents])
+  }, [reposQuery.data, activeUploads, user?.id, agent.repoEvents, steamCatalogGroups, steamAppIDByRepoID])
 
   // 搜索统一在这里做：名称或分组名命中都算。总览里按命中结果重新分组展示，
   // 进入某个分组后只在这一个分组内过滤 —— 两处用的是同一套匹配规则。
@@ -1412,7 +1592,7 @@ export function RepoList({
   }, [isSuperAdmin, onOpen, ownerName, t])
 
   const renderUserRepos = (): JSX.Element => {
-    if (reposQuery.isLoading) return <RepoListSkeleton viewMode={viewMode} />
+    if (reposQuery.isLoading || steamCatalogQuery.isLoading) return <RepoListSkeleton viewMode={viewMode} />
 
     // 顶部总览：左侧 2/3 性能指标，右侧 1/3 存储 + 配额上下排列。
     // 存储/配额卡沿用原来的整卡点击与文案，只改宽度与位置。
@@ -1433,13 +1613,13 @@ export function RepoList({
 
     const userId = user?.id ?? ''
     const quotaRepos = allEntries
-      .filter((entry) => !isPlaceholderRepoId(entry.repo.id))
+      .filter((entry) => !isPlaceholderRepoId(entry.repo.id) && !steamRepoIDs.has(entry.repo.id))
       .map((entry) => entry.repo)
     const keywordActive = keyword.trim() !== ''
     // 分组卡片与"当前分组是否存在"都以未过滤的全集为准：搜索不应影响"我在哪个分组里"。
-    const allGroups = buildGroups(allEntries, t('repo.group.ungrouped'), sortMode)
+    const allGroups = buildGroups(allEntries, t('repo.group.ungrouped'), sortMode, steamGroupState)
     // 搜索结果按命中的库重新分组：分组 A 有命中就展示 A 的命中库，B 同理，而不是只筛掉分组。
-    const resultGroups = buildGroups(filteredEntries, t('repo.group.ungrouped'), sortMode)
+    const resultGroups = buildGroups(filteredEntries, t('repo.group.ungrouped'), sortMode, steamGroupState)
     const currentGroup =
       activeGroup === null ? undefined : allGroups.find((bucket) => bucket.key === activeGroup)
 
@@ -1478,6 +1658,7 @@ export function RepoList({
             onConfigure={openSettings}
             onOpenUpload={onOpenUpload}
             onSettings={() => setSettingsGroup(currentGroup.key)}
+            onManageSteamGroup={onManageSteamGroup}
           />
         </Space>
       )
@@ -1515,6 +1696,9 @@ export function RepoList({
                 items={sortRepoEntries(bucket.items, sortMode)}
                 viewMode={viewMode}
                 currentUserId={userId}
+                allowAllocate={bucket.steam}
+                showConfigure={!bucket.steam}
+                showMountActions={!bucket.steam}
                 onOpen={onOpen}
                 onConfigure={openSettings}
                 onOpenUpload={onOpenUpload}
@@ -1590,6 +1774,7 @@ export function RepoList({
             .filter((entry) => !isPlaceholderRepoId(entry.repo.id))
             .filter((entry) => (entry.repo.group ?? '').trim() === settingsGroup)
             .map((entry) => entry.repo)}
+          isSteam={steamGroupState.has(settingsGroup)}
           open
           onClose={() => setSettingsGroup(null)}
         />

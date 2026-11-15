@@ -38,6 +38,13 @@ var ErrUnsupported = errors.New("platform: unsupported")
 // IsUnsupported 判断错误链上是否存在 ErrUnsupported。
 func IsUnsupported(err error) bool { return errors.Is(err, ErrUnsupported) }
 
+// PartitionExtender is an optional capability: after resizing a disk, also extend
+// the guest partition/filesystem to the new capacity. Windows Resize-VHD only grows
+// the VHDX, not the NTFS partition inside it.
+type PartitionExtender interface {
+	ExtendPartition(ctx context.Context, ref string) error
+}
+
 // Volume 是一次格式化/挂载操作返回的卷信息。
 type Volume struct {
 	// Device 卷设备标识：Windows 为盘符（如 "E"，无盘符时为空串）；

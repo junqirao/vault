@@ -124,6 +124,20 @@ func TestDiffSyncAbsRejectsEscape(t *testing.T) {
 	}
 }
 
+func TestDiffPlanWriteBytes(t *testing.T) {
+	plan := &diffSyncPlan{
+		add:    []DiffSyncEntry{{Path: "a", Size: 100}, {Path: "b", Size: 200}},
+		modify: []DiffSyncEntry{{Path: "c", Size: 300}},
+		del:    []DiffSyncEntry{{Path: "d"}},
+	}
+	if got := diffPlanWriteBytes(plan); got != 600 {
+		t.Fatalf("diffPlanWriteBytes = %d，期望 600", got)
+	}
+	if got := diffPlanWriteBytes(nil); got != 0 {
+		t.Fatalf("nil plan = %d，期望 0", got)
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {

@@ -327,6 +327,10 @@ const (
 	// JobCreateDiffFromDir 从服务端目录创建一块差异盘：先对比源目录与母盘现有内容，
 	// 生成新增/修改/删除清单，再在差异盘里只执行这些改动（见 app/diffsync.go）。
 	JobCreateDiffFromDir JobType = "create_diff_from_dir"
+	// JobSteamUpdate 是 Steam 游戏更新专用的差异盘任务：先由母盘 VHDX 派生差异盘，
+	// 再把 SteamCMD staging 与母盘现有内容的差异写入差异盘，最后 merge 回母盘。
+	// 实现与 create_diff_from_dir 相同，单独类型只为任务列表/日志语义更准确。
+	JobSteamUpdate JobType = "steam_update"
 	// JobPlanClientDiff 客户端目录创建差异盘的第一阶段：服务端建盘、比对客户端清单、
 	// 删除多余项，并记录"客户端还需要上传哪些文件"（见 app/clientdiff.go）。
 	JobPlanClientDiff JobType = "plan_client_diff"
@@ -382,6 +386,8 @@ const (
 	// Windows 侧没有这类"进程外依赖"，提交时直接返回 platform.unsupported）。
 	// RefID 与 Payload 都带依赖项 Key（如 lio_tools）——RefID 便于按引用检索，Payload 供 handler 读取。
 	JobInstallDeps JobType = "install_deps"
+	// JobSteamGameUpdate 是 Steam 游戏内容更新流水线（仅允许用于存储库下载/更新）。
+	JobSteamGameUpdate JobType = "steam_game_update"
 )
 
 // JobState 任务状态。

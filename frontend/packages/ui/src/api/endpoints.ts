@@ -57,7 +57,25 @@ import type {
   SystemLog,
   UpdateRepoRequest,
   UpdateUserRequest,
-  UserDTO
+  UserDTO,
+  SteamAccountDTO,
+  CreateSteamAccountRequest,
+  UpdateSteamAccountRequest,
+  SteamAccountAppDTO,
+  SteamAccountAvailableDTO,
+  RepoGroupDTO,
+  CreateRepoGroupRequest,
+  UpdateRepoGroupRequest,
+  GameDTO,
+  CreateGameRequest,
+  UpdateGameRequest,
+  RepoGroupKind,
+  GameCatalogGroupDTO,
+  SteamRuntimeStatusDTO,
+  SteamNetworkCheckDTO,
+  SteamStoreGameDTO,
+  BatchCreateGamesRequest,
+  BatchCreateGamesResultDTO
 } from './types'
 
 /**
@@ -659,6 +677,225 @@ export class VaultApi extends ApiClient {
    */
   cancelJob(id: string): Promise<JobDTO> {
     return this.request<JobDTO>('POST', `/v1/jobs/${encodeURIComponent(id)}/cancel`)
+  }
+
+  // ---- Steam 内容账号（仅超管；仅用于存储库下载/更新） ----
+
+  listSteamAccounts(params?: { limit?: number; offset?: number }): Promise<ListResponse<SteamAccountDTO>> {
+    return this.request<ListResponse<SteamAccountDTO>>('GET', '/v1/steam/accounts', undefined, params)
+  }
+
+  getSteamAccount(id: string): Promise<SteamAccountDTO> {
+    return this.request<SteamAccountDTO>('GET', `/v1/steam/accounts/${encodeURIComponent(id)}`)
+  }
+
+  createSteamAccount(body: CreateSteamAccountRequest): Promise<SteamAccountDTO> {
+    return this.request<SteamAccountDTO>('POST', '/v1/steam/accounts', body)
+  }
+
+  updateSteamAccount(id: string, body: UpdateSteamAccountRequest): Promise<SteamAccountDTO> {
+    return this.request<SteamAccountDTO>('PATCH', `/v1/steam/accounts/${encodeURIComponent(id)}`, body)
+  }
+
+  disableSteamAccount(id: string): Promise<void> {
+    return this.request<void>('DELETE', `/v1/steam/accounts/${encodeURIComponent(id)}`)
+  }
+
+  testSteamLogin(id: string, guardCode?: string): Promise<SteamAccountDTO> {
+    // SteamCMD 登录本身最长 90 秒；给浏览器留足余量，避免请求被前端先取消。
+    return this.request<SteamAccountDTO>(
+      'POST',
+      `/v1/steam/accounts/${encodeURIComponent(id)}/test-login`,
+      { guard_code: guardCode ?? '' },
+      undefined,
+      true,
+      8 * 60 * 1000
+    )
+  }
+
+  syncSteamLicenses(id: string, guardCode?: string): Promise<ListResponse<SteamAccountAppDTO>> {
+    // 许可同步最长 2 分钟；这里必须大于服务端超时，否则会出现 context canceled。
+    return this.request<ListResponse<SteamAccountAppDTO>>(
+      'POST',
+      `/v1/steam/accounts/${encodeURIComponent(id)}/sync-licenses`,
+      { guard_code: guardCode ?? '' },
+      undefined,
+      true,
+      4 * 60 * 1000
+    )
+  }
+
+  releaseSteamLeases(id: string): Promise<{ released: number }> {
+    return this.request<{ released: number }>(
+      'POST',
+      `/v1/steam/accounts/${encodeURIComponent(id)}/release-leases`
+    )
+  }
+
+  listSteamAccountApps(id: string): Promise<ListResponse<SteamAccountAppDTO>> {
+    return this.request<ListResponse<SteamAccountAppDTO>>(
+      'GET',
+      `/v1/steam/accounts/${encodeURIComponent(id)}/apps`
+    )
+  }
+
+  /** 账号已同步的全部游戏（带商店名称/封面/平台），供批量添加时勾选。 */
+  listSteamOwnedGames(
+    id: string,
+    lang?: string,
+    cc?: string,
+    refresh?: boolean
+  ): Promise<ListResponse<SteamStoreGameDTO>> {
+    return this.request<ListResponse<SteamStoreGameDTO>>(
+      'GET',
+      `/v1/steam/accounts/${encodeURIComponent(id)}/games`,
+      undefined,
+      { lang, cc, refresh: refresh ? 'true' : undefined },
+      true,
+      3 * 60 * 1000
+    )
+  }
+
+  /** 同步客户端本机 Steam 库到服务端账号（只同步 AppID/名称，不同步登录凭据）。 */
+  importSteamClientGames(
+    id: string,
+    games: Array<{ app_id: number; name: string; installed?: boolean }>
+  ): Promise<{ imported: number }> {
+    return this.request<{ imported: number }>(
+      'POST',
+      `/v1/steam/accounts/${encodeURIComponent(id)}/games/import`,
+      { games },
+      undefined,
+      true,
+      2 * 60 * 1000
+    )
+  }
+
+  listAvailableSteamAccounts(appId?: number, platform?: 'windows' | 'linux'): Promise<ListResponse<SteamAccountAvailableDTO>> {
+    return this.request<ListResponse<SteamAccountAvailableDTO>>('GET', '/v1/steam/accounts/available', undefined, {
+      app_id: appId,
+      platform
+    })
+  }
+
+  steamRuntimeStatus(): Promise<SteamRuntimeStatusDTO> {
+    return this.request<SteamRuntimeStatusDTO>('GET', '/v1/steam/runtime')
+  }
+
+  installSteamCmd(): Promise<SteamRuntimeStatusDTO> {
+    // 安装已改为后台执行，POST 会立即返回；这里保留较长超时只作为极端慢响应的兜底。
+    return this.request<SteamRuntimeStatusDTO>(
+      'POST',
+      '/v1/steam/runtime/install',
+      undefined,
+      undefined,
+      true,
+      2 * 60 * 1000
+    )
+  }
+
+  checkSteamNetwork(): Promise<SteamNetworkCheckDTO> {
+    // 服务端探测最长 20s，这里放宽到 30s，避免前后端同时超时导致看不到诊断结果。
+    return this.request<SteamNetworkCheckDTO>('POST', '/v1/steam/runtime/check', undefined, undefined, true, 30000)
+  }
+
+  searchSteamStore(q: string, lang?: string, cc?: string, accountId?: string): Promise<ListResponse<SteamStoreGameDTO>> {
+    return this.request<ListResponse<SteamStoreGameDTO>>('GET', '/v1/steam/store/search', undefined, {
+      q,
+      lang,
+      cc,
+      account_id: accountId
+    })
+  }
+
+  batchCreateGames(groupId: string, body: BatchCreateGamesRequest): Promise<BatchCreateGamesResultDTO> {
+    // 每个游戏都会建独立共享库；批量 50 个时可能远超默认 20 秒。
+    return this.request<BatchCreateGamesResultDTO>(
+      'POST',
+      `/v1/repo-groups/${encodeURIComponent(groupId)}/games/batch`,
+      body,
+      undefined,
+      true,
+      15 * 60 * 1000
+    )
+  }
+
+  // ---- 服务端分组 / 游戏库 ----
+
+  listRepoGroups(params?: { kind?: RepoGroupKind }): Promise<ListResponse<RepoGroupDTO>> {
+    return this.request<ListResponse<RepoGroupDTO>>('GET', '/v1/repo-groups', undefined, params)
+  }
+
+  getRepoGroup(id: string): Promise<RepoGroupDTO> {
+    return this.request<RepoGroupDTO>('GET', `/v1/repo-groups/${encodeURIComponent(id)}`)
+  }
+
+  createRepoGroup(body: CreateRepoGroupRequest): Promise<RepoGroupDTO> {
+    return this.request<RepoGroupDTO>('POST', '/v1/repo-groups', body)
+  }
+
+  updateRepoGroup(id: string, body: UpdateRepoGroupRequest): Promise<RepoGroupDTO> {
+    return this.request<RepoGroupDTO>('PATCH', `/v1/repo-groups/${encodeURIComponent(id)}`, body)
+  }
+
+  deleteRepoGroup(id: string): Promise<void> {
+    return this.request<void>('DELETE', `/v1/repo-groups/${encodeURIComponent(id)}`)
+  }
+
+  listGames(groupId: string): Promise<ListResponse<GameDTO>> {
+    return this.request<ListResponse<GameDTO>>(
+      'GET',
+      `/v1/repo-groups/${encodeURIComponent(groupId)}/games`
+    )
+  }
+
+  createGame(groupId: string, body: CreateGameRequest): Promise<GameDTO> {
+    return this.request<GameDTO>('POST', `/v1/repo-groups/${encodeURIComponent(groupId)}/games`, body)
+  }
+
+  getGame(id: string): Promise<GameDTO> {
+    return this.request<GameDTO>('GET', `/v1/games/${encodeURIComponent(id)}`)
+  }
+
+  updateGame(id: string, body: UpdateGameRequest): Promise<GameDTO> {
+    return this.request<GameDTO>('PATCH', `/v1/games/${encodeURIComponent(id)}`, body)
+  }
+
+  deleteGame(id: string): Promise<void> {
+    return this.request<void>('DELETE', `/v1/games/${encodeURIComponent(id)}`)
+  }
+
+  checkGroupUpdates(groupId: string): Promise<ListResponse<GameDTO>> {
+    return this.request<ListResponse<GameDTO>>(
+      'POST',
+      `/v1/repo-groups/${encodeURIComponent(groupId)}/check-updates`,
+      undefined,
+      undefined,
+      true,
+      5 * 60 * 1000
+    )
+  }
+
+  updateGameNow(id: string): Promise<GameDTO> {
+    return this.request<GameDTO>('POST', `/v1/games/${encodeURIComponent(id)}/update`)
+  }
+
+  pauseGameUpdate(id: string): Promise<GameDTO> {
+    return this.request<GameDTO>('POST', `/v1/games/${encodeURIComponent(id)}/pause-update`)
+  }
+
+  stopGameUpdate(id: string): Promise<GameDTO> {
+    return this.request<GameDTO>('POST', `/v1/games/${encodeURIComponent(id)}/stop-update`)
+  }
+
+  /** 最近一次/当前更新的 SteamCMD 原始输出（仅管理端）。 */
+  getGameOutput(id: string): Promise<ListResponse<string>> {
+    return this.request<ListResponse<string>>('GET', `/v1/games/${encodeURIComponent(id)}/output`)
+  }
+
+  /** 普通用户游戏目录：共享 Steam 游戏库（不含 Steam 账号信息）。 */
+  getGameCatalog(): Promise<ListResponse<GameCatalogGroupDTO>> {
+    return this.request<ListResponse<GameCatalogGroupDTO>>('GET', '/v1/game-catalog')
   }
 }
 

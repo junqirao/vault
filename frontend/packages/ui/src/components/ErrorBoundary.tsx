@@ -12,11 +12,14 @@ import { spacing } from '../tokens/palette'
  * 这里把异常收敛成一张可读的提示卡 + 一个"重试"（重新加载）按钮，保证任何单点故障
  * 都不会以白屏的形式暴露给用户。
  */
-export class ErrorBoundary extends Component<{ children: ReactNode }, { hasError: boolean }> {
-  override state: { hasError: boolean } = { hasError: false }
+export class ErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; message: string }
+> {
+  override state: { hasError: boolean; message: string } = { hasError: false, message: '' }
 
-  static getDerivedStateFromError(): { hasError: boolean } {
-    return { hasError: true }
+  static getDerivedStateFromError(error: Error): { hasError: boolean; message: string } {
+    return { hasError: true, message: error?.message ?? '' }
   }
 
   override componentDidCatch(error: Error, info: ErrorInfo): void {
@@ -26,17 +29,18 @@ export class ErrorBoundary extends Component<{ children: ReactNode }, { hasError
 
   override render(): ReactNode {
     if (!this.state.hasError) return this.props.children
-    return <ErrorFallback />
+    return <ErrorFallback message={this.state.message} />
   }
 }
 
-function ErrorFallback(): JSX.Element {
+function ErrorFallback({ message }: { message: string }): JSX.Element {
   const { t } = useI18n()
   return (
     <div style={{ padding: spacing.lg }}>
       <Result
         status="error"
-        title={t('err.unknown')}
+        title={t('err.boundary')}
+        subTitle={message || undefined}
         extra={
           <Button type="primary" onClick={() => window.location.reload()}>
             {t('common.retry')}

@@ -139,7 +139,7 @@ export function RepoDetail({
   const activeDiffOpQuery = useQuery({
     queryKey: ['repo-diff-op', repoId],
     queryFn: () => api.getActiveDiffOperation(repoId),
-    enabled: Boolean(repoQuery.data?.mode === 'shared'),
+    enabled: Boolean(repoQuery.data?.mode === 'shared' && repoQuery.data?.permission !== 'read'),
     refetchInterval: 10_000
   })
 
@@ -945,7 +945,6 @@ export function RepoDetail({
         }}
       >
         <Space direction="vertical" style={{ width: '100%' }}>
-          <Alert type="info" showIcon message={t('repo.copy.desc')} />
           <Form form={copyForm} layout="vertical">
             <Form.Item name="new_repo_name" label={t('field.newName')} rules={[{ required: true }]}>
               <Input maxLength={64} />
@@ -975,7 +974,6 @@ export function RepoDetail({
         }}
       >
         <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
-          <Alert type="warning" showIcon message={t('repo.move.desc')} />
           {repo?.storage_name ? (
             <Space>
               <span>{t('repo.move.current')}</span>
@@ -1038,7 +1036,6 @@ export function RepoDetail({
         }}
       >
         <Space direction="vertical" style={{ width: '100%' }}>
-          <Alert type="info" showIcon message={t('repo.maintenance.resizeHint')} />
           <Form form={resizeForm} layout="vertical">
             <Form.Item name="size_gb" label={t('repo.maintenance.resizeSize')} rules={[{ required: true }]}>
               <InputNumber

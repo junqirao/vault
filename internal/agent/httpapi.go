@@ -750,6 +750,8 @@ type repoMountPrefRequest struct {
 	//
 	// 与其它字段一样属于**整条偏好替换**的一部分。
 	ShortcutEnabled bool `json:"shortcut_enabled"`
+	// SteamLibrary 仅 Steam 分组使用：目标 Steam 库路径。
+	SteamLibrary string `json:"steam_library,omitempty"`
 }
 
 // groupMountPrefRequest 是存储库分组挂载配置的写入请求。
@@ -781,6 +783,7 @@ func (a *Agent) handleSetGroupMountPref(w http.ResponseWriter, r *http.Request) 
 		CacheEnabled:    cacheEnabled,
 		DirectMode:      in.DirectMode,
 		ShortcutEnabled: in.ShortcutEnabled,
+		SteamLibrary:    in.SteamLibrary,
 		UseForRepos:     in.UseForRepos,
 		UseRepos:        in.UseRepos,
 	})
@@ -814,6 +817,7 @@ func (a *Agent) handleSetRepoMountPref(w http.ResponseWriter, r *http.Request) {
 		CacheEnabled:    cacheEnabled,
 		DirectMode:      in.DirectMode,
 		ShortcutEnabled: in.ShortcutEnabled,
+		SteamLibrary:    in.SteamLibrary,
 	})
 	if err != nil {
 		a.writeError(w, err)

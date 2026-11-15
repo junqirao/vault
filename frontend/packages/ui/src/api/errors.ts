@@ -144,6 +144,10 @@ export function translateError(error: unknown): string {
   if (!isApiError(error)) return t('err.unknown', { code: 'unknown' })
 
   if (error.kind === 'network' || error.kind === 'timeout') {
+    const path = typeof error.args.path === 'string' ? error.args.path : ''
+    if (path !== '') {
+      return t(error.kind === 'timeout' ? 'err.network.timeoutPath' : 'err.network.errorPath', error.args)
+    }
     return t(error.code)
   }
   if (error.kind === 'business') {

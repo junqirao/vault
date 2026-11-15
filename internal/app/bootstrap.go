@@ -231,7 +231,7 @@ func (a *App) bootstrapTx(ctx context.Context, username, passwordHash, serverNam
 
 	a.Log.Warn("系统已完成初始化，首个超级管理员已创建",
 		"username", created.Username, "ip", ip)
-	_ = a.Store.AppendAudit(ctx, &domain.AuditLog{
+	a.writeAudit(ctx, &domain.AuditLog{
 		UserID:   created.ID,
 		Action:   "system.bootstrap",
 		Resource: "system",

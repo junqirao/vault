@@ -18,6 +18,7 @@ import (
 // 由请求内的锁与这里的 active job 闸门共同覆盖。
 var diffOperationJobTypes = map[domain.JobType]bool{
 	domain.JobCreateDiffFromDir: true,
+	domain.JobSteamUpdate:       true,
 	domain.JobPlanClientDiff:    true,
 	domain.JobMergeDiff:         true,
 }

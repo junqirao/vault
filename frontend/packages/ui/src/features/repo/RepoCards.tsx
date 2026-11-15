@@ -26,6 +26,7 @@ import {
 import { diffUsageAsVolume, RepoUsageTooltip, useRepoDiffUsage } from './RepoUsageTip'
 import { preparePercent, prepareValue } from './repoPrepareView'
 import { isPlaceholderRepoId, repoStateValue, uploadPercent } from './uploadView'
+import { SteamAppIcon } from '../steam/SteamAppIcon'
 
 export interface RepoCardProps {
   repo: RepoDTO
@@ -54,6 +55,17 @@ export interface RepoCardProps {
   upload?: UploadState
   /** 打开「上传任务」页；不传则整卡点击仍是普通库的行为（进入详情）。 */
   onOpenUpload?: (uploadId: string) => void
+  /**
+   * 共享 Steam 游戏库允许普通用户在尚未分配时直接点挂载，
+   * 由服务端幂等地创建该用户自己的差异盘。
+   */
+  allowAllocate?: boolean
+  /** 是否显示卡片右上角的「配置」入口（游戏分组里由分组页统一管理）。 */
+  showConfigure?: boolean
+  /** 是否显示单库挂载/卸载动作（Steam 分组由分组按钮统一挂载）。 */
+  showMountActions?: boolean
+  /** Steam AppID：显示应用图标。 */
+  steamAppID?: number
 }
 
 /**
@@ -499,17 +511,22 @@ function RepoActions({
   upload,
   controller,
   onConfigure,
+  showConfigure = true,
+  showMountActions = true,
   style
 }: {
   repo: RepoDTO
   upload?: UploadState
   controller: RepoMountController
   onConfigure: (repo: RepoDTO) => void
+  showConfigure?: boolean
+  showMountActions?: boolean
   style?: CSSProperties
 }): JSX.Element {
   const { t } = useI18n()
   const stop = (event: MouseEvent): void => event.stopPropagation()
   const placeholder = isPlaceholderRepoId(repo.id)
+  if (!showMountActions && !showConfigure) return <></>
   return (
     <div
       onClick={stop}
@@ -522,20 +539,22 @@ function RepoActions({
         ...style
       }}
     >
-      <Tooltip title={placeholder ? t('repo.uploadNotReady') : t('repo.settings.title')}>
-        <span style={{ display: 'inline-block' }}>
-          <Button
-            type="text"
-            size="small"
-            icon={<SettingOutlined />}
-            aria-label={t('repo.settings.title')}
-            disabled={placeholder}
-            onClick={() => onConfigure(repo)}
-          />
-        </span>
-      </Tooltip>
+      {showConfigure ? (
+        <Tooltip title={placeholder ? t('repo.uploadNotReady') : t('repo.settings.title')}>
+          <span style={{ display: 'inline-block' }}>
+            <Button
+              type="text"
+              size="small"
+              icon={<SettingOutlined />}
+              aria-label={t('repo.settings.title')}
+              disabled={placeholder}
+              onClick={() => onConfigure(repo)}
+            />
+          </span>
+        </Tooltip>
+      ) : null}
       {/* 上传中的条目：挂载按钮换成「暂停 / 继续」+「取消」（见 RepoUploadActions）。 */}
-      {repo.state === 'moving' ? (
+      {!showMountActions ? null : repo.state === 'moving' ? (
         <RepoMoveActions repo={repo} />
       ) : upload ? (
         <RepoUploadActions upload={upload} />
@@ -759,8 +778,19 @@ export function RepoCard(props: RepoCardProps): JSX.Element {
 }
 
 /** 库卡片：本机挂载这条链路（状态圆点 / 用量 / 挂载按钮）只在这一支里。 */
-function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onConfigure }: RepoCardProps): JSX.Element {
-  const mountController = useRepoMount(repo, currentUserId)
+function RepoMountCard({
+  repo,
+  currentUserId,
+  upload,
+  onOpenUpload,
+  allowAllocate,
+  showConfigure,
+  showMountActions,
+  steamAppID,
+  onOpen,
+  onConfigure
+}: RepoCardProps): JSX.Element {
+  const mountController = useRepoMount(repo, currentUserId, { allowAllocate })
   const openMountDir = useOpenMountDir(mountController)
   const interactions = useRepoCardInteractions(upload, onOpenUpload, openMountDir, () => onOpen(repo.id))
 
@@ -774,6 +804,7 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
     >
       {/* 标题行：状态圆点紧贴库名（8px 间距）。详情入口就是整卡单击，不再单独画「详情」按钮。 */}
       <div style={{ display: 'flex', alignItems: 'center', gap: spacing.sm }}>
+        {steamAppID ? <SteamAppIcon appID={steamAppID} name={repo.name} size={40} /> : null}
         <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, flex: 1, minWidth: 0 }}>
           <RepoMountDot controller={mountController} />
           <Typography.Text strong ellipsis={{ tooltip: repo.name }} style={{ minWidth: 0, fontSize: fontSize.lg }}>
@@ -811,6 +842,8 @@ function RepoMountCard({ repo, currentUserId, upload, onOpenUpload, onOpen, onCo
         upload={upload}
         controller={mountController}
         onConfigure={onConfigure}
+        showConfigure={showConfigure}
+        showMountActions={showMountActions}
         style={{ marginTop: spacing.sm }}
       />
     </Card>
@@ -833,8 +866,19 @@ export function RepoRow(props: RepoCardProps): JSX.Element {
 }
 
 /** 库行（列表形态）。 */
-function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onConfigure }: RepoCardProps): JSX.Element {
-  const mountController = useRepoMount(repo, currentUserId)
+function RepoMountRow({
+  repo,
+  currentUserId,
+  upload,
+  onOpenUpload,
+  allowAllocate,
+  showConfigure,
+  showMountActions,
+  steamAppID,
+  onOpen,
+  onConfigure
+}: RepoCardProps): JSX.Element {
+  const mountController = useRepoMount(repo, currentUserId, { allowAllocate })
   const openMountDir = useOpenMountDir(mountController)
   const interactions = useRepoCardInteractions(upload, onOpenUpload, openMountDir, () => onOpen(repo.id))
 
@@ -846,6 +890,7 @@ function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onCon
       styles={{ body: { padding: `${spacing.sm}px ${spacing.md}px` } }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: spacing.md, flexWrap: 'wrap' }}>
+        {steamAppID ? <SteamAppIcon appID={steamAppID} name={repo.name} size={40} /> : null}
         <div style={{ flex: '1 1 260px', minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, minWidth: 0 }}>
             <RepoMountDot controller={mountController} />
@@ -882,6 +927,8 @@ function RepoMountRow({ repo, currentUserId, upload, onOpenUpload, onOpen, onCon
           upload={upload}
           controller={mountController}
           onConfigure={onConfigure}
+          showConfigure={showConfigure}
+          showMountActions={showMountActions}
         />
       </div>
     </Card>

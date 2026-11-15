@@ -419,6 +419,8 @@ export interface AgentRepoMountPref {
    * 默认关闭。存放目录见全局 `shortcut_dir`（空串 = 系统桌面）。
    */
   shortcut_enabled?: boolean
+  /** 仅 Steam 游戏分组：挂载到该 Steam 库，并生成 appmanifest。 */
+  steam_library?: string
   /**
    * 仅分组配置有意义：为 true 时用这套分组配置覆盖组内每个库自己的挂载配置；
    * 为 false（默认）时组内库各用各的配置，分组配置只作为默认值保留。

@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
-  Alert,
   Button,
   Input,
   Modal,
@@ -388,8 +387,6 @@ export function RepoVerifyDiff({
       onCancel={onClose}
     >
       <Space direction="vertical" size={spacing.md} style={{ width: '100%' }}>
-        <Alert type="info" showIcon message={t('repo.verifyDiff.hint')} />
-
         <Space.Compact style={{ width: '100%' }}>
           <Input
             value={directory}

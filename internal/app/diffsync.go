@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -104,6 +106,15 @@ type diffSyncFile struct {
 // 正常态（idle）按普通派生规则校验 max_diff_disks；维护态是受控的管理员操作：
 // 通常紧接着就合并回母盘，因此不受该上限约束（临时共享态仍拒绝）。
 func (s *DiskService) StartDiffFromDir(ctx context.Context, repoID, sourceDir, mode string, deleteExtra bool, operatorID string) (*domain.Job, error) {
+	return s.startDiffFromDir(ctx, repoID, sourceDir, mode, deleteExtra, operatorID, domain.JobCreateDiffFromDir)
+}
+
+// StartSteamUpdate 用 Steam 更新的差异盘任务类型执行同一套"母盘派生 + 目录增量写入"。
+func (s *DiskService) StartSteamUpdate(ctx context.Context, repoID, sourceDir, mode string, deleteExtra bool, operatorID string) (*domain.Job, error) {
+	return s.startDiffFromDir(ctx, repoID, sourceDir, mode, deleteExtra, operatorID, domain.JobSteamUpdate)
+}
+
+func (s *DiskService) startDiffFromDir(ctx context.Context, repoID, sourceDir, mode string, deleteExtra bool, operatorID string, jobType domain.JobType) (*domain.Job, error) {
 	repo, err := s.Store.GetRepository(ctx, repoID)
 	if err != nil {
 		return nil, err
@@ -170,7 +181,7 @@ func (s *DiskService) StartDiffFromDir(ctx context.Context, repoID, sourceDir, m
 		DeleteExtra: deleteExtra,
 		ResultPath:  filepath.Join(runDir, "result.json"),
 	}
-	j, _, err := s.Jobs.EnqueueWith(ctx, domain.JobCreateDiffFromDir, disk.ID,
+	j, _, err := s.Jobs.EnqueueWith(ctx, jobType, disk.ID,
 		"create_diff_from_dir:"+disk.ID, lock.RepoKey(repo.ID), payload)
 	if err != nil {
 		_ = s.Store.DeleteDisk(ctx, disk.ID)
@@ -226,7 +237,7 @@ func (s *DiskService) GetDiffSyncResult(ctx context.Context, repoID, jobID strin
 	if err != nil {
 		return nil, err
 	}
-	if j.Type != domain.JobCreateDiffFromDir {
+	if j.Type != domain.JobCreateDiffFromDir && j.Type != domain.JobSteamUpdate {
 		return nil, apperr.New(apperr.CodeNotFound, http.StatusNotFound)
 	}
 	var p diffSyncPayload
@@ -314,34 +325,56 @@ func (s *DiskService) runCreateDiffFromDir(ctx context.Context, j *domain.Job, r
 		}
 	}
 	rep.Progress(5)
-	if !s.Disk.Exists(disk.VHDXPath) {
-		// 维护态下母盘可能正被「母盘文件」页本地挂载/被 iSCSI 目标打开：
-		// 先卸挂载、拆目标，否则创建差异盘会撞共享冲突。
-		if repo.Condition() == domain.ParentMaintenance {
-			if s.Repos != nil {
-				s.Repos.UnmountParentVolume(ctx, repo.ID)
-			}
-			if s.Vol != nil {
-				if err := s.Vol.UnmountVolume(ctx, parent.VHDXPath, ""); err != nil {
-					s.Log.Warn("从目录创建差异盘前卸载母盘失败（继续尝试）", "repo_id", repo.ID, "error", err)
+
+	// 与 MergeDiff 保持同一套清场顺序：母盘不能保持挂载，所有差异盘的 iSCSI
+	// 目标也必须先拆掉，否则创建/挂载新差异盘会撞共享冲突。Steam 更新同样是
+	// 维护态操作，客户端应在这里被断开。
+	if s.Repos != nil {
+		s.Repos.UnmountParentVolume(ctx, repo.ID)
+	}
+	if s.Vol != nil {
+		if err := s.Vol.UnmountVolume(ctx, parent.VHDXPath, ""); err != nil {
+			s.Log.Debug("创建差异盘前卸载母盘本地挂载（忽略）", "repo_id", repo.ID, "error", err)
+		}
+	}
+	if s.Leases != nil {
+		if leases, lErr := s.Store.ListActiveLeasesByRepo(ctx, repo.ID); lErr == nil {
+			for i := range leases {
+				if err := s.Leases.RevokeWithReason(ctx, leases[i].ID, "system", RevokeReasonRepoMaintenance); err != nil {
+					s.Log.Warn("创建差异盘前撤销租约失败", "repo_id", repo.ID, "lease_id", leases[i].ID, "error", err)
 				}
 			}
 		}
+	}
+	if diffs, dErr := s.Store.ListDiffDisksByParent(ctx, parent.ID); dErr == nil {
 		if s.IscsiSvc != nil {
+			for i := range diffs {
+				s.IscsiSvc.TeardownDiskTargets(ctx, diffs[i].ID)
+			}
 			s.IscsiSvc.TeardownDiskTargets(ctx, parent.ID)
 		}
-		if s.Iscsi != nil {
-			if err := s.Iscsi.RemoveVirtualDisk(ctx, parent.VHDXPath); err != nil {
-				s.Log.Warn("从目录创建差异盘前移除母盘 iSCSI 登记失败（继续尝试）",
-					"repo_id", repo.ID, "error", err)
-			}
+	}
+	if s.Iscsi != nil {
+		if err := s.Iscsi.RemoveVirtualDisk(ctx, parent.VHDXPath); err != nil {
+			s.Log.Warn("创建差异盘前移除母盘 iSCSI 登记失败（继续尝试）", "repo_id", repo.ID, "error", err)
 		}
+	}
+
+	if !s.Disk.Exists(disk.VHDXPath) {
 		if err := s.createDiffWithRetry(ctx, disk.VHDXPath, parent.VHDXPath); err != nil {
 			return err
 		}
 	}
 	disk.ParentVersion = repo.ParentVersion
 	rep.Progress(15)
+
+	// 兼容"从中间开始"的旧任务：上一次进程可能已经挂载过这块差异盘，
+	// 或崩溃后留下了挂载。先按引用做一次幂等卸载，再正式挂载。
+	if s.Vol != nil {
+		if err := s.Vol.UnmountVolume(ctx, disk.VHDXPath, ""); err != nil {
+			s.Log.Debug("创建差异盘前卸载残留挂载（忽略）", "disk_id", disk.ID, "error", err)
+		}
+	}
 
 	fsName := disk.FileSystemOrDefault().String()
 	root, err := s.Vol.MountVolume(ctx, disk.VHDXPath, fsName)
@@ -372,6 +405,32 @@ func (s *DiskService) runCreateDiffFromDir(ctx context.Context, j *domain.Job, r
 	plan, planWarnings := buildDiffSyncPlan(srcFiles, dstFiles, mode, p.DeleteExtra)
 	warnings := append(append(srcWarnings, dstWarnings...), planWarnings...)
 	rep.Progress(60)
+
+	// 差异盘是动态盘：内部卷看似很大，但底层 VHDX 所在卷写满时，guest 会直接报
+	// "There is not enough space on the disk."。在写入前按计划字节做一个保守预检，
+	// 避免写到一半才失败，也避免任务反复重试把同一块空间写满。
+	if need := diffPlanWriteBytes(plan); need > 0 {
+		if space, spaceErr := s.Vol.SpaceUsageOf(ctx, root); spaceErr == nil && space.FreeBytes > 0 {
+			reserve := need/100 + (256 << 20)
+			if space.FreeBytes < need+reserve {
+				return apperr.New("storage.insufficient_space", 507).
+					WithArg("free_bytes", space.FreeBytes).
+					WithArg("need_bytes", need+reserve).
+					WithArg("path", root)
+			}
+		}
+		// 同时检查 VHDX 所在的宿主机卷：guest 看到的容量不等于宿主实际可增长空间。
+		// 非 Windows 的 disk ref 可能不是普通文件路径；只把明确的容量错误向上抛。
+		if s.Repos != nil {
+			reserve := need/100 + (256 << 20)
+			if err := s.Repos.ensureVolumeFreeAt(ctx, filepath.Dir(disk.VHDXPath), need+reserve); err != nil {
+				switch apperr.CodeOf(err) {
+				case "storage.insufficient_space", "storage.low_free_space":
+					return err
+				}
+			}
+		}
+	}
 
 	lastProgress := -1
 	_, err = applyDiffSyncPlan(ctx, p.SourceDir, root, plan, func(done, total int) {
@@ -575,6 +634,22 @@ func scanDiffTree(ctx context.Context, root string, mode DiffSyncMode, onFile fu
 }
 
 // applyDiffSyncPlan 把改动写进已挂载的差异盘根目录。
+// diffPlanWriteBytes 返回这次计划真正要写进差异盘的字节数（新增 + 修改）。
+func diffPlanWriteBytes(plan *diffSyncPlan) int64 {
+	if plan == nil {
+		return 0
+	}
+	var need int64
+	for _, list := range [][]DiffSyncEntry{plan.add, plan.modify} {
+		for _, entry := range list {
+			if entry.Size > 0 {
+				need += entry.Size
+			}
+		}
+	}
+	return need
+}
+
 func applyDiffSyncPlan(ctx context.Context, sourceDir, root string, plan *diffSyncPlan, onProgress func(done, total int)) (int, error) {
 	// 上次尝试如果在中途崩溃，目标里可能留下 .vault-diffsync-* 临时文件：先清掉，
 	// 避免它们被当成盘内内容（尤其是 delete_extra=false 时）长期留给用户。
@@ -628,12 +703,32 @@ func applyDiffSyncPlan(ctx context.Context, sourceDir, root string, plan *diffSy
 			return done, err
 		}
 		if err := copyDiffFile(src, dst); err != nil {
+			if isNoSpaceError(err) {
+				return done, apperr.New("storage.insufficient_space", 507).
+					WithArg("path", e.Path).WithCause(err)
+			}
 			return done, apperr.New(apperr.CodeInternal, http.StatusInternalServerError).
 				WithArg("reason", "copy").WithArg("path", e.Path).WithCause(err)
 		}
 		report()
 	}
 	return done, nil
+}
+
+// isNoSpaceError 识别底层卷写满。Windows 上 VHDX 动态盘无法继续增长时，
+// guest 侧写入会返回 ERROR_DISK_FULL（Go 映射为 ENOSPC），但原始错误文本只有
+// "There is not enough space on the disk."，需要转成可本地化的业务错误。
+func isNoSpaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return true
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "not enough space") ||
+		strings.Contains(low, "no space left") ||
+		strings.Contains(low, "disk full")
 }
 
 // copyDiffFile 复制单个文件并保留修改时间（auto 模式下一轮比较依赖它）。
