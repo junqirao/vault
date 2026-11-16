@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { App, Button, Input, Space, Typography } from 'antd'
+import { App, Button, Input, Space, Switch, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -9,6 +9,7 @@ import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
 import { SectionCard } from '../../components/SectionCard'
+import { UsageBar } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { IssuedCertificateDTO, UserDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
@@ -53,6 +54,16 @@ export function UserList(): JSX.Element {
     onError: (err) => setError(err)
   })
 
+  // 列表里的启停开关：直接改 enabled，不打开编辑弹窗。
+  const toggleMutation = useMutation({
+    mutationFn: ({ id, enabled }: { id: string; enabled: boolean }) => api.updateUser(id, { enabled }),
+    onSuccess: () => {
+      setError(null)
+      invalidate()
+    },
+    onError: (err) => setError(err)
+  })
+
   // 证书的签发入口只在"用户证书"抽屉里（避免同一功能在列表与抽屉重复出现）。
   const columns = useMemo<TableColumnsType<UserDTO>>(
     () => [
@@ -63,18 +74,45 @@ export function UserList(): JSX.Element {
         dataIndex: 'enabled',
         key: 'enabled',
         width: 110,
-        render: (value: boolean) => (value ? t('common.enabled') : t('common.disabled'))
+        render: (_value, user) => (
+          <Switch
+            size="small"
+            checked={user.enabled}
+            loading={toggleMutation.isPending && toggleMutation.variables?.id === user.id}
+            onChange={(checked) => {
+              setError(null)
+              toggleMutation.mutate({ id: user.id, enabled: checked })
+            }}
+          />
+        )
       },
       {
         title: t('user.quota.used'),
         key: 'quota',
-        width: 200,
+        width: 220,
         // quota_bytes = 0 表示"不限"（只受存储池容量约束），不能显示成 "0 B" —— 会让人
-        // 以为该用户一点配额都没有（真实反馈）。
-        render: (_value, user) =>
-          user.quota_bytes > 0
-            ? `${formatBytes(user.used_bytes)} / ${formatBytes(user.quota_bytes)}`
-            : `${formatBytes(user.used_bytes)} / ${t('common.unlimited')}`
+        // 以为该用户一点配额都没有（真实反馈）。这里与首页「我的配额」用同一条 UsageBar：
+        // 上方数值、下方进度条；不限时条心写「不限」，避免留一根没有数字的空条。
+        render: (_value, user) => {
+          const unlimited = user.quota_bytes <= 0
+          const percent = unlimited
+            ? 0
+            : Math.min(100, Math.round((user.used_bytes / user.quota_bytes) * 100))
+          return (
+            <div style={{ minWidth: 0 }}>
+              <Typography.Text
+                style={{ fontSize: fontSize.sm, fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap' }}
+              >
+                {`${formatBytes(user.used_bytes)} / ${unlimited ? t('common.unlimited') : formatBytes(user.quota_bytes)}`}
+              </Typography.Text>
+              <UsageBar
+                percent={percent}
+                label={unlimited ? t('common.unlimited') : undefined}
+                style={{ marginTop: spacing.xxs }}
+              />
+            </div>
+          )
+        }
       },
       { title: t('field.remark'), dataIndex: 'remark', key: 'remark', render: (value?: string) => value || '-' },
       { title: t('common.createdAt'), dataIndex: 'created_at', key: 'created_at', width: 170, render: (value: number) => formatTime(value) },
@@ -107,7 +145,7 @@ export function UserList(): JSX.Element {
         )
       }
     ],
-    [t]
+    [t, toggleMutation]
   )
 
   return (

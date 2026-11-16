@@ -3,7 +3,6 @@ import {
   CloudOutlined,
   ClusterOutlined,
   ControlOutlined,
-  DashboardOutlined,
   DatabaseOutlined,
   DesktopOutlined,
   DownOutlined,
@@ -11,6 +10,7 @@ import {
   InfoCircleOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
+  ScheduleOutlined,
   SettingOutlined,
   TeamOutlined,
   CloudDownloadOutlined
@@ -39,6 +39,7 @@ import {
   useI18n,
   useServerConfig,
   useServerLatency,
+  UpdateIndicator,
   type Language
 } from '@vault/ui'
 
@@ -156,6 +157,11 @@ export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
     { key: '/my-repos', icon: <CloudOutlined />, label: t('nav.myRepos') },
     { key: '/logs', icon: <FileTextOutlined />, label: t('nav.logs') },
     { key: '/settings', icon: <SettingOutlined />, label: t('nav.settings') },
+    // 控制台（管理端）入口只对超级管理员显示，紧贴「设置」之下：两者都是"调整这台客户端/
+    // 这套服务"的地方，放在一起比塞在顶栏更符合导航直觉。
+    ...(isSuperAdmin
+      ? [{ key: '/admin/users', icon: <ControlOutlined />, label: t('nav.console') }]
+      : []),
     // 「关于」紧贴「配置」之下：两者都是"这台客户端自己"的事（配置改行为，关于看版本与许可）。
     // 被问"你那边是什么版本"时用户第一眼会往侧边栏找，排在配置下面最顺手。
     { key: '/about', icon: <InfoCircleOutlined />, label: t('nav.about') }
@@ -166,7 +172,7 @@ export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
     { key: '/admin/repos', icon: <AppstoreOutlined />, label: t('nav.repos') },
     { key: '/admin/game-groups', icon: <CloudDownloadOutlined />, label: t('nav.gameGroups') },
     { key: '/admin/storages', icon: <DatabaseOutlined />, label: t('nav.storages') },
-    { key: '/admin/jobs', icon: <DashboardOutlined />, label: t('nav.jobs') },
+    { key: '/admin/jobs', icon: <ScheduleOutlined />, label: t('nav.jobs') },
     // 审计日志与服务端日志已合并为一页，入口只留「服务日志」，页内用 Tab 切换。
     { key: '/admin/logs', icon: <FileTextOutlined />, label: t('nav.serverLogs') },
     { key: '/admin/system', icon: <ClusterOutlined />, label: t('nav.system') },
@@ -374,37 +380,43 @@ export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
                   {appInitial}
                 </Avatar>
               ) : (
-                <Space direction="vertical" size={0}>
-                  <Space align="center" size={6}>
-                    <Typography.Text strong style={{ fontSize: 16 }}>
-                      {t('app.name')}
-                    </Typography.Text>
-                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        v{RELEASE_VERSION}
-                      </Typography.Text>
-                      {releaseTag ? (
-                        <Tag
-                          color={releaseTagColor}
-                          style={{
-                            marginInlineEnd: 0,
-                            fontSize: 10,
-                            lineHeight: '16px',
-                            paddingInline: 5,
-                            fontWeight: 600
-                          }}
-                        >
-                          {releaseTag}
-                        </Tag>
-                      ) : null}
-                    </span>
-                  </Space>
-                  {mode === 'admin' ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                  <Typography.Text strong style={{ fontSize: 16 }}>
+                    {t('app.name')}
+                  </Typography.Text>
+                  <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, flexWrap: 'wrap' }}>
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      {t('nav.admin')}
+                      v{RELEASE_VERSION}
                     </Typography.Text>
-                  ) : null}
-                </Space>
+                    {releaseTag ? (
+                      <Tag
+                        color={releaseTagColor}
+                        style={{
+                          marginInlineEnd: 0,
+                          fontSize: 10,
+                          lineHeight: '16px',
+                          paddingInline: 5,
+                          fontWeight: 600
+                        }}
+                      >
+                        {releaseTag}
+                      </Tag>
+                    ) : null}
+                    {mode === 'admin' ? (
+                      <Tag
+                        style={{
+                          marginInlineEnd: 0,
+                          fontSize: 10,
+                          lineHeight: '16px',
+                          paddingInline: 5,
+                          fontWeight: 600
+                        }}
+                      >
+                        {t('nav.adminTag')}
+                      </Tag>
+                    ) : null}
+                  </span>
+                </div>
               )}
             </div>
             <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
@@ -450,7 +462,11 @@ export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
               alignItems: 'center',
               justifyContent: 'space-between',
               borderBottom: `1px solid ${palette.border}`,
-              background: palette.bgContainer
+              background: palette.bgContainer,
+              // antd Header 默认 line-height = 高度（56px），内联按钮按基线排会上下错开
+              // 几个像素（返回应用/更新图标/头像不在一条水平线上）。压成 normal 后
+              // 由 flex 的 align-items: center 统一居中。
+              lineHeight: 'normal'
             }}
           >
             <Space size={spacing.xs}>
@@ -502,13 +518,11 @@ export function AppLayout({ mode }: AppLayoutProps): JSX.Element {
             </Space>
 
             <Space size={spacing.xs}>
-              {isSuperAdmin ? (
-                <Button
-                  type="text"
-                  icon={mode === 'admin' ? <DesktopOutlined /> : <ControlOutlined />}
-                  onClick={() => navigate(mode === 'admin' ? '/my-repos' : '/admin/users')}
-                >
-                  {mode === 'admin' ? t('nav.switchToApp') : t('nav.switchToAdmin')}
+              <UpdateIndicator />
+              {/* 管理端返回应用端：入口放在头像左侧的顶栏，不再占侧边栏的一行。 */}
+              {mode === 'admin' ? (
+                <Button type="text" icon={<DesktopOutlined />} onClick={() => navigate('/my-repos')}>
+                  {t('nav.backToApp')}
                 </Button>
               ) : null}
               <Dropdown menu={userMenu} trigger={['click']}>

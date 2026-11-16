@@ -213,7 +213,6 @@ export function CacheManagementModal({ open, onClose }: CacheManagementModalProp
           <UsageBar
             percent={totals.percent}
             label={totals.limitBytes > 0 ? undefined : t('common.unlimited')}
-            height={10}
             style={{ flex: 1, marginTop: 0 }}
           />
         </div>
@@ -272,7 +271,6 @@ export function CacheManagementModal({ open, onClose }: CacheManagementModalProp
                   <UsageBar
                     percent={percent}
                     muted={!canClear && !row.file}
-                    height={8}
                     showPercent={false}
                     style={{ marginTop: 2 }}
                   />

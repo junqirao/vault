@@ -244,6 +244,13 @@ func (a *Agent) checkUpdate(ctx context.Context) (*UpdateCheckResult, error) {
 		return nil, err
 	}
 	if cand == nil {
+		// 确认没有可用更新：清掉上一次的目标版本，否则 /agent/state 会一直显示"有新版本"，
+		// 顶栏的更新提示也永远消不掉（暂时性失败不清，见 clearAvailableUpdate）。
+		reason := ""
+		if res != nil {
+			reason = res.Reason
+		}
+		a.clearAvailableUpdate(reason)
 		return res, nil
 	}
 
@@ -491,6 +498,28 @@ func (a *Agent) noteUpdateError(stage string, err error) {
 	a.store.UpdateServer(key, func(state *ServerState) {
 		state.LastError = describeError(stage, err)
 	})
+}
+
+// clearAvailableUpdate 在检查确认"没有可用更新"后清掉上一次发现的目标版本并广播。
+//
+// 暂时性失败（服务端不可达 / 尚未登录）不清：这次没拿到清单，不能断言没有更新，
+// 保留上一次的结果比误报"已是最新"更安全。其它原因（not_newer / no_manifest /
+// no_artifact …）都是明确结论，必须清掉，否则界面会一直提示一个已经不存在的更新。
+func (a *Agent) clearAvailableUpdate(reason string) {
+	switch reason {
+	case "server_unreachable", "no_session":
+		return
+	}
+	a.updateMu.Lock()
+	changed := a.availableVersion != ""
+	if changed {
+		a.availableVersion = ""
+	}
+	a.updateMu.Unlock()
+	if changed {
+		// 让所有订阅方立即看到 available_version 已被清空（否则要等下一次整份状态拉取）。
+		a.publishUpdateEvent()
+	}
 }
 
 // unavailable 构造"无可用更新"的软失败结果，并记录原因供 GET /agent/state 展示。

@@ -49,7 +49,7 @@ function EChart({ option, height }: { option: EChartsOption; height: number }): 
 }
 
 /**
- * 组装一张折线图的 option。
+ * 组装一张曲线图的 option。
  *
  * percent 为真时 y 轴按 0..1 百分比显示；`unit` 是"这张图的数带单位"的格式化函数
  * （缓存占用这类字节数）：tooltip 与坐标轴都必须走它，否则图上只有标题栏那一处有人话单位，
@@ -95,6 +95,8 @@ function lineOption(
       data: s.data,
       showSymbol: false,
       connectNulls: false,
+      // 与总览图保持一致：用柔和曲线而不是折线，采样点之间不会出现生硬的拐角。
+      smooth: 0.4,
       lineStyle: { width: 1.6, color: s.color },
       itemStyle: { color: s.color }
     }))

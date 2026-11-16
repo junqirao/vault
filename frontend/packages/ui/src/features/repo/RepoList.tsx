@@ -310,7 +310,6 @@ function QuotaOverview({
 }): JSX.Element | null {
   const api = useApi()
   const { t } = useI18n()
-  const { isSuperAdmin } = usePermission()
   const meQuery = useQuery({ queryKey: ['me'], queryFn: () => api.me() })
   const user = meQuery.data
   if (!user) return null
@@ -321,19 +320,19 @@ function QuotaOverview({
   const creating = repos.filter((repo) => repo.state === 'creating').length
 
   // 标题与「存储 →」保持同一套入口样式：一级文字 + 右箭头整体可点（见 StorageUsageCard）。
-  // 普通用户看不到这个入口：配额只能由管理员在用户管理页维护，给一个点不进去的箭头没有意义。
-  const title =
-    isSuperAdmin && onOpenUsers ? (
-      <Tooltip title={t('nav.users')}>
-        <SectionTitleLink title={t('nav.users')} onClick={onOpenUsers}>
-          {t('repo.quota.title')}
-        </SectionTitleLink>
-      </Tooltip>
-    ) : (
-      <Typography.Text strong style={{ fontSize: fontSize.sm }}>
+  // 入口对所有人可见；没有管理权限时由跳转方给提示（见 routes 的 openUsers），
+  // 不再把入口藏起来——藏起来会让人以为"我的配额"这块信息不可点、也不知道为什么。
+  const title = onOpenUsers ? (
+    <Tooltip title={t('nav.users')}>
+      <SectionTitleLink title={t('nav.users')} onClick={onOpenUsers}>
         {t('repo.quota.title')}
-      </Typography.Text>
-    )
+      </SectionTitleLink>
+    </Tooltip>
+  ) : (
+    <Typography.Text strong style={{ fontSize: fontSize.sm }}>
+      {t('repo.quota.title')}
+    </Typography.Text>
+  )
 
   const content = (
     <>
@@ -857,32 +856,36 @@ function mountOfRepo(mounts: AgentMountState[], repo: RepoDTO): AgentMountState 
 }
 
 /** 分组卡片里的一行紧凑指标：标签 + 数值 + 短条，三者横向排布。 */
+/**
+ * 分组卡片里的一个指标：标签 / 数值 / 进度条。
+ *
+ * 三部分**各自是外层 subgrid 的一列**（而不是挤在一个 flex 盒子里）：
+ * 列宽由全列表最宽的内容决定，数值不会再被固定像素宽撑出空洞，
+ * 同时所有行的数值起点、进度条、按钮都落在同一条竖线上。
+ */
 function GroupMetric({
   label,
   value,
   percent,
   color,
-  loading,
-  valueWidth = 0
+  loading
 }: {
   label: string
   value: ReactNode
   percent: number
   color?: string
   loading?: boolean
-  /** 数值列固定宽度：让不同分组的标签、进度条落在同一竖线上。 */
-  valueWidth?: number
 }): JSX.Element {
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xxs, flexShrink: 0 }}>
-      <Typography.Text type="secondary" style={{ fontSize: fontSize.xs, whiteSpace: 'nowrap' }}>
+    <>
+      <Typography.Text
+        type="secondary"
+        style={{ fontSize: fontSize.xs, whiteSpace: 'nowrap', justifySelf: 'start' }}
+      >
         {label}
       </Typography.Text>
       <div
         style={{
-          // 数值紧跟标签左对齐：固定宽度只用于让各行的进度条落在同一条竖线上，
-          // 余量留在数值与进度条之间，不再撑在「标签 → 数值」中间形成大空隙。
-          minWidth: valueWidth,
           display: 'flex',
           justifyContent: 'flex-start',
           alignItems: 'baseline',
@@ -896,7 +899,7 @@ function GroupMetric({
       </div>
       {/* 64 → 77（+20%）：分组卡片里这根条之前太短，几乎看不出占比差异 */}
       <UsageBar percent={percent} color={color} loading={loading} style={{ width: 77, marginTop: 0 }} />
-    </div>
+    </>
   )
 }
 
@@ -993,19 +996,24 @@ function RepoGroupCard({
     <Card
       hoverable
       onClick={onOpen}
-      style={{ height: '100%' }}
-      styles={{
-        body: {
-          padding: `${spacing.sm}px ${spacing.md}px`,
-          display: 'flex',
-          alignItems: 'center',
-          gap: spacing.sm,
-          height: '100%',
-          // 与「列表形态」的库行同高：库行是 16px 标题 + 12px 次要信息（含 4px 间距）
-          // 再加大小的上下内边距；分组卡片沿用同一套节奏，切视图时纵向节奏一致。
-          minHeight: 48
-        }
+      style={{
+        // 每个分组卡片都是外层网格的一行（subgrid）：列轨道由列表统一计算，
+        // 数值列宽自动等于全列表最宽的内容——分组多了也不会挤，内容短时也不留空洞，
+        // 同时所有行的标签、数值、进度条、按钮都严格对齐。
+        display: 'grid',
+        gridTemplateColumns: 'subgrid',
+        gridColumn: '1 / -1',
+        alignItems: 'center',
+        columnGap: spacing.xxs,
+        // 横向内边距不能放在卡片上：subgrid 的列轨道按外层网格的线算，
+        // 卡片自带 padding 会让图标/内容整体偏移、列与列叠在一起（真实反馈）。
+        // 左右留白改由首列宽度和操作区的 margin 提供。
+        padding: `${spacing.sm}px 0`,
+        // 与「列表形态」的库行同高：库行是 16px 标题 + 12px 次要信息（含 4px 间距）
+        // 再加大小的上下内边距；分组卡片沿用同一套节奏，切视图时纵向节奏一致。
+        minHeight: 48
       }}
+      styles={{ body: { display: 'contents' } }}
     >
       <div
         style={{
@@ -1016,19 +1024,21 @@ function RepoGroupCard({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          flexShrink: 0
+          flexShrink: 0,
+          // 首列 32px + 16px 左边距 = 外层网格第一列的 48px（见 RepoGroupList）。
+          marginLeft: spacing.md
         }}
       >
         <FolderOutlined style={{ color: palette.accent, fontSize: 16 }} />
       </div>
 
-      <div style={{ minWidth: 0, flex: '1 1 120px' }}>
+      <div style={{ minWidth: 0 }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, minWidth: 0 }}>
           <Typography.Text strong ellipsis style={{ minWidth: 0, fontSize: fontSize.lg }}>
             {bucket.title}
           </Typography.Text>
           {bucket.steam ? (
-            <Tag color="blue" style={{ marginInlineEnd: 0 }}>
+            <Tag color={palette.accent} style={{ marginInlineEnd: 0 }}>
               {t('repo.group.steam')}
             </Tag>
           ) : null}
@@ -1055,8 +1065,9 @@ function RepoGroupCard({
         percent={mountedPercent}
         // 已挂载容量不是"用量"，不随占比变色：一路主色蓝。
         color={palette.accent}
-        valueWidth={43}
       />
+      {/* 两组指标之间留一条固定间隔列：subgrid 的列由所有行共享，间隔也一致。 */}
+      <div aria-hidden />
       <GroupMetric
         label={t('repo.group.usedSpace')}
         value={
@@ -1066,11 +1077,19 @@ function RepoGroupCard({
         }
         percent={diffPercent}
         loading={diffLoading}
-        valueWidth={107}
       />
 
       {/* 动作放最右：挂载/卸载一个按钮，设置只留图标、不要边框。 */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xxs, flexShrink: 0 }}>
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: spacing.xxs,
+          justifySelf: 'end',
+          // 卡片不再自带横向内边距，右侧留白由这里提供（与左侧 16px 对称）。
+          marginRight: spacing.md
+        }}
+      >
         <Tooltip
           title={
             activeKind === 'mount' && !steamMountReady ? t('repo.group.steamLibraryRequired') : undefined
@@ -1142,18 +1161,26 @@ function RepoGroupList({
 
   return (
     <>
-      <Row gutter={[spacing.md, spacing.md]}>
+      {/* 分组卡片共用一张网格：列宽由所有行里最宽的内容决定（max-content），
+          内容短时不留固定空洞、内容长时也不会挤在一起，行与行严格对齐。 */}
+      <div
+        style={{
+          display: 'grid',
+          gridTemplateColumns: `48px minmax(180px, 1fr) max-content max-content 77px ${spacing.md}px max-content max-content 77px max-content`,
+          columnGap: spacing.xxs,
+          rowGap: spacing.md
+        }}
+      >
         {groups.slice(0, visibleCount).map((bucket) => (
-          <Col key={bucket.key || '__ungrouped__'} span={24}>
-            <RepoGroupCard
-              bucket={bucket}
-              currentUserId={currentUserId}
-              onOpen={() => onOpen(bucket.key)}
-              onSettings={() => onSettings(bucket.key)}
-            />
-          </Col>
+          <RepoGroupCard
+            key={bucket.key || '__ungrouped__'}
+            bucket={bucket}
+            currentUserId={currentUserId}
+            onOpen={() => onOpen(bucket.key)}
+            onSettings={() => onSettings(bucket.key)}
+          />
         ))}
-      </Row>
+      </div>
       {hasMore ? <InfiniteSentinel sentinelRef={sentinelRef} /> : null}
     </>
   )
@@ -1229,7 +1256,11 @@ function RepoGroupDetail({
         </Button>
         <FolderOutlined style={{ color: palette.accent }} />
         <Typography.Text strong>{bucket.title}</Typography.Text>
-        {bucket.steam ? <Tag color="blue">{t('repo.group.steam')}</Tag> : null}
+        {bucket.steam ? (
+          <Tag color={palette.accent} style={{ marginInlineEnd: 0 }}>
+            {t('repo.group.steam')}
+          </Tag>
+        ) : null}
         <Typography.Text type="secondary" style={{ fontSize: fontSize.sm }}>
           {items.length === bucket.items.length ? bucket.items.length : `${items.length} / ${bucket.items.length}`}
         </Typography.Text>

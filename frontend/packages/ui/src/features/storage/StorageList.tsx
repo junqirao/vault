@@ -1,21 +1,22 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Button, Form, Input, InputNumber, Modal, Space, Switch, Tag, Tooltip, Typography } from 'antd'
-import type { TableColumnsType } from 'antd'
+import type { ReactNode } from 'react'
+import { Button, Card, Form, Input, InputNumber, Modal, Skeleton, Space, Switch, Tag, Typography } from 'antd'
+import { DatabaseOutlined, FolderOutlined } from '@ant-design/icons'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ConfirmDialog } from '../../components/ConfirmDialog'
-import { DataTable } from '../../components/DataTable'
 import { EmptyState } from '../../components/EmptyState'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { MediaTypeTag } from '../../components/MediaTypeTag'
 import { PageShell } from '../../components/PageShell'
-import { SectionCard } from '../../components/SectionCard'
+import { UsageBar } from '../../components/UsageBar'
 import { useApi } from '../../api/provider'
 import type { StorageDTO } from '../../api/types'
 import { useI18n } from '../../i18n'
-import { fontSize, spacing } from '../../tokens/palette'
+import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
 import { StoragePoolsPanel } from './StoragePoolsPanel'
+import { storageUsage } from './storageUsageMetrics'
 
 const BYTES_PER_GB = 1024 ** 3
 
@@ -28,9 +29,13 @@ interface StorageEditValues {
 
 /** 按卷去重后的容量汇总：同一卷上的多条存储只计一条容量。 */
 interface VolumeSummary {
+  key: string
   volumeName: string
+  mediaType: StorageDTO['media_type']
   freeBytes: number
   totalBytes: number
+  /** 本应用在这块盘上真实占用的字节（卷承载的存储按整卷已用算，目录存储按目录内磁盘汇总）。 */
+  appUsedBytes: number
   count: number
 }
 
@@ -40,7 +45,272 @@ function isVolumeBacked(storage: StorageDTO): boolean {
 }
 
 /**
+ * 行尾的用量块：上方「已用 / 总量」，下方同一条 UsageBar。
+ *
+ * 与存储库列表行同一套排版：信息在左、用量与操作在右，多条存储的条能上下对齐着扫。
+ */
+function UsageMeter({
+  used,
+  total,
+  percent,
+  otherPercent,
+  color,
+  legend
+}: {
+  used: number
+  total: number
+  percent: number
+  /** 非本应用占用的灰色段（见 UsageBar）。 */
+  otherPercent?: number
+  color?: string
+  /** 条下方的图例（蓝 = 本应用 / 灰 = 其他占用）。 */
+  legend?: JSX.Element
+}): JSX.Element {
+  return (
+    <div style={{ flex: '0 0 auto', width: 276, minWidth: 0 }}>
+      <div style={{ display: 'flex', justifyContent: 'flex-end', alignItems: 'baseline', gap: spacing.xs }}>
+        <Typography.Text style={{ fontSize: fontSize.sm, fontVariantNumeric: 'tabular-nums' }}>
+          {`${formatBytes(used)} / ${formatBytes(total)}`}
+        </Typography.Text>
+      </div>
+      <UsageBar percent={percent} otherPercent={otherPercent} color={color} />
+      {legend ?? null}
+    </div>
+  )
+}
+
+/** 行首的方块图标：与存储库卡片的图标同一尺寸/底色。 */
+function RowIcon({ children }: { children: JSX.Element }): JSX.Element {
+  return (
+    <div
+      style={{
+        width: 32,
+        height: 32,
+        borderRadius: 8,
+        background: palette.neutralFill,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexShrink: 0
+      }}
+    >
+      {children}
+    </div>
+  )
+}
+
+/** 分区标题：与「存储使用情况」页同一套字号与留白（标题 + 右侧计数）。 */
+function SectionHeading({ title, extra }: { title: string; extra?: JSX.Element }): JSX.Element {
+  return (
+    <div
+      style={{
+        display: 'flex',
+        alignItems: 'baseline',
+        justifyContent: 'space-between',
+        gap: spacing.sm,
+        marginBottom: spacing.sm
+      }}
+    >
+      <Typography.Title level={5} style={{ margin: 0 }}>
+        {title}
+      </Typography.Title>
+      {extra ?? null}
+    </div>
+  )
+}
+
+/** 图例小圆点：颜色 + 文案（蓝 = 本应用，灰 = 其他占用）。 */
+function LegendDot({ color, children }: { color: string; children: ReactNode }): JSX.Element {
+  return (
+    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+      <span style={{ width: 8, height: 8, borderRadius: 2, background: color }} />
+      {children}
+    </span>
+  )
+}
+
+/** 按卷汇总的一行：左边卷名与存储数，右边整卷用量条（蓝 = 本应用，灰 = 其他占用）。 */
+function VolumeUsageRow({ volume }: { volume: VolumeSummary }): JSX.Element {
+  const { t } = useI18n()
+  const used = Math.max(0, volume.totalBytes - volume.freeBytes)
+  const appUsed = Math.min(used, Math.max(0, volume.appUsedBytes))
+  const otherUsed = Math.max(0, used - appUsed)
+  const percentOf = (bytes: number): number =>
+    volume.totalBytes > 0 ? (bytes / volume.totalBytes) * 100 : 0
+  const otherPercent = percentOf(otherUsed)
+  // 不足 1%（四舍五入后）的灰色段不进图例/条：浮点误差会让"其他占用 0 B"冒出来。
+  const showOther = Math.round(otherPercent) > 0
+  return (
+    <Card styles={{ body: { padding: `${spacing.sm}px ${spacing.md}px` } }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.md, flexWrap: 'wrap' }}>
+        <RowIcon>
+          <DatabaseOutlined style={{ color: palette.accent, fontSize: 16 }} />
+        </RowIcon>
+        <div style={{ flex: '1 1 240px', minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, minWidth: 0 }}>
+            <Typography.Text strong ellipsis={{ tooltip: volume.volumeName }} style={{ fontSize: fontSize.lg }}>
+              {volume.volumeName}
+            </Typography.Text>
+            {volume.mediaType && volume.mediaType !== 'unknown' ? (
+              <MediaTypeTag mediaType={volume.mediaType} />
+            ) : null}
+          </div>
+          <Typography.Text
+            type="secondary"
+            ellipsis
+            style={{ display: 'block', fontSize: fontSize.xs, marginTop: spacing.xxs }}
+          >
+            {t('storage.volumeStorages', { count: volume.count })} · {t('storage.usage.remaining')}{' '}
+            {formatBytes(volume.freeBytes)}
+          </Typography.Text>
+        </div>
+        <UsageMeter
+          used={used}
+          total={volume.totalBytes}
+          percent={percentOf(appUsed)}
+          otherPercent={showOther ? otherPercent : 0}
+          color={palette.accent}
+          legend={
+            showOther ? (
+              <div
+                style={{
+                  display: 'flex',
+                  justifyContent: 'flex-end',
+                  gap: spacing.sm,
+                  marginTop: spacing.xxs,
+                  fontSize: fontSize.xs,
+                  color: palette.textSecondary
+                }}
+              >
+                <LegendDot color={palette.accent}>
+                  {t('storage.usage.appUsed')} {formatBytes(appUsed)}
+                </LegendDot>
+                <LegendDot color={palette.textTertiary}>
+                  {t('storage.usage.otherUsed')} {formatBytes(otherUsed)}
+                </LegendDot>
+              </div>
+            ) : undefined
+          }
+        />
+      </div>
+    </Card>
+  )
+}
+
+/** 单块存储的一行：左边名称/标签/路径，右边用量条与管理动作。 */
+function StorageRow({
+  storage,
+  kindLabel,
+  toggling,
+  mounting,
+  onToggle,
+  onEdit,
+  onMount,
+  onUnmount,
+  onResize,
+  onRemove
+}: {
+  storage: StorageDTO
+  kindLabel: (kind: StorageDTO['kind']) => string
+  toggling: boolean
+  mounting: boolean
+  onToggle: (checked: boolean) => void
+  onEdit: () => void
+  onMount: () => void
+  onUnmount: () => void
+  onResize: () => void
+  onRemove: () => void
+}): JSX.Element {
+  const { t } = useI18n()
+  const usage = storageUsage(storage)
+  const meta = [storage.path, storage.file_system, `${t('storage.diskCount')} ${storage.disk_count}`]
+    .filter(Boolean)
+    .join(' · ')
+  return (
+    <Card styles={{ body: { padding: `${spacing.sm}px ${spacing.md}px` } }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: spacing.md, flexWrap: 'wrap' }}>
+        <RowIcon>
+          <FolderOutlined style={{ color: palette.accent, fontSize: 16 }} />
+        </RowIcon>
+
+        <div style={{ flex: '1 1 260px', minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xs, flexWrap: 'wrap', minWidth: 0 }}>
+            <Typography.Text
+              strong
+              ellipsis={{ tooltip: storage.name }}
+              style={{ minWidth: 0, fontSize: fontSize.lg }}
+            >
+              {storage.name}
+            </Typography.Text>
+            <Tag style={{ marginInlineEnd: 0 }}>{kindLabel(storage.kind)}</Tag>
+            {storage.media_type && storage.media_type !== 'unknown' ? (
+              <MediaTypeTag mediaType={storage.media_type} />
+            ) : null}
+            {!storage.enabled ? <Tag style={{ marginInlineEnd: 0 }}>{t('storage.usage.disabled')}</Tag> : null}
+            {isVolumeBacked(storage) ? (
+              storage.mounted ? (
+                <Tag color="green" style={{ marginInlineEnd: 0 }}>
+                  {t('storage.mounted')}
+                </Tag>
+              ) : (
+                <Tag color="red" style={{ marginInlineEnd: 0 }}>
+                  {t('storage.notMounted')}
+                </Tag>
+              )
+            ) : null}
+          </div>
+          <Typography.Text
+            type="secondary"
+            ellipsis={{ tooltip: meta }}
+            style={{ display: 'block', fontSize: fontSize.xs, marginTop: spacing.xxs }}
+          >
+            {meta}
+          </Typography.Text>
+        </div>
+
+        <UsageMeter used={usage.used} total={usage.total} percent={usage.percent} />
+
+        {/* 操作全部收在右侧：启停 / 编辑 / 挂载切换 / 扩容 / 移除。 */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: spacing.xxs, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <Switch
+            size="small"
+            checked={storage.enabled}
+            loading={toggling}
+            onChange={onToggle}
+          />
+          <Button type="link" size="small" onClick={onEdit}>
+            {t('common.edit')}
+          </Button>
+          {isVolumeBacked(storage) ? (
+            storage.mounted ? (
+              <Button type="link" size="small" onClick={onUnmount}>
+                {t('storage.unmount')}
+              </Button>
+            ) : (
+              <Button type="link" size="small" loading={mounting} onClick={onMount}>
+                {t('storage.mount')}
+              </Button>
+            )
+          ) : null}
+          {storage.kind === 'thin' ? (
+            <Button type="link" size="small" onClick={onResize}>
+              {t('storage.resize')}
+            </Button>
+          ) : null}
+          <Button type="link" size="small" danger onClick={onRemove}>
+            {t('storage.remove')}
+          </Button>
+        </div>
+      </div>
+    </Card>
+  )
+}
+
+/**
  * 存储管理（管理员）：列表 / 编辑 / 启停 / 挂载 / 卸载 / 扩容 / 移除记录。
+ *
+ * 版式与「存储库」列表一致：一行一个存储，信息在左、用量条与管理动作在右；
+ * 上方先给「按卷汇总」——同一块物理卷上的多个存储只算一份容量，避免把卷容量重复累加。
  *
  * 创建不在本页：逻辑链是「选/建存储池 → 设定存储 → 存储库」，内联建池还要带块设备表格，
  * 弹窗装不下也看不清，所以独立成创建页（StorageCreateForm），保存后跳回本页。
@@ -154,14 +424,22 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
     const map = new Map<string, VolumeSummary>()
     for (const storage of storages) {
       const key = storage.volume_name || storage.path
+      // 卷承载的存储：整卷都是本应用的，已用 = 卷已用；目录存储：目录内磁盘汇总才是本应用占用。
+      const appBytes = isVolumeBacked(storage)
+        ? Math.max(0, storage.total_bytes - storage.free_bytes)
+        : storage.used_bytes
       const existing = map.get(key)
       if (existing) {
         existing.count += 1
+        existing.appUsedBytes += appBytes
       } else {
         map.set(key, {
+          key,
           volumeName: storage.volume_name || '-',
+          mediaType: storage.media_type,
           freeBytes: storage.free_bytes,
           totalBytes: storage.total_bytes,
+          appUsedBytes: appBytes,
           count: 1
         })
       }
@@ -180,147 +458,6 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
     setResizeTarget(storage)
     resizeForm.setFieldsValue({ sizeGB: Math.round((storage.size_bytes / BYTES_PER_GB) * 100) / 100 })
   }
-
-  const columns: TableColumnsType<StorageDTO> = [
-    { title: t('field.name'), dataIndex: 'name', key: 'name', width: 160 },
-    {
-      title: t('field.type'),
-      key: 'kind',
-      width: 100,
-      render: (_value, storage) => <Tag>{kindLabel(storage.kind)}</Tag>
-    },
-    {
-      title: t('storage.capacity'),
-      key: 'capacity',
-      width: 190,
-      render: (_value, storage) =>
-        // 有底层卷时展示"已用 ÷ 分配"：这里是**宿主实际占用**口径（卷上真占了多大），
-        // 不是库/用户的配额口径（那个是"已用 = 已分配磁盘总量"，按盘标称容量计费）；
-        // 纯目录模式退化为所在卷可用空间。
-        storage.size_bytes > 0
-          ? `${formatBytes(storage.used_bytes)} / ${formatBytes(storage.size_bytes)}`
-          : `${formatBytes(storage.free_bytes)} / ${formatBytes(storage.total_bytes)}`
-    },
-    {
-      title: t('field.mountPoint'),
-      dataIndex: 'path',
-      key: 'path',
-      render: (value: string) => (
-        <Tooltip title={value}>
-          <Typography.Text type="secondary" ellipsis style={{ maxWidth: 320 }}>
-            {value}
-          </Typography.Text>
-        </Tooltip>
-      )
-    },
-    {
-      title: t('system.cap.fileSystem'),
-      dataIndex: 'file_system',
-      key: 'file_system',
-      width: 110,
-      render: (value: string) => value || '-'
-    },
-    {
-      title: t('storage.media'),
-      key: 'media_type',
-      width: 90,
-      render: (_value, storage) =>
-        storage.media_type && storage.media_type !== 'unknown' ? (
-          <MediaTypeTag mediaType={storage.media_type} />
-        ) : (
-          '-'
-        )
-    },
-    { title: t('storage.diskCount'), dataIndex: 'disk_count', key: 'disk_count', width: 90 },
-    {
-      title: t('common.status'),
-      key: 'enabled',
-      width: 170,
-      render: (_value, storage) => (
-        <Space size={spacing.xxs} wrap>
-          <Switch
-            size="small"
-            checked={storage.enabled}
-            loading={toggleMutation.isPending && toggleMutation.variables?.id === storage.id}
-            checkedChildren={t('common.enabled')}
-            unCheckedChildren={t('common.disabled')}
-            onChange={(checked) => {
-              setError(null)
-              toggleMutation.mutate({ id: storage.id, enabled: checked })
-            }}
-          />
-          {isVolumeBacked(storage) ? (
-            storage.mounted ? (
-              <Tag color="green">{t('storage.mounted')}</Tag>
-            ) : (
-              <Tag color="red">{t('storage.notMounted')}</Tag>
-            )
-          ) : null}
-        </Space>
-      )
-    },
-    {
-      title: t('common.actions'),
-      key: 'actions',
-      width: 250,
-      render: (_value, storage) => (
-        <Space size={0} wrap>
-          <Button
-            type="link"
-            size="small"
-            onClick={() => {
-              setEditing(storage)
-              setFormOpen(true)
-            }}
-          >
-            {t('common.edit')}
-          </Button>
-          {isVolumeBacked(storage) ? (
-            storage.mounted ? (
-              <Button
-                type="link"
-                size="small"
-                onClick={() => {
-                  setError(null)
-                  setPendingUnmount(storage)
-                }}
-              >
-                {t('storage.unmount')}
-              </Button>
-            ) : (
-              <Button
-                type="link"
-                size="small"
-                loading={mountMutation.isPending && mountMutation.variables === storage.id}
-                onClick={() => {
-                  setError(null)
-                  mountMutation.mutate(storage.id)
-                }}
-              >
-                {t('storage.mount')}
-              </Button>
-            )
-          ) : null}
-          {storage.kind === 'thin' ? (
-            <Button type="link" size="small" onClick={() => openResize(storage)}>
-              {t('storage.resize')}
-            </Button>
-          ) : null}
-          <Button
-            type="link"
-            size="small"
-            danger
-            onClick={() => {
-              setError(null)
-              setPendingDelete(storage)
-            }}
-          >
-            {t('storage.remove')}
-          </Button>
-        </Space>
-      )
-    }
-  ]
 
   return (
     <PageShell
@@ -341,35 +478,67 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
       {error ? <ErrorNotice error={error} /> : null}
       {storagesQuery.error ? <ErrorNotice error={storagesQuery.error} /> : null}
 
-      {volumeSummaries.length > 0 ? (
-        <SectionCard title={t('storage.volumeSummary')}>
-          <Space size={spacing.md} wrap>
-            {volumeSummaries.map((volume) => (
-              <Typography.Text key={volume.volumeName} style={{ fontSize: fontSize.sm }}>
-                {`${volume.volumeName} · ${formatBytes(volume.freeBytes)} / ${formatBytes(volume.totalBytes)} · ${volume.count}`}
-              </Typography.Text>
-            ))}
-          </Space>
-        </SectionCard>
-      ) : null}
+      <Space direction="vertical" size={spacing.lg} style={{ width: '100%' }}>
+        {volumeSummaries.length > 0 ? (
+          <div>
+            <SectionHeading title={t('storage.volumeSummary')} />
+            <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
+              {volumeSummaries.map((volume) => (
+                <VolumeUsageRow key={volume.key} volume={volume} />
+              ))}
+            </Space>
+          </div>
+        ) : null}
 
-      <SectionCard
-        title={t('storage.list.title')}
-        extra={
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-            {t('common.total', { total: storages.length })}
-          </Typography.Text>
-        }
-      >
-        <DataTable<StorageDTO>
-          columns={columns}
-          rows={storages}
-          rowKey={(storage) => storage.id}
-          loading={storagesQuery.isLoading}
-          empty={<EmptyState title={t('storage.empty')} />}
-          scroll={{ x: 1280 }}
-        />
-      </SectionCard>
+        <div>
+          <SectionHeading
+            title={t('storage.list.title')}
+            extra={
+              <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
+                {t('common.total', { total: storages.length })}
+              </Typography.Text>
+            }
+          />
+          {storagesQuery.isLoading ? (
+            <Skeleton active paragraph={{ rows: 4 }} />
+          ) : storages.length === 0 ? (
+            <EmptyState title={t('storage.empty')} />
+          ) : (
+            <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
+              {storages.map((storage) => (
+                <StorageRow
+                  key={storage.id}
+                  storage={storage}
+                  kindLabel={kindLabel}
+                  toggling={toggleMutation.isPending && toggleMutation.variables?.id === storage.id}
+                  mounting={mountMutation.isPending && mountMutation.variables === storage.id}
+                  onToggle={(checked) => {
+                    setError(null)
+                    toggleMutation.mutate({ id: storage.id, enabled: checked })
+                  }}
+                  onEdit={() => {
+                    setEditing(storage)
+                    setFormOpen(true)
+                  }}
+                  onMount={() => {
+                    setError(null)
+                    mountMutation.mutate(storage.id)
+                  }}
+                  onUnmount={() => {
+                    setError(null)
+                    setPendingUnmount(storage)
+                  }}
+                  onResize={() => openResize(storage)}
+                  onRemove={() => {
+                    setError(null)
+                    setPendingDelete(storage)
+                  }}
+                />
+              ))}
+            </Space>
+          )}
+        </div>
+      </Space>
 
       <Modal
         open={formOpen}
@@ -395,7 +564,7 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
             <Input maxLength={64} />
           </Form.Item>
           <Form.Item name="enabled" label={t('common.status')} valuePropName="checked">
-            <Switch checkedChildren={t('common.enabled')} unCheckedChildren={t('common.disabled')} />
+            <Switch />
           </Form.Item>
           {editing ? (
             <Form.Item
@@ -429,7 +598,7 @@ export function StorageList({ onCreate }: { onCreate: () => void }): JSX.Element
         maskClosable={false}
       >
         {error ? <ErrorNotice error={error} /> : null}
-          <Form form={resizeForm} layout="vertical">
+        <Form form={resizeForm} layout="vertical">
           <Form.Item name="sizeGB" label={t('storage.sizeGb')} rules={[{ required: true }]}>
             <InputNumber min={0.1} precision={2} style={{ width: '100%' }} addonAfter="GB" />
           </Form.Item>

@@ -101,6 +101,7 @@ export { StorageOption, type StorageOptionProps } from './components/StorageOpti
 export { StorageSelect, type StorageSelectProps } from './components/StorageSelect'
 export { StatusTag, type StatusTagProps } from './components/StatusTag'
 export { SystemDepsBanner } from './components/SystemDepsBanner'
+export { UpdateIndicator } from './components/UpdateIndicator'
 
 // 业务视图
 export { AboutPage, type AboutPageProps } from './features/about/AboutPage'
@@ -153,7 +154,6 @@ export { JobList } from './features/job/JobList'
 export { AuditList } from './features/audit/AuditList'
 export { StorageList } from './features/storage/StorageList'
 export { StorageCreateForm, type StorageCreateFormProps } from './features/storage/StorageCreateForm'
-export { StorageUsagePage } from './features/storage/StorageUsage'
 export { DiskImport, type DiskImportProps } from './features/system/DiskImport'
 export { SystemSettings, type SystemSettingsProps } from './features/system/SystemSettings'
 export { ClientSettings, type ClientSettingsProps } from './features/settings/ClientSettings'

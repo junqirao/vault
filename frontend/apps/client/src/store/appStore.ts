@@ -44,7 +44,7 @@ export interface AppState extends PersistedConfig {
    * 用续期/证书重登录得到的用户信息更新**指定**服务端的会话用户（id / 名字 / 角色）。
    *
    * 角色必须一起刷新：界面只该把本地这份角色当作"服务端最近一次的说法"。少了这一步，
-   * 服务端把用户降级后，顶栏的"管理控制台"入口会一直留着，点进去只会一路 403。
+   * 服务端把用户降级后，侧边栏的「控制台」入口会一直留着，点进去只会一路 403。
    */
   updateServerUser: (key: string, user: { id: string; username: string; role: Role }) => void
 }

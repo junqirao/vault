@@ -163,7 +163,7 @@ export function UserForm({ open, mode, user, onCancel, onSubmitted }: UserFormPr
         </Form.Item>
         {mode === 'edit' ? (
           <Form.Item name="enabled" label={t('common.status')} valuePropName="checked">
-            <Switch checkedChildren={t('common.enabled')} unCheckedChildren={t('common.disabled')} />
+            <Switch />
           </Form.Item>
         ) : null}
       </Form>

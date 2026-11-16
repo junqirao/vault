@@ -13,7 +13,6 @@ import {
   RepoList,
   ServerConfigProvider,
   StorageList,
-  StorageUsagePage,
   UserList,
   createVaultTheme,
   type ServerConfigValue
@@ -42,17 +41,15 @@ window.localStorage.setItem('vault.sidebar.collapsed', '1')
 const initialPath =
   screen === 'detail' || screen === 'disks'
     ? '/repos/repo-steam'
-    : screen === 'admin'
+    : screen === 'admin' || screen === 'storages'
       ? '/admin/storages'
       : screen === 'users'
         ? '/admin/users'
-        : screen === 'storages'
-          ? '/storages'
-          : screen === 'performance'
-            ? '/performance'
-            : '/my-repos'
+        : screen === 'performance'
+          ? '/performance'
+          : '/my-repos'
 
-const mode = screen === 'admin' || screen === 'users' ? 'admin' : 'app'
+const mode = screen === 'admin' || screen === 'users' || screen === 'storages' ? 'admin' : 'app'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -153,10 +150,6 @@ function DemoApp(): JSX.Element {
                     />
                     <Route path="/repos/:repoId" element={<DemoRepoDetail />} />
                     <Route path="/performance" element={<PerformancePage onBack={() => undefined} />} />
-                    <Route
-                      path="/storages"
-                      element={<StorageUsagePage onBack={() => undefined} onManage={() => undefined} />}
-                    />
                     <Route path="/admin/storages" element={<StorageList onCreate={() => undefined} />} />
                     <Route path="/admin/users" element={<UserList />} />
                   </Route>

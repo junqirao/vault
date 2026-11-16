@@ -118,8 +118,9 @@ export function App(): JSX.Element {
   )
 
   const flow = useStartupFlow(api)
-  // 版本更新在**启动期**由独立更新器完成（见 electron/clientUpdate.ts）；界面运行期
-  // 不再自行触发整包/代理/渲染层更新，避免出现"界面已经换了、本地服务还是旧的"。
+  // 版本更新在**启动期**由独立更新器完成（见 electron/clientUpdate.ts）；界面运行期只做
+  // 只读的「检查更新」并在顶栏提示（见 UpdateIndicator），不自行触发整包/代理/渲染层更新，
+  // 避免出现"界面已经换了、本地服务还是旧的"。
   const { setPhase } = flow
 
   useEffect(() => {
@@ -263,7 +264,7 @@ export function App(): JSX.Element {
       if (current.token === session.token && current.tokenExpiresAt === session.expires_at) return
       updateServerToken(current.key, session.token, session.expires_at)
       // 角色也要写回："记住我"的会话是从 store 里读角色的，只刷新令牌的话，
-      // 服务端改过角色后顶栏的管理端入口还是会留在那儿。
+      // 服务端改过角色后侧边栏的「控制台」入口还是会留在那儿。
       updateServerUser(current.key, user)
     },
     [updateServerToken, updateServerUser]
@@ -395,8 +396,8 @@ export function App(): JSX.Element {
   /**
    * 进入应用时向服务端确认一次身份（角色）。
    *
-   * 本地缓存里的角色只是"上次登录那一刻的说法"：服务端把用户降级后，顶栏的"管理控制台"入口
-   * 会一直留着，点进去只会一路 403（入口可见性只该认服务端）。这里用 /auth/me 的答案覆盖本地。
+   * 本地缓存里的角色只是"上次登录那一刻的说法"：服务端把用户降级后，侧边栏的「控制台」
+   * 入口会一直留着，点进去只会一路 403（入口可见性只该认服务端）。这里用 /auth/me 的答案覆盖本地。
    * 未记住我的会话只改内存里那一份 —— 角色不落盘，否则下次启动会出现"没令牌却像已登录"。
    */
   useEffect(() => {

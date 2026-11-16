@@ -69,8 +69,11 @@ export interface UsageBarProps {
   /**
    * 条厚度，默认 12（刚好容得下内嵌的百分数）。
    *
-   * 悬浮明细里用 6：那里每行右边已经写着「已用 / 上限」，条只当比例尺用，
-   * 12px 的厚条 + 条内百分数会让气泡又高又挤（真实反馈："hover 里的不要那么大"）。
+   * 全站**所有用量条**都用这一个厚度：首页「用量」模块、存储库卡片、分组卡片、
+   * 分组详情里的库行、用户配额、存储/按卷用量……同一条数据在哪儿看都等高。
+   *
+   * 悬浮明细（RepoUsageTip）是唯一的例外：那里每行右边已经写着「已用 / 上限」，
+   * 条只当比例尺用，传 6 以免气泡又高又挤。
    */
   height?: number
   /**
@@ -85,6 +88,13 @@ export interface UsageBarProps {
    * 用于"本地缓存无上限"这类没有百分比可算的场景：条仍要画出来，但中间写「无限」。
    */
   label?: string
+  /**
+   * 灰色段：同一块盘上**不属于本应用**的占用（0–100，接在主色段之后）。
+   *
+   * 用于"按卷汇总"/磁盘用量：蓝 = 本应用的存储数据，灰 = 盘上其它程序/文件，
+   * 空白轨道 = 剩余。传了它就会把条画成两段，条的百分数按「蓝 + 灰」合计显示。
+   */
+  otherPercent?: number
   style?: CSSProperties
 }
 
@@ -123,6 +133,7 @@ export function UsageBar({
   height = 12,
   showPercent = true,
   label,
+  otherPercent,
   style
 }: UsageBarProps): JSX.Element {
   // 取数中与置灰一样：不填、不写数 —— 这一刻没有数字可填，填 0 或写 "0%" 都会被读成
@@ -131,19 +142,45 @@ export function UsageBar({
   const clamped = blank ? 0 : Math.min(100, Math.max(0, Math.round(percent)))
   // 空条的颜色给轨道色：不留"该是什么档"的悬念，也不必让分档函数去操心一个没画出来的颜色。
   const strokeColor = blank ? palette.neutralFill : (color ?? usageColor(clamped))
+  // 灰色段（非本应用占用）不能超过轨道剩余部分；百分数按蓝 + 灰合计显示。
+  const otherClamped = blank ? 0 : Math.min(100 - clamped, Math.max(0, Math.round(otherPercent ?? 0)))
+  const usedEnd = blank ? 0 : Math.min(100, clamped + otherClamped)
+  const segmented = otherClamped > 0
   const labelSize = height >= 14 ? fontSize.xs : Math.max(9, height - 2)
   return (
     <div style={{ position: 'relative', lineHeight: 0, marginTop: 2, ...style }}>
-      {/* size 只给 height：line 形态下传单个数字是"宽高都设成它"（条会变成方块），
-          传对象才是"只改粗细"，正好 = 条的厚度。 */}
-      <Progress
-        percent={clamped}
-        showInfo={false}
-        size={{ height }}
-        strokeColor={strokeColor}
-        trailColor={palette.neutralFill}
-        style={{ marginBottom: 0, fontSize: 0, lineHeight: 0 }}
-      />
+      {segmented ? (
+        // 两段式：蓝（本应用）+ 灰（同一块盘的其它占用），空白轨道即剩余。
+        // 不用 antd Progress 的 success 段：那里是叠在实心段上的第二根条，
+        // 长度与圆角都会跟着主段变化，画不出"从蓝段右边续上"的效果。
+        <div
+          role="progressbar"
+          aria-valuenow={usedEnd}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          style={{
+            display: 'flex',
+            height,
+            borderRadius: height / 2,
+            overflow: 'hidden',
+            background: palette.neutralFill
+          }}
+        >
+          <div style={{ width: `${clamped}%`, height: '100%', background: strokeColor }} />
+          <div style={{ width: `${otherClamped}%`, height: '100%', background: palette.textTertiary }} />
+        </div>
+      ) : (
+        // size 只给 height：line 形态下传单个数字是"宽高都设成它"（条会变成方块），
+        // 传对象才是"只改粗细"，正好 = 条的厚度。
+        <Progress
+          percent={clamped}
+          showInfo={false}
+          size={{ height }}
+          strokeColor={strokeColor}
+          trailColor={palette.neutralFill}
+          style={{ marginBottom: 0, fontSize: 0, lineHeight: 0 }}
+        />
+      )}
       {loading ? (
         // 转圈用深灰：条的底纹是浅灰，白色或彩色的转圈都会糊在底上。
         // 细条（悬浮明细里的 6px）放不下 12px 的字，缩到 8：溢出一点也比盖住整条好。
@@ -156,13 +193,13 @@ export function UsageBar({
             ...overlayStyle,
             fontSize: labelSize,
             fontWeight: 600,
-            backgroundImage: `linear-gradient(90deg, ${palette.textInverse} 0 ${clamped}%, ${palette.textSecondary} ${clamped}% 100%)`,
+            backgroundImage: `linear-gradient(90deg, ${palette.textInverse} 0 ${usedEnd}%, ${palette.textSecondary} ${usedEnd}% 100%)`,
             WebkitBackgroundClip: 'text',
             backgroundClip: 'text',
             color: 'transparent'
           }}
         >
-          {label ?? `${clamped}%`}
+          {label ?? `${usedEnd}%`}
         </span>
       )}
     </div>

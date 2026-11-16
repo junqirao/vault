@@ -1,4 +1,5 @@
 import { Navigate, Route, Routes, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { message } from 'antd'
 
 import {
   AboutPage,
@@ -16,7 +17,6 @@ import {
   ServerLogsPage,
   StorageCreateForm,
   StorageList,
-  StorageUsagePage,
   SystemSettings,
   UploadTaskPage,
   UserList,
@@ -130,7 +130,29 @@ function NotFoundRoute(): JSX.Element {
 /** 路由表：应用端与管理端各自独立的外壳与菜单，互不混用。 */
 export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.Element {
   const navigate = useNavigate()
+  const { t } = useI18n()
   const { isSuperAdmin } = useAuth()
+
+  /**
+   * 用量模块的入口统一直接跳到已有页面：不再为了"看明细"单开只读页。
+   *
+   * 没有对应权限时留在原页给出提示，而不是把用户送进一个 403 页面
+   * （普通用户看到的存储用量仍然有效，只是不能进管理端）。
+   */
+  const openStorages = (): void => {
+    if (!isSuperAdmin) {
+      void message.warning(t('storage.usage.noPermission'))
+      return
+    }
+    navigate('/admin/storages')
+  }
+  const openUsers = (): void => {
+    if (!isSuperAdmin) {
+      void message.warning(t('err.auth.forbidden'))
+      return
+    }
+    navigate('/admin/users')
+  }
 
   return (
     <Routes>
@@ -161,9 +183,9 @@ export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.E
               onOpenUpload={(uploadId) =>
                 navigate(`/uploads/${uploadId}`, { state: { from: '/my-repos' } })
               }
-              onOpenStorages={() => navigate('/storages', { state: { from: '/my-repos' } })}
-              // 配额只能由管理员在用户管理页查看/调整；普通用户看不到这个入口（见 QuotaOverview）。
-              onOpenUsers={() => navigate('/admin/users')}
+              onOpenStorages={openStorages}
+              // 配额只能由管理员在用户管理页查看/调整；普通用户点了给出提示（见 openUsers）。
+              onOpenUsers={openUsers}
               onManageSteamGroup={(groupID) =>
                 navigate(`/admin/game-groups?group=${encodeURIComponent(groupID)}`, {
                   state: { from: '/my-repos' }
@@ -186,10 +208,11 @@ export function AppRoutes({ language, onLanguageChange }: AppRoutesProps): JSX.E
           }
         />
         <Route path="logs" element={<LogViewer />} />
-        {/* 客户端只读存储页：展示每块存储的用量，没有任何管理动作（管理入口在首页卡片箭头）。 */}
+        {/* 旧的只读存储页已取消：用量模块的入口直接跳管理端「存储」（见 openStorages）。
+            保留旧路径重定向，避免历史链接 404；普通用户没有管理端权限，回存储库列表。 */}
         <Route
           path="storages"
-          element={<StorageUsagePage onBack={() => navigate('/my-repos')} onManage={() => navigate('/admin/storages')} />}
+          element={<Navigate to={isSuperAdmin ? '/admin/storages' : '/my-repos'} replace />}
         />
         <Route path="repos/:repoId" element={<RepoDetailRoute />} />
         {/* 性能详情：总览 + 已挂载库 + 未挂载库（默认收起）三个可折叠模块。 */}
