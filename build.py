@@ -75,6 +75,7 @@ from typing import Any, Callable
 ROOT = Path(__file__).resolve().parent
 
 VERSION_FILE = ROOT / "VERSION"
+RELEASE_FILE = ROOT / "RELEASE.json"
 BUILD_STATE_FILE = ROOT / ".build-state.json"
 CONFIG_FILE = ROOT / "config.yaml"
 CONFIG_EXAMPLE_FILE = ROOT / "config.example.yaml"
@@ -879,6 +880,22 @@ def _git_commit() -> str:
     return commit
 
 
+def read_release_meta() -> dict[str, str]:
+    """读取对外发布版本（RELEASE.json）；缺失或损坏时返回空值，不阻断内部构建。"""
+    out = {"version": "", "channel": ""}
+    if not RELEASE_FILE.is_file():
+        warn(f"未找到 {RELEASE_FILE.name}，服务端将无法进行 GitHub 自更新版本比较")
+        return out
+    try:
+        data = json.loads(RELEASE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        warn(f"读取 {RELEASE_FILE.name} 失败：{exc}")
+        return out
+    out["version"] = str(data.get("version") or "").strip()
+    out["channel"] = str(data.get("channel") or "").strip().lower()
+    return out
+
+
 def _ldflags(version: str, commit: str, build_time: str, public_key: str | None) -> str:
     """拼装 Go 构建的 ldflags（public_key 非空时注入发布方公钥）。"""
     flags = (
@@ -888,6 +905,11 @@ def _ldflags(version: str, commit: str, build_time: str, public_key: str | None)
         f"-X vault/internal/version.GitCommit={commit} "
         f"-X vault/internal/version.BuildTime={build_time}"
     )
+    release = read_release_meta()
+    if release["version"]:
+        flags += f" -X vault/internal/version.ReleaseVersion={release['version']}"
+    if release["channel"]:
+        flags += f" -X vault/internal/version.ReleaseChannel={release['channel']}"
     if public_key:
         flags += f" -X vault/internal/agent.updatePublicKeyBase64={public_key}"
     return flags

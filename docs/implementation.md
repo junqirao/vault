@@ -3290,6 +3290,27 @@ Vault-Server sign release -artifact agent=... -artifact client_web=dist.zip
     清理 `.tmp-*` / `.part` 残留（判据与第 1 段完全一致；应用版本不可解析时不判定、不动手）。
     **用户无需手工删 `%ProgramData%\Vault\webapp`**。
 
+#### 7.4.6 服务端自更新（GitHub Release）
+
+服务端自更新是**独立于客户端更新**的一条链路；客户端仍然只从服务端的 `/v1/system/update/*` 获取更新。
+
+- 构建期把 `RELEASE.json` 的 `version` / `channel` 注入 `internal/version`
+  （`ReleaseVersion` / `ReleaseChannel`）；
+- 更新源固定为 `https://github.com/junqirao/vault/releases`，不提供仓库/令牌/代理配置；
+- 管理端「系统设置 → 服务端更新」调用 `GET/POST /v1/system/server-update*`（仅超级管理员）；
+- 版本比较使用 `internal/releasever`，保留 `beta` / `rc` 预发布优先级；
+- GitHub 查询走 `/repos/{owner}/{repo}/releases` 列表（不能用 `/releases/latest`，它不返回预发布）；
+- 资产按平台选择，下载支持 Range 断点续传与 GitHub `digest` / `SHA256SUMS.txt` 校验；
+- 下载完成后解压到 `<配置目录>/update/server/staging`，校验 `updates/manifest.json` 与签名文件；
+- 更新包通道必须与 `update.channel` 一致，否则拒绝应用，避免替换后客户端更新链路被切断；
+- 应用时写 `pending.json`，把当前 exe 复制为 `update/server/helper/` 下的 helper 并以
+  `apply-update` 子命令启动；旧服务端返回 202 后优雅停机；
+- helper 等旧 PID 退出、备份旧 exe、替换 exe / scripts / `updates/`，再启动新服务端并等待监听；
+- 启动失败自动恢复旧 exe / scripts / updates 并重启旧版本；成功后删除备份、下载 zip、解压目录；
+- Linux + systemd 场景通过 `systemd-run` 把 helper 放到独立 unit，替换后 `systemctl restart`，
+  避免 helper 被旧服务的 cgroup 一起杀掉。
+
+完整调研、接口与回滚设计见 [`docs/server-update-github-release.md`](server-update-github-release.md)。
 
 ### 7.5 i18n
 

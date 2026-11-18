@@ -6,6 +6,12 @@ var (
 	Version   = "0.0.0-dev"
 	GitCommit = "unknown"
 	BuildTime = "unknown"
+
+	// ReleaseVersion / ReleaseChannel 是对外发布版本（真源为根目录 RELEASE.json），
+	// 由 build.py 在构建期注入。服务端自更新用它和 GitHub Release 比较；
+	// 内部构建号 Version 仍用于客户端更新与兼容性判定。
+	ReleaseVersion = ""
+	ReleaseChannel = ""
 )
 
 // APIVersion 是 HTTP 协议版本。

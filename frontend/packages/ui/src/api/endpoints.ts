@@ -52,6 +52,7 @@ import type {
   ConfigResponse,
   SettingsResponse,
   StorageDTO,
+  ServerUpdateStatus,
   SysDepsReport,
   SystemInfo,
   SystemLog,
@@ -166,6 +167,28 @@ export class VaultApi extends ApiClient {
   /** 在线改配置（写回 config.yaml）：只接受 editable 的键。 */
   patchConfig(body: { settings: Record<string, string> }): Promise<ConfigResponse> {
     return this.request<ConfigResponse>('PATCH', '/v1/system/config', body)
+  }
+
+  // ---- 服务端自更新（GitHub Release，仅超级管理员） ----
+
+  serverUpdateStatus(): Promise<ServerUpdateStatus> {
+    return this.request<ServerUpdateStatus>('GET', '/v1/system/server-update')
+  }
+
+  checkServerUpdate(): Promise<ServerUpdateStatus> {
+    return this.request<ServerUpdateStatus>('POST', '/v1/system/server-update/check', undefined, undefined, true, 90000)
+  }
+
+  downloadServerUpdate(): Promise<ServerUpdateStatus> {
+    return this.request<ServerUpdateStatus>('POST', '/v1/system/server-update/download', undefined, undefined, true, 30000)
+  }
+
+  cancelServerUpdateDownload(): Promise<ServerUpdateStatus> {
+    return this.request<ServerUpdateStatus>('DELETE', '/v1/system/server-update/download')
+  }
+
+  applyServerUpdate(): Promise<ServerUpdateStatus> {
+    return this.request<ServerUpdateStatus>('POST', '/v1/system/server-update/apply', undefined, undefined, true, 30000)
   }
 
   auditLogs(params?: { user_id?: string; action?: string; limit?: number; offset?: number }): Promise<ListResponse<AuditDTO>> {

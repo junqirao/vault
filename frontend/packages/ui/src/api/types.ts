@@ -622,9 +622,54 @@ export interface SystemInfo {
   server_name: string
   api_version: number
   server_version: string
+  /** 对外发布版本（RELEASE.json）；旧构建可能为空。 */
+  release_version?: string
+  /** 对外发布通道：stable / beta / rc / alpha。 */
+  release_channel?: string
   client_compat: ClientCompatInfo
   features: string[]
   capabilities: Capabilities
+}
+
+/** 服务端自更新状态（GET /v1/system/server-update）。 */
+export interface ServerUpdateStatus {
+  current: {
+    release_version: string
+    release_channel: string
+    internal_version: string
+    platform: string
+    arch: string
+  }
+  state: 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'applying' | 'restarting' | 'failed'
+  latest?: {
+    version: string
+    channel: string
+    tag: string
+    notes?: string
+    html_url?: string
+    published_at?: number
+    asset_name: string
+    asset_size: number
+    sha256?: string
+  }
+  progress?: {
+    received_bytes: number
+    total_bytes: number
+    /** -1 表示总大小未知。 */
+    percent: number
+    speed_bytes_per_sec: number
+  }
+  error?: { code: string; message?: string; args?: Record<string, unknown> }
+  last_result?: {
+    ok: boolean
+    from_version?: string
+    to_version?: string
+    error?: string
+    finished_at?: number
+  }
+  checked_at?: number
+  restart_mode?: string
+  systemd_unit?: string
 }
 
 export interface HealthStatus {
@@ -1278,6 +1323,13 @@ export interface GameCatalogItemDTO {
   available_build_id: string
   target_platform: 'windows' | 'linux' | ''
   status: 'ready' | 'updating' | 'paused' | 'error'
+  /** 实时更新进度：与游戏分组页同一条下载进度。 */
+  progress_percent: number
+  progress_phase: 'checking' | 'downloading' | 'preparing' | 'diffing' | 'merging' | 'stopping' | ''
+  progress_stage: string
+  progress_bytes_done: number
+  progress_bytes_total: number
+  progress_speed: number
   last_updated_at: number
   repo: RepoDTO
 }

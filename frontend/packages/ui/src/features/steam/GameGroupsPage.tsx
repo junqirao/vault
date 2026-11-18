@@ -30,13 +30,14 @@ import type {
 } from '../../api/types'
 import { ErrorNotice } from '../../components/ErrorNotice'
 import { PageShell } from '../../components/PageShell'
-import { UsageBar } from '../../components/UsageBar'
 import { useI18n } from '../../i18n'
 import { fontSize, palette, spacing } from '../../tokens/palette'
-import { formatBytes, formatTime } from '../../utils/format'
+import { formatTime } from '../../utils/format'
 import { SteamAccountsPage } from './SteamAccountsPage'
 import { SteamAppIcon } from './SteamAppIcon'
 import { SteamGamePicker } from './SteamGamePicker'
+import { SteamUpdateMeter } from './SteamUpdateMeter'
+import { steamUpdateProgress } from './steamUpdateProgress'
 
 interface GroupFormValues {
   name: string
@@ -83,20 +84,12 @@ function accessLabel(t: (key: string) => string, group: RepoGroupDTO): string {
   return t(`steam.access.${group.access_mode}`)
 }
 
+/** 非就绪状态的标签配色：实心标签用具体色值（preset 名会渲染成浅底描边）。 */
 function gameStatusColor(status: GameDTO['status']): string {
-  if (status === 'ready') return 'green'
-  if (status === 'updating') return 'blue'
-  if (status === 'paused') return 'gold'
-  return 'red'
-}
-
-/** SteamCMD 内部阶段 → 更准确的中文/本地化文案；未识别的阶段回退到 pipeline phase。 */
-const UPDATE_STAGE_KEYS: Record<string, string> = {
-  verifying: 'verifying',
-  validating: 'verifying',
-  committing: 'committing',
-  preallocating: 'preallocating',
-  reconfiguring: 'reconfiguring'
+  if (status === 'ready') return palette.success
+  if (status === 'updating') return palette.accent
+  if (status === 'paused') return palette.warning
+  return palette.danger
 }
 
 /** 游戏库管理：分组卡片瀑布流 + 全页面游戏选择器。 */
@@ -608,23 +601,7 @@ function GameLibraryRow({
   const { t } = useI18n()
   const [outputOpen, setOutputOpen] = useState(false)
   const updatingGame = game.status === 'updating'
-  const total = game.progress_bytes_total || 0
-  const done = game.progress_bytes_done || 0
-  const fallbackPercent = total > 0 ? (done / total) * 100 : 0
-  const percent = Math.max(0, Math.min(100, game.progress_percent || fallbackPercent))
-  const speed = game.progress_speed || 0
-  // 百分比只留在进度条里，这里不再重复。
-  const stageKey = UPDATE_STAGE_KEYS[(game.progress_stage || '').toLowerCase()]
-  const phaseLabel = stageKey
-    ? t(`steam.games.updateStage.${stageKey}`)
-    : t(`steam.games.updatePhase.${game.progress_phase || 'downloading'}`)
-  const progressText = [
-    phaseLabel,
-    total > 0 ? `${formatBytes(done)} / ${formatBytes(total)}` : '',
-    speed > 0 ? `${formatBytes(speed)}/s` : ''
-  ]
-    .filter(Boolean)
-    .join(' · ')
+  const progress = steamUpdateProgress(game, t)
 
   return (
     <div
@@ -646,14 +623,25 @@ function GameLibraryRow({
           <Typography.Text strong ellipsis={{ tooltip: game.app_name }}>
             {game.app_name}
           </Typography.Text>
-          {game.status !== 'ready' ? (
-            <Tag color={gameStatusColor(game.status)} style={{ marginInlineEnd: 0 }}>
-              {t(`steam.gameStatus.${game.status}`)}
-            </Tag>
-          ) : null}
           <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
             App {game.app_id}
           </Typography.Text>
+          {/* 状态标签放最后：实心、小一号，不再抢在名字和 AppID 之间打断阅读。 */}
+          {game.status !== 'ready' ? (
+            <Tag
+              color={gameStatusColor(game.status)}
+              bordered={false}
+              style={{
+                marginInlineEnd: 0,
+                fontSize: 11,
+                lineHeight: '16px',
+                padding: '0 6px',
+                borderRadius: 4
+              }}
+            >
+              {t(`steam.gameStatus.${game.status}`)}
+            </Tag>
+          ) : null}
         </Space>
         <Typography.Text
           type="secondary"
@@ -680,12 +668,7 @@ function GameLibraryRow({
       </div>
 
       {updatingGame ? (
-        <div style={{ flex: '0 1 320px', minWidth: 220 }}>
-          <UsageBar percent={percent} style={{ marginTop: 0 }} />
-          <Typography.Text type="secondary" style={{ fontSize: fontSize.xs }}>
-            {progressText}
-          </Typography.Text>
-        </div>
+        <SteamUpdateMeter progress={progress} style={{ flex: '0 1 320px', minWidth: 220 }} />
       ) : null}
 
       <Space wrap style={{ flexShrink: 0 }}>

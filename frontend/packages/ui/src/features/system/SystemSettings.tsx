@@ -14,6 +14,7 @@ import { fontSize, spacing } from '../../tokens/palette'
 import { formatBytes } from '../../utils/format'
 import { LvmPoolCard } from './LvmPoolCard'
 import { ServerConfigCard } from './ServerConfigCard'
+import { ServerUpdateCard } from './ServerUpdateCard'
 
 export interface SystemSettingsProps {
   isSuperAdmin: boolean
@@ -94,10 +95,16 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
         <Descriptions size="small" column={2} bordered>
           <Descriptions.Item label={t('system.instanceId')}>{info?.server_instance_id ?? '-'}</Descriptions.Item>
           <Descriptions.Item label={t('system.serverName')}>{settingsQuery.data?.server.name ?? info?.server_name ?? '-'}</Descriptions.Item>
-          <Descriptions.Item label={t('system.apiVersion')}>{info?.api_version ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label={t('system.releaseVersion')}>
+            {info?.release_version ? `v${info.release_version}` : '-'}
+            {info?.release_channel && info.release_channel !== 'stable' ? ` · ${info.release_channel.toUpperCase()}` : ''}
+          </Descriptions.Item>
           <Descriptions.Item label={t('system.serverVersion')}>{info?.server_version ?? '-'}</Descriptions.Item>
+          <Descriptions.Item label={t('system.apiVersion')}>{info?.api_version ?? '-'}</Descriptions.Item>
         </Descriptions>
       </SectionCard>
+
+      {isSuperAdmin ? <ServerUpdateCard /> : null}
 
       <SectionCard title={t('system.clientCompat')} loading={infoQuery.isLoading}>
         {compat && !compat.enabled ? (

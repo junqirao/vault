@@ -170,6 +170,12 @@ func (r *Router) middlewareAccessLog(next http.Handler) http.Handler {
 			next.ServeHTTP(w, req)
 			return
 		}
+		// 服务端自更新状态在下载期间每秒轮询一次：和 ping 一样，只读且高频，
+		// 不为它刷访问日志（否则几分钟内就把有用的日志冲走）。
+		if req.Method == http.MethodGet && req.URL.Path == serverUpdateStatusPath {
+			next.ServeHTTP(w, req)
+			return
+		}
 		rec := &statusRecorder{ResponseWriter: w}
 		start := time.Now()
 		next.ServeHTTP(rec, req)

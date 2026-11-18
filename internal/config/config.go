@@ -294,7 +294,7 @@ type SecurityConfig struct {
 	EnrollmentTokenTTL Duration `yaml:"enrollment_token_ttl"`
 }
 
-// UpdateConfig 客户端更新分发（服务端仅作 mirror，不参与签名）。
+// UpdateConfig 客户端更新分发（服务端仅作 mirror，不参与签名）与服务端自更新。
 type UpdateConfig struct {
 	// ArtifactsDir 更新包存放目录。
 	ArtifactsDir string `yaml:"artifacts_dir"`
@@ -302,6 +302,17 @@ type UpdateConfig struct {
 	Channel string `yaml:"channel"`
 	// MinClientVersion 低于此版本的客户端将被强制升级（留空表示不强制）。
 	MinClientVersion string `yaml:"min_client_version"`
+
+	// ---- 服务端自更新（GitHub Release） ----
+
+	// ServerAutoCheck 是否在后台周期性检查服务端更新（默认关闭，仅设置页手动检查）。
+	ServerAutoCheck bool `yaml:"server_auto_check"`
+	// ServerCheckInterval 后台检查间隔；留空默认 6h。
+	ServerCheckInterval Duration `yaml:"server_check_interval"`
+	// RestartMode 替换后的重启方式：auto / helper / systemd / manual。
+	RestartMode string `yaml:"restart_mode"`
+	// SystemdUnit systemd 托管时的 unit 名（restart_mode=auto 且检测到 systemd 时使用）。
+	SystemdUnit string `yaml:"systemd_unit"`
 }
 
 // SteamConfig 是 Steam 内容账号与游戏更新模块的配置。
@@ -618,6 +629,15 @@ func (c *Config) applyDefaults() {
 	if c.Update.Channel == "" {
 		c.Update.Channel = "stable"
 	}
+	if c.Update.ServerCheckInterval <= 0 {
+		c.Update.ServerCheckInterval = Duration(6 * time.Hour)
+	}
+	if strings.TrimSpace(c.Update.RestartMode) == "" {
+		c.Update.RestartMode = "auto"
+	}
+	if strings.TrimSpace(c.Update.SystemdUnit) == "" {
+		c.Update.SystemdUnit = "vault-server.service"
+	}
 	if c.Platform.Kind == "" {
 		c.Platform.Kind = "auto"
 	}
@@ -792,6 +812,13 @@ func (c *Config) validate() error {
 	}
 	if c.Steam.DefaultRepoSizeGB <= 0 {
 		c.Steam.DefaultRepoSizeGB = 60
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Update.RestartMode)) {
+	case "":
+		c.Update.RestartMode = "auto"
+	case "auto", "helper", "systemd", "manual":
+	default:
+		return fmt.Errorf("config: update.restart_mode 非法: %q（可选 auto/helper/systemd/manual）", c.Update.RestartMode)
 	}
 	return nil
 }

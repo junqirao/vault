@@ -84,13 +84,17 @@ type VolumeCapability struct {
 // 该接口**匿名可访问**：客户端需要在认证之前完成版本兼容判定，
 // 否则证书/账号问题会与版本问题混淆，排障困难（见 docs/implementation.md 3.4.2 约束 3）。
 type SystemInfo struct {
-	ServerInstanceID string           `json:"server_instance_id"`
-	ServerName       string           `json:"server_name"`
-	APIVersion       int              `json:"api_version"`
-	ServerVersion    string           `json:"server_version"`
-	ClientCompat     ClientCompatInfo `json:"client_compat"`
-	Features         []string         `json:"features"`
-	Capabilities     Capabilities     `json:"capabilities"`
+	ServerInstanceID string `json:"server_instance_id"`
+	ServerName       string `json:"server_name"`
+	APIVersion       int    `json:"api_version"`
+	ServerVersion    string `json:"server_version"`
+	// ReleaseVersion / ReleaseChannel 是对外发布版本（RELEASE.json），用于服务端自更新比较。
+	// 旧构建可能为空，界面按“不支持自动判断”处理。
+	ReleaseVersion string           `json:"release_version,omitempty"`
+	ReleaseChannel string           `json:"release_channel,omitempty"`
+	ClientCompat   ClientCompatInfo `json:"client_compat"`
+	Features       []string         `json:"features"`
+	Capabilities   Capabilities     `json:"capabilities"`
 	// UpdateChannel 本服务端提供的更新分发通道（供客户端确认"当前更新源"的通道）。
 	// 服务端只 mirror 一份发布目录，因此这是服务端级属性而非客户端参数。
 	UpdateChannel string `json:"update_channel"`
@@ -116,6 +120,8 @@ func (a *App) SystemInfo(ctx context.Context) *SystemInfo {
 		ServerName:       raw.Server.Name,
 		APIVersion:       version.APIVersion,
 		ServerVersion:    version.Version,
+		ReleaseVersion:   version.ReleaseVersion,
+		ReleaseChannel:   version.ReleaseChannel,
 		ClientCompat: ClientCompatInfo{
 			Enabled: compat.Enabled,
 		},

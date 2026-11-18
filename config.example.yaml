@@ -337,6 +337,16 @@ update:
   # 低于此版本的客户端将被强制升级（留空表示不强制）。
   # 该值用于版本契约的展示与提示；真正的区间判定见上面的 client_compat。
   min_client_version: ""
+  # ---- 服务端自更新（GitHub Release） ----
+  # 是否在后台周期性检查服务端更新；默认关闭，系统设置里仍可手动检查。
+  server_auto_check: false
+  # 后台检查周期（如 6h）；留空默认 6h。
+  server_check_interval: "6h"
+  # 服务端更新源固定为 https://github.com/junqirao/vault/releases，不需要配置仓库/令牌/代理。
+  # 替换后的重启方式：auto（检测 systemd）/ helper（直接启动新进程）/ systemd / manual。
+  restart_mode: "auto"
+  # systemd 托管时的 unit 名。
+  systemd_unit: "vault-server.service"
 
 # Steam 内容账号模块（仅用于存储库内容下载/更新，不提供玩家登录或通用 Steam 命令入口）。
 # 账号密码 / TOTP secret / 长期 token 一律使用 security.master_key 派生密钥做 AES-GCM 加密后落库。

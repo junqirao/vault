@@ -72,6 +72,7 @@ import (
 	"vault/internal/logging"
 	"vault/internal/platform"
 	"vault/internal/secret"
+	"vault/internal/serverupdate"
 	"vault/internal/signtool"
 	"vault/internal/store"
 	appversion "vault/internal/version"
@@ -272,6 +273,8 @@ func run() (code int, promptHandled bool) {
 			return runStop(os.Args[2:]), true
 		case doctorSubcommand:
 			return runDoctor(os.Args[2:]), true
+		case applyUpdateSubcommand:
+			return runApplyUpdate(os.Args[2:]), true
 		}
 	}
 
@@ -290,8 +293,9 @@ func run() (code int, promptHandled bool) {
 		appversion.Version = v
 	}
 	if *showVersion {
-		fmt.Printf("Vault-Server %s (api_version=%d, commit=%s, built=%s)\n",
-			appversion.Version, appversion.APIVersion, appversion.GitCommit, appversion.BuildTime)
+		fmt.Printf("Vault-Server %s (release=%s/%s, api_version=%d, commit=%s, built=%s)\n",
+			appversion.Version, appversion.ReleaseVersion, appversion.ReleaseChannel,
+			appversion.APIVersion, appversion.GitCommit, appversion.BuildTime)
 		return 0, false
 	}
 
@@ -493,6 +497,9 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	}
 	defer watcher.Close() //nolint:errcheck
 
+	// 服务端自更新管理器：状态在内存，临时文件在 <配置目录>/update/server。
+	updateManager := serverupdate.NewManager(log, watcher)
+
 	// ---- 8) 平台层 ----
 	// 各后端由同一份上层代码驱动，具体实现随构建产物而定（见 platform_* 文件）。
 	// StorageVol 在 Windows 上刻意留 nil（存储就是普通目录），Linux 上是 thin LV 卷后端。
@@ -618,6 +625,8 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	// ---- 12) 后台定时任务 ----
 	bgCtx, cancelBackground := context.WithCancel(context.Background())
 	defer cancelBackground()
+	// 服务端自更新后台检查（默认关闭，配置 update.server_auto_check 开启后生效）。
+	updateManager.StartAutoCheck(bgCtx)
 	// startTicker 用 safeGo 启动周期任务：panic 只记 ERROR（含栈）并终止该 ticker，
 	// 绝不拖垮进程（runTicker 内部还会对每次 fn 调用单独兜底）。
 	startTicker := func(name string, every time.Duration, fn func(context.Context) error) {
@@ -764,8 +773,18 @@ func runServe(configPath *string, migrateOnly *bool) int {
 
 	// Logs 交给管理端「服务日志」页读取：读的是服务端自己的按天日志文件
 	// （客户端日志是本机代理的事，走 GET /agent/log，两者互不相干）。
+	// stopRequests 在这里提前声明：服务端自更新的 apply 接口要在写完响应后请求优雅停机。
+	stopRequests := make(chan stopRequest, 1)
+	requestShutdown := func() {
+		select {
+		case stopRequests <- stopRequest{source: stopSourceCommand}:
+		default:
+		}
+	}
 	router := api.New(api.Deps{
 		App: application, Log: log, Cfg: watcher, Store: st, Events: events, Logs: logger,
+		Update:          updateManager,
+		RequestShutdown: requestShutdown,
 	})
 	server := &http.Server{
 		Addr:              raw.HTTP.Listen,
@@ -846,7 +865,6 @@ func runServe(configPath *string, migrateOnly *bool) int {
 	}
 	defer closeStopEvent(stopEvent)
 
-	stopRequests := make(chan stopRequest, 1)
 	safeGo(log, "stop_waiter", func() {
 		select {
 		case sig := <-signals:

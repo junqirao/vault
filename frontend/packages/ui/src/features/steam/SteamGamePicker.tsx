@@ -76,6 +76,20 @@ export function SteamGamePicker({ group, account, onBack, onDone }: SteamGamePic
     () => new Map(localGames.map((game) => [game.app_id, game])),
     [localGames]
   )
+  // 已经在任意游戏组里的 AppID：服务端对 AppID 是全局唯一的（game.app_taken），
+  // 选择器里直接置灰并标「已添加」，避免选完才在提交时报冲突。
+  const catalogQuery = useQuery({
+    queryKey: ['game-catalog'],
+    queryFn: () => api.getGameCatalog(),
+    staleTime: 60_000
+  })
+  const existingAppIDs = useMemo(() => {
+    const ids = new Set<number>()
+    for (const group of catalogQuery.data?.items ?? []) {
+      for (const game of group.games) ids.add(game.app_id)
+    }
+    return ids
+  }, [catalogQuery.data])
   const serverGames = useMemo(
     () =>
       (ownedGamesQuery.data?.items ?? []).map((game) => {
@@ -97,7 +111,10 @@ export function SteamGamePicker({ group, account, onBack, onDone }: SteamGamePic
       (game) => game.name.toLowerCase().includes(keyword) || String(game.app_id).includes(keyword)
     )
   }, [games, storeQuery])
-  const selectableGames = useMemo(() => displayGames.filter(isWindowsGame), [displayGames])
+  const selectableGames = useMemo(
+    () => displayGames.filter((game) => isWindowsGame(game) && !existingAppIDs.has(game.app_id)),
+    [displayGames, existingAppIDs]
+  )
   const unresolvedGames = useMemo(
     () => (useLocalList ? 0 : games.filter((game) => /^App \d+$/.test(game.name)).length),
     [useLocalList, games]
@@ -162,15 +179,18 @@ export function SteamGamePicker({ group, account, onBack, onDone }: SteamGamePic
     mutationFn: () =>
       api.batchCreateGames(group.id, {
         size_bytes: 0,
-        games: Object.values(selectedGames).map((game) => ({
-          app_id: game.app_id,
-          app_name: game.name
-        }))
+        games: Object.values(selectedGames)
+          .filter((game) => !existingAppIDs.has(game.app_id))
+          .map((game) => ({
+            app_id: game.app_id,
+            app_name: game.name
+          }))
       }),
     onSuccess: (res) => {
       void queryClient.invalidateQueries({ queryKey: ['steam', 'games', group.id] })
       void queryClient.invalidateQueries({ queryKey: ['steam', 'groups'] })
       void queryClient.invalidateQueries({ queryKey: ['steam', 'accounts'] })
+      void queryClient.invalidateQueries({ queryKey: ['game-catalog'] })
       if (res.failed.length === 0) {
         message.success(t('steam.games.batchCreated', { count: res.created.length }))
         onDone()
@@ -191,6 +211,7 @@ export function SteamGamePicker({ group, account, onBack, onDone }: SteamGamePic
 
   const toggleGame = (game: SteamStoreGameDTO): void => {
     if (!isWindowsGame(game)) return
+    if (existingAppIDs.has(game.app_id)) return
     setSelectedGames((previous) => {
       const next = { ...previous }
       if (next[game.app_id]) {
@@ -374,6 +395,7 @@ export function SteamGamePicker({ group, account, onBack, onDone }: SteamGamePic
                 key={game.app_id}
                 game={game}
                 selected={Boolean(selectedGames[game.app_id])}
+                alreadyAdded={existingAppIDs.has(game.app_id)}
                 onToggle={() => toggleGame(game)}
               />
             ))}
@@ -399,17 +421,21 @@ export function SteamGamePicker({ group, account, onBack, onDone }: SteamGamePic
 function GamePickRow({
   game,
   selected,
+  alreadyAdded,
   onToggle
 }: {
   game: SteamStoreGameDTO
   selected: boolean
+  /** 这个 AppID 已经在游戏组里：不可再次添加。 */
+  alreadyAdded: boolean
   onToggle: () => void
 }): JSX.Element {
   const { t } = useI18n()
   const windows = isWindowsGame(game)
+  const disabled = !windows || alreadyAdded
   return (
     <div
-      onClick={windows ? onToggle : undefined}
+      onClick={disabled ? undefined : onToggle}
       style={{
         display: 'flex',
         alignItems: 'center',
@@ -418,18 +444,18 @@ function GamePickRow({
         borderRadius: 10,
         padding: `${spacing.xs}px ${spacing.md}px`,
         background: palette.bgContainer,
-        cursor: windows ? 'pointer' : 'not-allowed',
-        opacity: windows ? 1 : 0.55,
+        cursor: disabled ? 'not-allowed' : 'pointer',
+        opacity: alreadyAdded ? 0.6 : windows ? 1 : 0.55,
         transition: 'border-color 0.15s ease'
       }}
     >
       <Checkbox
         checked={selected}
-        disabled={!windows}
+        disabled={disabled}
         aria-label={t('steam.games.selectGame')}
         onClick={(event) => event.stopPropagation()}
         onChange={() => {
-          if (windows) onToggle()
+          if (!disabled) onToggle()
         }}
       />
       <SteamAppIcon
@@ -448,6 +474,15 @@ function GamePickRow({
       </div>
       {game.installed ? <Tag color="green">{t('steam.games.installed')}</Tag> : null}
       {windows ? null : <Tag>{t('steam.games.notWindows')}</Tag>}
+      {alreadyAdded ? (
+        <Tag
+          color={palette.textTertiary}
+          bordered={false}
+          style={{ marginInlineEnd: 0, fontSize: 11, lineHeight: '16px', padding: '0 6px', borderRadius: 4 }}
+        >
+          {t('steam.games.alreadyAdded')}
+        </Tag>
+      ) : null}
     </div>
   )
 }

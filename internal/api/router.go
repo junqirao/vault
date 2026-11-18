@@ -10,6 +10,7 @@ import (
 	"vault/internal/apperr"
 	"vault/internal/config"
 	"vault/internal/domain"
+	"vault/internal/serverupdate"
 	"vault/internal/store"
 )
 
@@ -22,6 +23,10 @@ type Deps struct {
 	Events *EventHub
 	// Logs 服务端日志只读访问（管理端「服务日志」页）；可为 nil（不提供日志查询）。
 	Logs LogSource
+	// Update 服务端自更新管理器；为 nil 时相关接口返回 501（例如未启用/旧构建）。
+	Update *serverupdate.Manager
+	// RequestShutdown 请求旧服务端优雅停机（服务端自更新 apply 后调用）。
+	RequestShutdown func()
 }
 
 // Router 是 HTTP 路由器（实现 http.Handler）。
@@ -111,6 +116,12 @@ func (r *Router) routes() {
 		// 全量配置表（读）与在线改配置（写回 config.yaml）：仅超级管理员。
 		g.Get("/v1/system/config", r.requireSuperAdmin(r.handleGetConfig))
 		g.Patch("/v1/system/config", r.requireSuperAdmin(r.handlePatchConfig))
+		// 服务端自更新：查询 GitHub Release、下载、重启替换（仅超级管理员）。
+		g.Get("/v1/system/server-update", r.requireSuperAdmin(r.handleServerUpdateStatus))
+		g.Post("/v1/system/server-update/check", r.requireSuperAdmin(r.handleServerUpdateCheck))
+		g.Post("/v1/system/server-update/download", r.requireSuperAdmin(r.handleServerUpdateDownload))
+		g.Delete("/v1/system/server-update/download", r.requireSuperAdmin(r.handleServerUpdateCancel))
+		g.Post("/v1/system/server-update/apply", r.requireSuperAdmin(r.handleServerUpdateApply))
 		g.Get("/v1/system/audit", r.requireSuperAdmin(r.handleListAudit))
 		// 服务端日志（管理端「服务日志」页）：读的是服务端自己的按天日志文件。
 		// 仅超级管理员——日志含内部实现细节，且只有管理员才需要对服务端排障。

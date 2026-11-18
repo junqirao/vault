@@ -197,17 +197,24 @@ func toGameDTOs(games []domain.Game) []gameDTO {
 //
 // 刻意不包含 install_dir / last_error 等内部字段，也不包含 Steam 账号信息。
 type catalogGameDTO struct {
-	ID               string  `json:"id"`
-	GroupID          string  `json:"group_id"`
-	RepoID           string  `json:"repo_id"`
-	AppID            int64   `json:"app_id"`
-	AppName          string  `json:"app_name"`
-	BuildID          string  `json:"build_id"`
-	AvailableBuildID string  `json:"available_build_id"`
-	TargetPlatform   string  `json:"target_platform"`
-	Status           string  `json:"status"`
-	LastUpdatedAt    int64   `json:"last_updated_at"`
-	Repo             repoDTO `json:"repo"`
+	ID               string `json:"id"`
+	GroupID          string `json:"group_id"`
+	RepoID           string `json:"repo_id"`
+	AppID            int64  `json:"app_id"`
+	AppName          string `json:"app_name"`
+	BuildID          string `json:"build_id"`
+	AvailableBuildID string `json:"available_build_id"`
+	TargetPlatform   string `json:"target_platform"`
+	Status           string `json:"status"`
+	// 实时更新进度：普通用户也要能在存储库列表里看到同一个下载进度。
+	ProgressPercent    float64 `json:"progress_percent"`
+	ProgressPhase      string  `json:"progress_phase"`
+	ProgressStage      string  `json:"progress_stage"`
+	ProgressBytesDone  int64   `json:"progress_bytes_done"`
+	ProgressBytesTotal int64   `json:"progress_bytes_total"`
+	ProgressSpeed      int64   `json:"progress_speed"`
+	LastUpdatedAt      int64   `json:"last_updated_at"`
+	Repo               repoDTO `json:"repo"`
 }
 
 type catalogGroupDTO struct {
@@ -240,6 +247,9 @@ func toGameCatalogDTOs(items []app.GameCatalogItem) []catalogGroupDTO {
 			ID: game.ID, GroupID: game.GroupID, AppID: game.AppID, AppName: game.AppName,
 			BuildID: game.BuildID, AvailableBuildID: game.AvailableBuildID,
 			TargetPlatform: game.TargetPlatform, Status: game.Status,
+			ProgressPercent: item.Progress.Percent, ProgressPhase: item.Progress.Phase,
+			ProgressStage: item.Progress.Stage, ProgressBytesDone: item.Progress.BytesDone,
+			ProgressBytesTotal: item.Progress.BytesTotal, ProgressSpeed: item.Progress.SpeedBytesPerSec,
 			LastUpdatedAt: game.LastUpdatedAt, Repo: repoDTO,
 		}
 		if game.RepoID != nil {

@@ -485,6 +485,31 @@ func DescribeFields() []FieldDef {
 			Editable: true,
 			Default:  "",
 		},
+		// ---- 服务端自更新（GitHub Release） ----
+		{
+			Key: "update.server_auto_check", Section: "update", Kind: KindBool, path: []string{"Update", "ServerAutoCheck"},
+			Desc:     "是否在后台周期性检查服务端更新；关闭时仍可在系统设置里手动检查。",
+			Editable: true,
+			Default:  false,
+		},
+		{
+			Key: "update.server_check_interval", Section: "update", Kind: KindDuration, path: []string{"Update", "ServerCheckInterval"},
+			Desc:     "后台检查服务端更新的周期（如 6h）；留空默认 6h。",
+			Editable: true,
+			Default:  "6h",
+		},
+		{
+			Key: "update.restart_mode", Section: "update", Kind: KindString, path: []string{"Update", "RestartMode"},
+			Desc:     "服务端替换后的重启方式：auto / helper / systemd / manual。",
+			Editable: true,
+			Default:  "auto",
+		},
+		{
+			Key: "update.systemd_unit", Section: "update", Kind: KindString, path: []string{"Update", "SystemdUnit"},
+			Desc:     "systemd 托管时的 unit 名（auto 模式检测到 systemd 时使用）。",
+			Editable: true,
+			Default:  "vault-server.service",
+		},
 
 		// ---- steam ----
 		{

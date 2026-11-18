@@ -202,6 +202,10 @@ def print_publish_hint(out_dir: Path, release: dict, artifacts: list[Path], note
     )
     flags = " --prerelease" if release["channel"] != "stable" else ""
     files = " ".join(f'"{p}"' for p in artifacts)
+    if (out_dir / "SHA256SUMS.txt").is_file():
+        files += f' "{out_dir / "SHA256SUMS.txt"}"'
+    if (out_dir / "release.json").is_file():
+        files += f' "{out_dir / "release.json"}"'
     info("\n产物已就绪。可手动上传，或执行：")
     info(
         f'gh release create {tag} {files} '
@@ -354,8 +358,11 @@ def publish_release(out_dir: Path, release: dict, artifacts: list[Path], notes: 
         )
         info(f"  已存在 Release：{tag}，刷新说明与附件")
 
-    # 要上传的附件：两个 zip + 校验文件（notes 已作为 Release 正文）。
+    # 要上传的附件：两个 zip + 校验文件 + 机器可读的发布元数据。
     files = list(artifacts) + [out_dir / "SHA256SUMS.txt"]
+    release_meta = out_dir / "release.json"
+    if release_meta.is_file():
+        files.append(release_meta)
     names = {path.name for path in files}
     for asset in rel.get("assets", []):
         if asset.get("name") in names:
@@ -443,11 +450,31 @@ def main(argv: list[str] | None = None) -> int:
     (out_dir / "SHA256SUMS.txt").write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
     notes = write_notes(out_dir, release, internal, artifacts)
 
+    # 机器可读的发布元数据：服务端自更新可以据此知道公开版本、通道与内部构建号。
+    # 不放进 SHA256SUMS.txt（校验文件不能包含自身的摘要），但会作为 Release 附件上传。
+    release_meta = {
+        "version": display_version(release),
+        "base_version": release["version"],
+        "channel": release["channel"],
+        "internal_version": internal,
+        "tag": tag,
+        "commit": git_commit(),
+        "published_at": int(time.time()),
+        "assets": [
+            {"name": path.name, "size": path.stat().st_size, "sha256": sha256(path)}
+            for path in artifacts
+        ],
+    }
+    (out_dir / "release.json").write_text(
+        json.dumps(release_meta, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+
     info("\nRelease 产物：")
     for path in artifacts:
         info(f"  {path.name}  ({human_size(path.stat().st_size)})")
     info(f"  {notes.name}")
     info(f"  SHA256SUMS.txt")
+    info(f"  release.json")
     print_publish_hint(out_dir, release, artifacts, notes)
     if args.publish:
         publish_release(out_dir, release, artifacts, notes, args.draft)

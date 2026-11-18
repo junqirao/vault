@@ -50,6 +50,8 @@ import { PerformanceMonitor } from './PerformanceMonitor'
 import { CacheOverview } from './CacheOverview'
 import { StorageUsageCard } from '../storage/StorageUsage'
 import { isPlaceholderRepoId, uploadPlaceholderRepo } from './uploadView'
+import { steamUpdateProgress } from '../steam/steamUpdateProgress'
+import type { SteamUpdateProgress } from '../steam/steamUpdateProgress'
 
 export interface RepoListProps {
   isSuperAdmin: boolean
@@ -104,6 +106,8 @@ interface RepoListEntry {
   upload?: UploadState
   /** Steam 游戏库对应的 AppID：用于在列表行左侧显示应用图标。 */
   steamAppID?: number
+  /** Steam 游戏正在下载/更新时的进度：在用量格原位置显示下载进度。 */
+  steamUpdate?: SteamUpdateProgress
 }
 
 /** 用户端展示形式：卡片网格（默认，一眼扫过多块盘）/ 整页宽度的列表（一库一行，便于横向比对）。 */
@@ -533,7 +537,7 @@ function RepoSection({
       {title || headerExtra ? <RepoGroupHeader title={title} count={items.length} extra={headerExtra} /> : null}
       {viewMode === 'card' ? (
         <Row gutter={[spacing.md, spacing.md]}>
-          {visible.map(({ repo, upload, steamAppID }) => (
+          {visible.map(({ repo, upload, steamAppID, steamUpdate }) => (
             <Col key={repo.id} xs={24} sm={12} xl={8} xxl={6}>
               <RepoCard
                 repo={repo}
@@ -544,6 +548,7 @@ function RepoSection({
                 showConfigure={showConfigure}
                 showMountActions={showMountActions}
                 steamAppID={steamAppID}
+                steamUpdate={steamUpdate}
                 onOpen={onOpen}
                 onConfigure={onConfigure}
               />
@@ -552,7 +557,7 @@ function RepoSection({
         </Row>
       ) : (
         <Space direction="vertical" size={spacing.sm} style={{ width: '100%' }}>
-          {visible.map(({ repo, upload, steamAppID }) => (
+          {visible.map(({ repo, upload, steamAppID, steamUpdate }) => (
             <RepoRow
               key={repo.id}
               repo={repo}
@@ -563,6 +568,7 @@ function RepoSection({
               showConfigure={showConfigure}
               showMountActions={showMountActions}
               steamAppID={steamAppID}
+              steamUpdate={steamUpdate}
               onOpen={onOpen}
               onConfigure={onConfigure}
             />
@@ -1440,6 +1446,17 @@ export function RepoList({
     }
     return map
   }, [steamCatalogGroups])
+  // 正在更新的游戏：把同一条下载进度同步到存储库列表（与游戏分组页同一个元素）。
+  const steamUpdateByRepoID = useMemo(() => {
+    const map = new Map<string, SteamUpdateProgress>()
+    for (const group of steamCatalogGroups) {
+      for (const game of group.games) {
+        if (game.status !== 'updating') continue
+        map.set(game.repo.id, steamUpdateProgress(game, t))
+      }
+    }
+    return map
+  }, [steamCatalogGroups, t])
 
   const usersQuery = useQuery({
     queryKey: ['users', 'options'],
@@ -1510,7 +1527,8 @@ export function RepoList({
       return {
         repo: next,
         upload: upload && next.state !== 'active' ? upload : undefined,
-        steamAppID: steamAppIDByRepoID.get(next.id)
+        steamAppID: steamAppIDByRepoID.get(next.id),
+        steamUpdate: steamUpdateByRepoID.get(next.id)
       }
     })
 
@@ -1530,12 +1548,16 @@ export function RepoList({
         if (knownRepoIDs.has(game.repo.id)) continue
         knownRepoIDs.add(game.repo.id)
         // 目录接口的库不代表当前用户可管理；标记为只读，详情页据此收起管理入口。
-        merged.push({ repo: { ...game.repo, permission: game.repo.permission ?? 'read' }, steamAppID: game.app_id })
+        merged.push({
+          repo: { ...game.repo, permission: game.repo.permission ?? 'read' },
+          steamAppID: game.app_id,
+          steamUpdate: steamUpdateByRepoID.get(game.repo.id)
+        })
       }
     }
 
     return merged
-  }, [reposQuery.data, activeUploads, user?.id, agent.repoEvents, steamCatalogGroups, steamAppIDByRepoID])
+  }, [reposQuery.data, activeUploads, user?.id, agent.repoEvents, steamCatalogGroups, steamAppIDByRepoID, steamUpdateByRepoID])
 
   // 搜索统一在这里做：名称或分组名命中都算。总览里按命中结果重新分组展示，
   // 进入某个分组后只在这一个分组内过滤 —— 两处用的是同一套匹配规则。

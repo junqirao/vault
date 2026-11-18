@@ -27,6 +27,8 @@ import { diffUsageAsVolume, RepoUsageTooltip, useRepoDiffUsage } from './RepoUsa
 import { preparePercent, prepareValue } from './repoPrepareView'
 import { isPlaceholderRepoId, repoStateValue, uploadPercent } from './uploadView'
 import { SteamAppIcon } from '../steam/SteamAppIcon'
+import { SteamUpdateMeter } from '../steam/SteamUpdateMeter'
+import type { SteamUpdateProgress } from '../steam/steamUpdateProgress'
 
 export interface RepoCardProps {
   repo: RepoDTO
@@ -66,6 +68,8 @@ export interface RepoCardProps {
   showMountActions?: boolean
   /** Steam AppID：显示应用图标。 */
   steamAppID?: number
+  /** Steam 游戏正在下载/更新：用量格原位置改报下载进度（与游戏分组页同一个元素）。 */
+  steamUpdate?: SteamUpdateProgress
 }
 
 /**
@@ -259,6 +263,7 @@ function RepoUsage({
   usage,
   loading = false,
   upload,
+  steamUpdate,
   style
 }: {
   repo: RepoDTO
@@ -270,6 +275,8 @@ function RepoUsage({
   loading?: boolean
   /** 本机正在上传这个库：这一格改报上传进度。 */
   upload?: UploadState
+  /** Steam 游戏正在下载/更新：这一格改报下载进度。 */
+  steamUpdate?: SteamUpdateProgress
   style?: CSSProperties
 }): JSX.Element {
   const { t } = useI18n()
@@ -286,6 +293,8 @@ function RepoUsage({
   )
   if (repo.state === 'moving' && repo.move) return <RepoMoveProgress repo={repo} style={style} />
   if (upload) return <RepoProgress upload={upload} style={style} />
+  // Steam 游戏更新：同一格改报下载进度；位置/宽度/行高与用量格完全一致。
+  if (steamUpdate) return <SteamUpdateMeter progress={steamUpdate} style={style} />
   // 从服务端目录导入 / 预创建池位：**复用「已用」这一格**报进度，不再另起一条进度条。
   // 与本机上传同一个位置、同一个形状，行高与别的库一致；母盘拷贝阶段还能给出
   // "已写入 / 总量"，不再只显示"0/1"。
@@ -787,6 +796,7 @@ function RepoMountCard({
   showConfigure,
   showMountActions,
   steamAppID,
+  steamUpdate,
   onOpen,
   onConfigure
 }: RepoCardProps): JSX.Element {
@@ -827,6 +837,7 @@ function RepoMountCard({
         usage={mountController.usage}
         loading={mountController.usageLoading}
         upload={upload}
+        steamUpdate={steamUpdate}
         style={{ marginTop: spacing.md }}
       />
 
@@ -875,6 +886,7 @@ function RepoMountRow({
   showConfigure,
   showMountActions,
   steamAppID,
+  steamUpdate,
   onOpen,
   onConfigure
 }: RepoCardProps): JSX.Element {
@@ -919,6 +931,7 @@ function RepoMountRow({
           usage={mountController.usage}
           loading={mountController.usageLoading}
           upload={upload}
+          steamUpdate={steamUpdate}
           style={{ flex: '0 0 auto', width: 276 }}
         />
 

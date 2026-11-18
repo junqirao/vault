@@ -468,11 +468,12 @@ func (s *SteamGameService) DeleteGame(ctx context.Context, id, operatorID string
 	return nil
 }
 
-// GameCatalogItem 是面向普通用户的游戏目录项：组 + 游戏 + 可挂载的共享库。
+// GameCatalogItem 是面向普通用户的游戏目录项：组 + 游戏 + 可挂载的共享库 + 实时更新进度。
 type GameCatalogItem struct {
-	Group *domain.RepoGroup
-	Game  *domain.Game
-	Repo  *domain.Repository
+	Group    *domain.RepoGroup
+	Game     *domain.Game
+	Repo     *domain.Repository
+	Progress SteamGameProgress
 }
 
 // Catalog 返回当前用户可见的 Steam 游戏库。
@@ -513,7 +514,9 @@ func (s *SteamGameService) Catalog(ctx context.Context, userID string, isSuperAd
 			if !repo.IsShared() {
 				continue
 			}
-			out = append(out, GameCatalogItem{Group: g, Game: game, Repo: repo})
+			out = append(out, GameCatalogItem{
+				Group: g, Game: game, Repo: repo, Progress: s.Progress(game.ID),
+			})
 		}
 	}
 	return out, nil
