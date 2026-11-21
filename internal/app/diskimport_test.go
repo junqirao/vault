@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"encoding/binary"
 	"io"
 	"log/slog"
 	"os"
@@ -80,6 +81,63 @@ func writeDiskMeta(t *testing.T, vhdxPath string, meta DiskMetaFile) {
 	if err := writeDiskMetaFile(vhdxPath, meta); err != nil {
 		t.Fatalf("写元数据失败：%v", err)
 	}
+}
+
+// writeFakeVHDX 造一个带合法 VHDX 头部的最小文件（只有区域表与元数据区域）。
+//
+// 与 internal/platform/vhdx 的单测同一套布局：这里要验证的是"导入扫描有没有把
+// VHDX 头部里的标称容量读出来"，不是再测一遍解析器。
+func writeFakeVHDX(t *testing.T, dir, name string, physicalSize, virtualSize int64) string {
+	t.Helper()
+
+	const (
+		regionTableOffset  = 192 * 1024
+		metadataOffset     = 512 * 1024
+		metadataLength     = 64 * 1024
+		regionTableHeader  = 16
+		metadataHeaderSize = 32
+	)
+	// 区域表里的元数据区域 GUID 与元数据项里的 VirtualDiskSize GUID（文件字节序）。
+	metadataRegionGUID := []byte{
+		0x06, 0xA2, 0x7C, 0x8B, 0x90, 0x47, 0x9A, 0x4B,
+		0xB8, 0xFE, 0x57, 0x5F, 0x05, 0x0F, 0x88, 0x6E,
+	}
+	virtualSizeGUID := []byte{
+		0x24, 0x42, 0xA5, 0x2F, 0x1B, 0xCD, 0x76, 0x48,
+		0xB2, 0x11, 0x5D, 0xBE, 0xD8, 0x3B, 0xF4, 0xB8,
+	}
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("建目录失败：%v", err)
+	}
+	buf := make([]byte, metadataOffset+metadataLength)
+	copy(buf[0:], "vhdxfile")
+	copy(buf[regionTableOffset:], "regi")
+	binary.LittleEndian.PutUint32(buf[regionTableOffset+8:], 1)
+	entry := buf[regionTableOffset+regionTableHeader:]
+	copy(entry[0:16], metadataRegionGUID)
+	binary.LittleEndian.PutUint64(entry[16:24], metadataOffset)
+	binary.LittleEndian.PutUint32(entry[24:28], metadataLength)
+
+	copy(buf[metadataOffset:], "metadata")
+	binary.LittleEndian.PutUint16(buf[metadataOffset+10:], 1)
+	item := buf[metadataOffset+metadataHeaderSize:]
+	copy(item[0:16], virtualSizeGUID)
+	binary.LittleEndian.PutUint32(item[16:20], 0x100)
+	binary.LittleEndian.PutUint32(item[20:24], 8)
+	binary.LittleEndian.PutUint64(buf[metadataOffset+0x100:], uint64(virtualSize))
+
+	p := filepath.Join(dir, name)
+	if err := os.WriteFile(p, buf, 0o644); err != nil {
+		t.Fatalf("写 VHDX 失败：%v", err)
+	}
+	// 稀疏地把文件"撑"到给定的物理大小，模拟真实 VHDX（结构只在前 576KiB）。
+	if physicalSize > int64(len(buf)) {
+		if err := os.Truncate(p, physicalSize); err != nil {
+			t.Fatalf("扩展文件大小失败：%v", err)
+		}
+	}
+	return p
 }
 
 // TestScanDiskImportsClassifiesCandidates 锁定导入页面的候选口径：
@@ -169,6 +227,38 @@ func TestScanDiskImportsClassifiesCandidates(t *testing.T) {
 		t.Fatal("已登记的盘也应出现在候选里（用户要确认盘是不是都搬过来了）")
 	} else if !c.Registered || c.Importable || c.SkipReason != DiskImportSkipRegistered {
 		t.Fatalf("已登记的盘应标为已存在并跳过：%+v", c)
+	}
+}
+
+// TestScanDiskImportsReadsVHDXVirtualSize 锁定"没有 sidecar 也不靠文件大小猜"：
+//
+// VHDX 头部里就写着标称容量，它才是客户端按容量匹配磁盘时用的值。文件大小只是
+// 稀疏文件在宿主卷上的占用（本例刻意让两者差很多），拿它当容量会让库永远挂不上。
+func TestScanDiskImportsReadsVHDXVirtualSize(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	app, _ := newImportTestApp(t, root)
+
+	virtualSize := int64(198870176638) // 非 1MiB 对齐：客户端按这个值也匹配不到真实磁盘，但至少来自头部
+	physicalSize := int64(1 << 20)     // 稀疏文件在宿主卷上的占用，与标称容量无关
+	path := writeFakeVHDX(t, filepath.Join(root, "disks", "standalone", "s1"), "disk.vhdx", physicalSize, virtualSize)
+
+	scan, err := app.ScanDiskImports(ctx)
+	if err != nil {
+		t.Fatalf("扫描导入候选失败：%v", err)
+	}
+	if len(scan.Candidates) != 1 {
+		t.Fatalf("应有 1 条候选，实际=%+v", scan.Candidates)
+	}
+	got := scan.Candidates[0]
+	if got.Path != path {
+		t.Fatalf("候选路径不对：%q", got.Path)
+	}
+	if got.SuggestedCapacityBytes != virtualSize || got.CapacitySource != DiskImportCapacityVHDX {
+		t.Fatalf("容量应取自 VHDX 头部（vhdx），实际=%d/%s", got.SuggestedCapacityBytes, got.CapacitySource)
+	}
+	if got.SizeBytes != physicalSize {
+		t.Fatalf("展示用的文件大小仍应是物理占用，实际=%d", got.SizeBytes)
 	}
 }
 
@@ -427,26 +517,31 @@ func TestImportDisksSuffixesConflictingName(t *testing.T) {
 	}
 }
 
-// TestImportDiskCapacityPriority 覆盖容量取值优先级：请求显式填 > 元数据 > 文件大小。
+// TestImportDiskCapacityPriority 覆盖容量取值优先级：请求显式填 > 元数据 > VHDX 头部 > 文件大小。
 //
-// 容量是导入里最要命的字段（客户端按容量精确匹配本地盘），因此"谁能覆盖谁"必须有确定的次序。
+// 容量是导入里最要命的字段（客户端按容量精确匹配本地盘），因此"谁能覆盖谁"必须有确定的次序，
+// 并且文件大小只能排最后 —— 它只是稀疏文件在宿主卷上的占用，和标称容量没有对应关系。
 func TestImportDiskCapacityPriority(t *testing.T) {
 	fileSize := int64(4096)
+	virtualSize := int64(64 << 30)
 	meta := &DiskMetaFile{CapacityBytes: 1 << 30}
 
-	if got, src := pickImportCapacity(DiskImportItem{CapacityBytes: 2 << 30}, meta, fileSize); got != 2<<30 || src != DiskImportCapacityManual {
+	if got, src := pickImportCapacity(DiskImportItem{CapacityBytes: 2 << 30}, meta, fileSize, virtualSize); got != 2<<30 || src != DiskImportCapacityManual {
 		t.Fatalf("请求填的容量应优先，实际=%d/%s", got, src)
 	}
-	if got, src := pickImportCapacity(DiskImportItem{}, meta, fileSize); got != 1<<30 || src != DiskImportCapacityMeta {
+	if got, src := pickImportCapacity(DiskImportItem{}, meta, fileSize, virtualSize); got != 1<<30 || src != DiskImportCapacityMeta {
 		t.Fatalf("其次用元数据里的容量，实际=%d/%s", got, src)
 	}
-	if got, src := pickImportCapacity(DiskImportItem{}, nil, fileSize); got != fileSize || src != DiskImportCapacityFile {
+	if got, src := pickImportCapacity(DiskImportItem{}, nil, fileSize, virtualSize); got != virtualSize || src != DiskImportCapacityVHDX {
+		t.Fatalf("没有元数据时应读 VHDX 头部的标称容量，实际=%d/%s", got, src)
+	}
+	if got, src := pickImportCapacity(DiskImportItem{}, nil, fileSize, 0); got != fileSize || src != DiskImportCapacityFile {
 		t.Fatalf("最后按文件大小估，实际=%d/%s", got, src)
 	}
-	if got, src := pickImportCapacity(DiskImportItem{}, nil, 0); got != 0 || src != DiskImportCapacityFile {
+	if got, src := pickImportCapacity(DiskImportItem{}, nil, 0, 0); got != 0 || src != DiskImportCapacityFile {
 		t.Fatalf("没有任何来源时应为 0 并由调用方判失败，实际=%d/%s", got, src)
 	}
-	if got, _ := pickImportCapacity(DiskImportItem{CapacityBytes: 3 << 30}, nil, fileSize); got != 3<<30 {
+	if got, _ := pickImportCapacity(DiskImportItem{CapacityBytes: 3 << 30}, nil, fileSize, virtualSize); got != 3<<30 {
 		t.Fatalf("没有元数据时请求填的值仍应生效，实际=%d", got)
 	}
 }

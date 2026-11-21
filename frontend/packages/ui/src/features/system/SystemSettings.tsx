@@ -29,7 +29,14 @@ export function SystemSettings({ isSuperAdmin }: SystemSettingsProps): JSX.Eleme
   const [renameOpen, setRenameOpen] = useState(false)
   const [renameForm] = Form.useForm<{ server_name: string }>()
 
-  const infoQuery = useQuery({ queryKey: ['system-info'], queryFn: () => api.systemInfo() })
+  const infoQuery = useQuery({
+    queryKey: ['system-info'],
+    queryFn: () => api.systemInfo(),
+    // 发布版本/服务端版本会在自更新重启后变化：进入页面时永远重新取一次，
+    // 不能被上一次访问留下的 React Query 缓存挡住（真实反馈：更新完成后版本卡片仍显示旧值）。
+    staleTime: 0,
+    refetchOnMount: 'always'
+  })
   const settingsQuery = useQuery({ queryKey: ['system-settings'], queryFn: () => api.settings(), enabled: isSuperAdmin })
   const healthQuery = useQuery({ queryKey: ['system-health'], queryFn: () => api.systemHealth() })
   const storagesQuery = useQuery({ queryKey: ['storages', 'list'], queryFn: () => api.listStorages() })

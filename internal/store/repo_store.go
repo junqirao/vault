@@ -626,6 +626,21 @@ func (s *Store) UpdateDiskPath(ctx context.Context, id, path string) error {
 	return mustAffect(res, apperr.DiskNotFound().WithArg("id", id))
 }
 
+// UpdateDiskSize 只更新磁盘的标称容量。
+//
+// 单独一个方法而不是走 UpdateDisk：调用点只想纠正容量（例如导入时按文件大小猜错了，
+// 挂载前从 VHDX 头部读到真实值），而 UpdateDisk 是全量写回可变字段，会顺手覆盖
+// 同一时刻别处正在改的 state/desired_state。
+func (s *Store) UpdateDiskSize(ctx context.Context, id string, sizeBytes int64) error {
+	res, err := s.q.ExecContext(ctx,
+		s.q.Rebind(`UPDATE disks SET size_bytes = ?, updated_at = ? WHERE id = ?`),
+		sizeBytes, nowMillis(), id)
+	if err != nil {
+		return fmt.Errorf("store: 更新磁盘容量失败: %w", err)
+	}
+	return mustAffect(res, apperr.DiskNotFound().WithArg("id", id))
+}
+
 // UpdateDisk 覆盖更新磁盘的可变字段。
 func (s *Store) UpdateDisk(ctx context.Context, d *domain.Disk) error {
 	d.UpdatedAt = nowMillis()

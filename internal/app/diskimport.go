@@ -12,6 +12,7 @@ import (
 	"vault/internal/apperr"
 	"vault/internal/domain"
 	"vault/internal/platform"
+	"vault/internal/platform/vhdx"
 	"vault/internal/store"
 )
 
@@ -75,6 +76,11 @@ const (
 	DiskImportCapacityMeta = "meta"
 	// DiskImportCapacityManual 管理员在导入界面上填的。
 	DiskImportCapacityManual = "manual"
+	// DiskImportCapacityVHDX 直接读 VHDX 头部里的标称容量（VirtualDiskSize），**权威**。
+	//
+	// 客户端按容量精确匹配磁盘，这个值必须与 Windows 报告的磁盘大小一致；
+	// 文件大小只是稀疏文件在宿主卷上的占用，两者没有对应关系。
+	DiskImportCapacityVHDX = "vhdx"
 	// DiskImportCapacityFile 按**文件大小**估的。VHDX 是稀疏文件，这个值几乎必然偏小，
 	// 界面必须显著提示：容量对不上，客户端会匹配不到盘。
 	DiskImportCapacityFile = "file"
@@ -117,7 +123,7 @@ type DiskImportCandidate struct {
 	SuggestedName string `json:"suggested_name"`
 	// SuggestedCapacityBytes 建议的标称容量（见 CapacitySource）。
 	SuggestedCapacityBytes int64 `json:"suggested_capacity_bytes"`
-	// CapacitySource meta / manual / file（见 DiskImportCapacity*）。
+	// CapacitySource meta / manual / vhdx / file（见 DiskImportCapacity*）。
 	CapacitySource string `json:"capacity_source"`
 }
 
@@ -146,7 +152,7 @@ type DiskImportItem struct {
 	Name string `json:"name,omitempty"`
 	// Note 说明备注；空则用元数据里的备注。
 	Note string `json:"note,omitempty"`
-	// CapacityBytes 标称容量（字节）；0 则用元数据里的容量，再退到文件大小。
+	// CapacityBytes 标称容量（字节）；0 则依次用元数据、VHDX 头部、文件大小。
 	CapacityBytes int64 `json:"capacity_bytes,omitempty"`
 }
 
@@ -292,7 +298,8 @@ func (a *App) importCandidate(p, root, disksRoot string, fi os.FileInfo, dbPaths
 		c.Meta = meta
 	}
 	c.SuggestedName = pickImportName(DiskImportItem{}, meta, p)
-	c.SuggestedCapacityBytes, c.CapacitySource = pickImportCapacity(DiskImportItem{}, meta, fi.Size())
+	c.SuggestedCapacityBytes, c.CapacitySource = pickImportCapacity(
+		DiskImportItem{}, meta, fi.Size(), vhdxVirtualSize(p))
 
 	// 不可导入的情形按"用户最该先解决哪个"排序：已登记（无需处理）→ 差异盘（不能处理）
 	// → 元数据坏了 / 无容量（可以处理）。路径合法性在扫描阶段必然成立（文件就是从白名单
@@ -346,20 +353,35 @@ func pickImportName(item DiskImportItem, meta *DiskMetaFile, abs string) string 
 
 // pickImportCapacity 决定标称容量与它的可信度（见 DiskImportCapacity*）。
 //
-// 优先级：请求里显式填的 > sidecar 里的 > 文件大小（估）。
-// 前两者是"有人知道真实值"，最后一个是"只能猜"——VHDX 稀疏，猜出来的通常偏小，
-// 因此必须把来源一路传到界面，让用户知道哪个数字需要复核。
-func pickImportCapacity(item DiskImportItem, meta *DiskMetaFile, fileSize int64) (int64, string) {
+// 优先级：请求里显式填的 > sidecar 里的 > VHDX 头部里的 > 文件大小（估）。
+// 前三者是"有人知道真实值"（VHDX 头部就是权威值），最后一个是"只能猜"——VHDX 稀疏，
+// 猜出来的通常偏小且**无法对齐**，客户端按容量精确匹配时会永远找不到盘。
+// 因此 capacity source 必须一路传到界面：`file` 需要用户复核，其余可以放心。
+func pickImportCapacity(item DiskImportItem, meta *DiskMetaFile, fileSize, virtualSize int64) (int64, string) {
 	if item.CapacityBytes > 0 {
 		return item.CapacityBytes, DiskImportCapacityManual
 	}
 	if meta != nil && meta.CapacityBytes > 0 {
 		return meta.CapacityBytes, DiskImportCapacityMeta
 	}
+	if virtualSize > 0 {
+		return virtualSize, DiskImportCapacityVHDX
+	}
 	if fileSize > 0 {
 		return fileSize, DiskImportCapacityFile
 	}
 	return 0, DiskImportCapacityFile
+}
+
+// vhdxVirtualSize 读 VHDX 头部里的标称容量；读不到（不是 VHDX / 文件损坏）返回 0。
+//
+// 解析失败绝不阻断导入：退回"文件大小估算"仍可导入，只是界面要提示复核。
+func vhdxVirtualSize(path string) int64 {
+	size, err := vhdx.VirtualSize(path)
+	if err != nil {
+		return 0
+	}
+	return size
 }
 
 // importFileSystem 决定盘的文件系统：元数据里写了且合法就用它，否则按默认客户端系统（NTFS）。
@@ -534,7 +556,7 @@ func (a *App) importOneDisk(ctx context.Context, guards domain.PathGuardSet, dbP
 	}
 
 	name := pickImportName(item, meta, abs)
-	capacity, capacitySource := pickImportCapacity(item, meta, fi.Size())
+	capacity, capacitySource := pickImportCapacity(item, meta, fi.Size(), vhdxVirtualSize(abs))
 	if capacity <= 0 {
 		return nil, nil, &DiskImportFailure{Path: abs, Code: DiskImportFailCapacity}
 	}

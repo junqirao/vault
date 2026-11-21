@@ -8,6 +8,7 @@ import { MemoryRouter, Route, Routes, useParams } from 'react-router-dom'
 import {
   ApiProvider,
   AuthProvider,
+  GameGroupsPage,
   PerformancePage,
   RepoDetail,
   RepoList,
@@ -40,16 +41,23 @@ window.localStorage.setItem('vault.sidebar.collapsed', '1')
 
 const initialPath =
   screen === 'detail' || screen === 'disks'
-    ? '/repos/repo-steam'
+    ? '/repos/repo-nebula'
     : screen === 'admin' || screen === 'storages'
       ? '/admin/storages'
       : screen === 'users'
         ? '/admin/users'
         : screen === 'performance'
           ? '/performance'
-          : '/my-repos'
+          : screen === 'steam'
+            ? '/admin/game-groups'
+            : screen === 'steam-detail'
+              ? '/admin/game-groups?group=grp-nebula'
+              : '/my-repos'
 
-const mode = screen === 'admin' || screen === 'users' || screen === 'storages' ? 'admin' : 'app'
+const mode =
+  screen === 'admin' || screen === 'users' || screen === 'storages' || screen === 'steam' || screen === 'steam-detail'
+    ? 'admin'
+    : 'app'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -60,10 +68,10 @@ const queryClient = new QueryClient({
 const serverConfig: ServerConfigValue = {
   servers: [
     {
-      key: 'srv-vault',
+      key: 'srv-demo',
       baseUrl: 'http://127.0.0.1:5173',
-      serverName: 'WIN-E095H11JSS',
-      instanceId: 'srv-vault',
+      serverName: 'VAULT-DEMO-01',
+      instanceId: 'srv-demo',
       autoConnect: true,
       token: 'demo-token',
       tokenExpiresAt: Date.now() + 12 * 3600 * 1000,
@@ -72,12 +80,12 @@ const serverConfig: ServerConfigValue = {
       role: 'super_admin'
     }
   ],
-  activeKey: 'srv-vault',
+  activeKey: 'srv-demo',
   active: {
-    key: 'srv-vault',
+    key: 'srv-demo',
     baseUrl: 'http://127.0.0.1:5173',
-    serverName: 'WIN-E095H11JSS',
-    instanceId: 'srv-vault',
+    serverName: 'VAULT-DEMO-01',
+    instanceId: 'srv-demo',
     autoConnect: true,
     token: 'demo-token',
     tokenExpiresAt: Date.now() + 12 * 3600 * 1000,
@@ -97,7 +105,7 @@ function DemoRepoDetail(): JSX.Element {
   const { repoId } = useParams<{ repoId: string }>()
   return (
     <RepoDetail
-      repoId={repoId ?? 'repo-steam'}
+      repoId={repoId ?? 'repo-nebula'}
       isSuperAdmin
       currentUserId={demoUser.id}
       currentUserName={demoUser.username}
@@ -150,6 +158,7 @@ function DemoApp(): JSX.Element {
                     />
                     <Route path="/repos/:repoId" element={<DemoRepoDetail />} />
                     <Route path="/performance" element={<PerformancePage onBack={() => undefined} />} />
+                    <Route path="/admin/game-groups" element={<GameGroupsPage />} />
                     <Route path="/admin/storages" element={<StorageList onCreate={() => undefined} />} />
                     <Route path="/admin/users" element={<UserList />} />
                   </Route>

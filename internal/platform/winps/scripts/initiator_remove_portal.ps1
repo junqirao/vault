@@ -50,6 +50,12 @@ try {
     }
 
     $errors = @()
+    # 复核阶段的判定依据：
+    #   - sawNotFound：删除时系统明确回答"门户不存在"（ObjectNotFound）；
+    #   - realFailure：出现了"不存在"以外的真实失败（cmdlet 与 iscsicli 都没搞定）。
+    # 只有"见过 not found 且没有真实失败"时，复核仍列出条目才可判定为缓存残留。
+    $sawNotFound = $false
+    $realFailure = $false
     $iscsicli = Join-Path $env:SystemRoot 'System32\iscsicli.exe'
     foreach ($portal in $portals) {
         # 用管道传入门户对象，而不是回传 -TargetPortalAddress/-TargetPortalPortNumber：
@@ -64,12 +70,21 @@ try {
                 $lastError = $null
                 break
             } catch {
+                # "The specified portal was not found."：门户已经不存在了（并发清理、或
+                # Get-IscsiTargetPortal 返回的是缓存里的死条目）。这是**想要的终态**，不是失败。
+                # 文案随系统语言变化，按 ErrorCategory 判定（ObjectNotFound），不做文本匹配。
+                if ($_.CategoryInfo.Category -eq 'ObjectNotFound') {
+                    $sawNotFound = $true
+                    $lastError = $null
+                    break
+                }
                 $lastError = $_
                 if ($attempt -lt 2) { Start-Sleep -Milliseconds 250 }
             }
         }
         if (-not $lastError) { continue }
 
+        $realFailure = $true
         # cmdlet 彻底失败时用 iscsicli 兜底：上面那个"CIM 参数类型不匹配"是 cmdlet 自身
         # 的缺陷（管道传对象同样会撞上），而 iscsicli 直接调 MSiSCSI 服务，没有这层校验。
         # 删没删掉由下面的复核决定，这里不看 iscsicli 的输出（本地化文本不可解析）。
@@ -81,14 +96,27 @@ try {
     }
 
     # 复核：门户必须真的没了（避免"报成功却没删掉"）。
-    $remaining = @(Get-IscsiTargetPortal -ErrorAction SilentlyContinue | Where-Object {
-        $_.TargetPortalAddress -eq $PortalAddress -and [int]$_.TargetPortalPortNumber -eq $PortalPort
-    })
-    if ($remaining.Count -gt 0) {
+    #
+    # 但 Remove 之后 WMI 缓存可能还返回旧条目 —— 真实日志里出现过
+    # "仍有门户未移除：The specified portal was not found."：删除时明确报"门户不存在"，
+    # 复核却还能列出来，说明复核读到的是缓存。因此先刷新存储缓存，再给几拍退避重查；
+    # 删除本身是异步落盘的，一次查不到干净结果不代表失败。
+    $remaining = @()
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try { Update-HostStorageCache -ErrorAction Stop } catch { }
+        $remaining = @(Get-IscsiTargetPortal -ErrorAction SilentlyContinue | Where-Object {
+            $_.TargetPortalAddress -eq $PortalAddress -and [int]$_.TargetPortalPortNumber -eq $PortalPort
+        })
+        if ($remaining.Count -eq 0) { break }
+        if ($attempt -lt 3) { Start-Sleep -Milliseconds 300 }
+    }
+    $staleOnly = $sawNotFound -and (-not $realFailure)
+    if ($remaining.Count -gt 0 -and -not $staleOnly) {
+        $detail = if ($errors.Count -gt 0) { ($errors -join ' ; ') } else { '门户在刷新缓存后仍然存在' }
         [pscustomobject]@{
             ok      = $false
             reason  = 'remove_portal_failed'
-            message = ('仍有门户未移除：' + ($errors -join ' ; '))
+            message = ('仍有门户未移除：' + $detail)
             portal  = ($PortalAddress + ':' + $PortalPort)
         } | ConvertTo-Json -Compress -Depth 5
         exit 1
@@ -96,7 +124,7 @@ try {
 
     [pscustomobject]@{
         ok     = $true
-        action = 'removed'
+        action = $(if ($staleOnly -and $remaining.Count -gt 0) { 'removed_stale' } else { 'removed' })
         portal = ($PortalAddress + ':' + $PortalPort)
     } | ConvertTo-Json -Compress -Depth 5
 } catch {

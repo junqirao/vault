@@ -16,6 +16,11 @@ import {
   demoMounts,
   demoPerformance,
   demoRepos,
+  demoSteamAccounts,
+  demoSteamGames,
+  demoSteamGroups,
+  demoSteamIcon,
+  demoSteamLibrary,
   demoStorages,
   demoSystemInfo,
   demoUsage,
@@ -55,6 +60,40 @@ class DemoApi extends VaultApi {
     if (clean === '/v1/system/deps') return demoDepsReport as T
     if (clean === '/v1/system/pools') return { items: [], default_pool: '' } as T
     if (clean === '/v1/repos') return { items: demoRepos } as T
+    if (clean === '/v1/repo-groups') return { items: demoSteamGroups } as T
+    if (clean === '/v1/steam/accounts') return { items: demoSteamAccounts } as T
+    if (clean === '/v1/game-catalog') return { items: [] } as T
+
+    const groupGames = clean.match(/^\/v1\/repo-groups\/([^/]+)\/games$/)
+    if (groupGames) {
+      const groupID = decodeURIComponent(groupGames[1])
+      return { items: demoSteamGames.filter((game) => game.group_id === groupID) } as T
+    }
+    const groupCheck = clean.match(/^\/v1\/repo-groups\/([^/]+)\/check-updates$/)
+    if (groupCheck) {
+      const groupID = decodeURIComponent(groupCheck[1])
+      return { items: demoSteamGames.filter((game) => game.group_id === groupID) } as T
+    }
+    const gameOutput = clean.match(/^\/v1\/games\/([^/]+)\/output$/)
+    if (gameOutput) {
+      return {
+        items: [
+          'Loading Steam API...OK',
+          'Logging in as demo_steam_01...OK',
+          'Update state (0x61) downloading, progress: 62.40 (4939212390 / 7916483720)'
+        ]
+      } as T
+    }
+    const gameAction = clean.match(/^\/v1\/games\/([^/]+)\/(update|pause-update|stop-update)$/)
+    if (gameAction) {
+      const game = demoSteamGames.find((item) => item.id === decodeURIComponent(gameAction[1]))
+      return (game ?? demoSteamGames[0]) as T
+    }
+    const gameOne = clean.match(/^\/v1\/games\/([^/]+)$/)
+    if (gameOne) {
+      const game = demoSteamGames.find((item) => item.id === decodeURIComponent(gameOne[1]))
+      if (game) return game as T
+    }
 
     const repoSub = clean.match(/^\/v1\/repos\/([^/]+)\/(allocations|disks|members|diff-operation)$/)
     if (repoSub) {
@@ -113,6 +152,29 @@ function createStream(): AgentEventStream & { emit: (type: string, data: unknown
 }
 
 export function installDemoRuntime(): void {
+  // 浏览器没有 Electron preload；补一个最小 bridge，只提供 Steam 封面/图标读取，
+  // 让截图里的游戏图标来自本地生成的几何图形，而不是真实的 Steam 素材。
+  const demoBridge = {
+    getConfig: async () => demoAgentConfig,
+    setConfig: async () => true,
+    getAgent: async () => ({
+      available: true,
+      baseUrl: null,
+      version: '0.0.0-demo',
+      expectedVersion: '0.0.0-demo',
+      versionMismatch: false
+    }),
+    onAgentChanged: () => () => undefined,
+    openPath: async () => undefined,
+    showItemInFolder: async () => undefined,
+    quit: async () => undefined,
+    steamLocalLibrary: async () => demoSteamLibrary,
+    steamLocalIcon: async (appID: number) => demoSteamIcon(appID),
+    steamLocalImage: async () => null,
+    steamLibraries: async () => []
+  }
+  ;(window as unknown as { vault?: unknown }).vault = demoBridge
+
   // 顶栏延迟探针走的是渲染进程直连 fetch，拦一下让它显示一个稳定的 2ms。
   const originalFetch = window.fetch.bind(window)
   window.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Alert, Button, Descriptions, Modal, Progress, Space, Tag, Typography } from 'antd'
 import { CheckCircleOutlined, CloudDownloadOutlined, ReloadOutlined } from '@ant-design/icons'
+import { useQueryClient } from '@tanstack/react-query'
 
 import { useApi } from '../../api/provider'
 import type { ServerUpdateStatus } from '../../api/types'
@@ -14,6 +15,12 @@ import { formatBytes, formatTime } from '../../utils/format'
 const ACTIVE_POLL_MS = 1000
 /** 服务端重启后的探测间隔：慢一点，避免每次失败都刷错误。 */
 const RESTART_POLL_MS = 1500
+/**
+ * 「已更新到 x」的成功提示只在**这次更新刚完成**时展示：
+ * 页面停留期间看到更新结束，或结果发生在最近 10 分钟内。旧结果不再每次进页面都弹一遍。
+ * 失败结果仍保留（需要管理员处理），但可以手动关闭。
+ */
+const RECENT_SUCCESS_MS = 10 * 60 * 1000
 
 /**
  * 服务端自更新卡片（仅超级管理员可见）。
@@ -25,6 +32,7 @@ const RESTART_POLL_MS = 1500
 export function ServerUpdateCard(): JSX.Element {
   const api = useApi()
   const { t } = useI18n()
+  const queryClient = useQueryClient()
   const [status, setStatus] = useState<ServerUpdateStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
@@ -32,6 +40,12 @@ export function ServerUpdateCard(): JSX.Element {
   const [unsupported, setUnsupported] = useState(false)
   const [restarting, setRestarting] = useState(false)
   const restartingRef = useRef(false)
+  const lastReleaseRef = useRef<string>('')
+  // 页面停留期间是否亲眼看到一次更新结束（服务端重启回来 / applying → idle）。
+  const [completedDuringSession, setCompletedDuringSession] = useState(false)
+  const applyingSeenRef = useRef(false)
+  // 本次会话手动关闭过的结果（按结果指纹区分），关掉后不再反复弹出。
+  const [dismissedResult, setDismissedResult] = useState('')
 
   const refresh = useCallback(async (silent = false): Promise<ServerUpdateStatus | null> => {
     try {
@@ -39,10 +53,31 @@ export function ServerUpdateCard(): JSX.Element {
       setStatus(next)
       setUnsupported(false)
       setError(null)
-      if (restartingRef.current) {
+      const wasRestarting = restartingRef.current
+      if (wasRestarting && next.state !== 'applying' && next.state !== 'restarting') {
         // 服务端回来后，last_result/current version 会告诉我们结果。
         restartingRef.current = false
         setRestarting(false)
+        setCompletedDuringSession(true)
+      }
+      // 别的管理员发起 / 页面打开时正好在更新：同样认作"本次看到了结束"。
+      if (next.state === 'applying' || next.state === 'restarting') {
+        applyingSeenRef.current = true
+      } else if (applyingSeenRef.current) {
+        applyingSeenRef.current = false
+        setCompletedDuringSession(true)
+      }
+      const release = next.current.release_version
+      if (release && release !== lastReleaseRef.current) {
+        lastReleaseRef.current = release
+        // 服务端更新/重启后，“版本”卡片里的发布版本必须立刻跟着变，不能等下一次
+        // 手动刷新或页面重载。这里复用 React Query 缓存，只做一次主动失效。
+        void queryClient.invalidateQueries({ queryKey: ['system-info'] })
+        void queryClient.invalidateQueries({ queryKey: ['system-settings'] })
+        void queryClient.invalidateQueries({ queryKey: ['system-health'] })
+      } else if (wasRestarting && next.state !== 'applying' && next.state !== 'restarting') {
+        // 极端情况下 release_version 没变（例如同版本重装），仍然要刷新版本卡片。
+        void queryClient.invalidateQueries({ queryKey: ['system-info'] })
       }
       return next
     } catch (err) {
@@ -57,7 +92,7 @@ export function ServerUpdateCard(): JSX.Element {
     } finally {
       setLoading(false)
     }
-  }, [api])
+  }, [api, queryClient])
 
   useEffect(() => {
     void refresh()
@@ -119,9 +154,39 @@ export function ServerUpdateCard(): JSX.Element {
   const percent = progress && progress.percent >= 0 ? progress.percent : undefined
   const latest = status?.latest
   const manual = status?.restart_mode === 'manual'
+  const lastResult = status?.last_result
+  const resultKey = lastResult
+    ? `${lastResult.finished_at ?? 0}:${lastResult.to_version ?? ''}:${lastResult.ok}`
+    : ''
+  const recentSuccess = Boolean(
+    lastResult?.ok && lastResult.finished_at && Date.now() - lastResult.finished_at < RECENT_SUCCESS_MS
+  )
+  // 成功结果：只展示"页面期间刚完成"或"最近 10 分钟内完成"的那一次；
+  // 失败结果保留给管理员处理。两种情况都可以手动关闭，关掉后本次会话不再重复弹。
+  const showLastResult = Boolean(
+    lastResult &&
+      resultKey !== dismissedResult &&
+      (!lastResult.ok || completedDuringSession || recentSuccess)
+  )
+
+  const checkButton = (
+    <Button
+      size="small"
+      icon={<ReloadOutlined />}
+      loading={busy && status?.state !== 'downloading' && status?.state !== 'applying'}
+      disabled={busy || status?.state === 'downloading' || status?.state === 'applying' || status?.state === 'downloaded' || restarting}
+      onClick={() => void run(() => api.checkServerUpdate())}
+    >
+      {status?.state === 'checking' ? t('system.serverUpdate.checking') : t('system.serverUpdate.check')}
+    </Button>
+  )
 
   return (
-    <SectionCard title={t('system.serverUpdate.title')} loading={loading && !status}>
+    <SectionCard
+      title={t('system.serverUpdate.title')}
+      loading={loading && !status}
+      extra={unsupported ? undefined : checkButton}
+    >
       {unsupported ? (
         <Alert
           type="info"
@@ -172,17 +237,19 @@ export function ServerUpdateCard(): JSX.Element {
             />
           ) : null}
 
-          {status?.last_result ? (
+          {lastResult && showLastResult ? (
             <Alert
-              type={status.last_result.ok ? 'success' : 'warning'}
+              type={lastResult.ok ? 'success' : 'warning'}
               showIcon
-              icon={status.last_result.ok ? <CheckCircleOutlined /> : undefined}
+              closable
+              icon={lastResult.ok ? <CheckCircleOutlined /> : undefined}
+              onClose={() => setDismissedResult(resultKey)}
               message={
-                status.last_result.ok
-                  ? t('system.serverUpdate.lastSuccess', { version: status.last_result.to_version || '-' })
+                lastResult.ok
+                  ? t('system.serverUpdate.lastSuccess', { version: lastResult.to_version || '-' })
                   : t('system.serverUpdate.lastFailed', {
-                      error: status.last_result.error || t('common.failed'),
-                      time: status.last_result.finished_at ? formatTime(status.last_result.finished_at) : '-'
+                      error: lastResult.error || t('common.failed'),
+                      time: lastResult.finished_at ? formatTime(lastResult.finished_at) : '-'
                     })
               }
             />
@@ -252,40 +319,35 @@ export function ServerUpdateCard(): JSX.Element {
             <Alert type="warning" showIcon message={t('system.serverUpdate.manual')} />
           ) : null}
 
-          <Space size={spacing.sm} wrap>
-            <Button
-              icon={<ReloadOutlined />}
-              loading={busy && status?.state !== 'downloading'}
-              disabled={busy || status?.state === 'downloading' || status?.state === 'applying' || status?.state === 'downloaded' || restarting}
-              onClick={() => void run(() => api.checkServerUpdate())}
-            >
-              {status?.state === 'checking' ? t('system.serverUpdate.checking') : t('system.serverUpdate.check')}
-            </Button>
+          {(latest && (status?.state === 'available' || status?.state === 'failed')) ||
+          status?.state === 'downloading' ||
+          status?.state === 'downloaded' ? (
+            <Space size={spacing.sm} wrap>
+              {latest && (status?.state === 'available' || status?.state === 'failed') ? (
+                <Button
+                  type="primary"
+                  icon={<CloudDownloadOutlined />}
+                  loading={busy}
+                  disabled={busy}
+                  onClick={() => void run(() => api.downloadServerUpdate())}
+                >
+                  {t('system.serverUpdate.download')}
+                </Button>
+              ) : null}
 
-            {latest && (status?.state === 'available' || status?.state === 'failed') ? (
-              <Button
-                type="primary"
-                icon={<CloudDownloadOutlined />}
-                loading={busy}
-                disabled={busy}
-                onClick={() => void run(() => api.downloadServerUpdate())}
-              >
-                {t('system.serverUpdate.download')}
-              </Button>
-            ) : null}
+              {status?.state === 'downloading' ? (
+                <Button danger disabled={busy} onClick={() => void run(() => api.cancelServerUpdateDownload())}>
+                  {t('system.serverUpdate.cancel')}
+                </Button>
+              ) : null}
 
-            {status?.state === 'downloading' ? (
-              <Button danger disabled={busy} onClick={() => void run(() => api.cancelServerUpdateDownload())}>
-                {t('system.serverUpdate.cancel')}
-              </Button>
-            ) : null}
-
-            {status?.state === 'downloaded' ? (
-              <Button type="primary" danger loading={busy} disabled={busy} onClick={apply}>
-                {t('system.serverUpdate.apply')}
-              </Button>
-            ) : null}
-          </Space>
+              {status?.state === 'downloaded' ? (
+                <Button type="primary" danger loading={busy} disabled={busy} onClick={apply}>
+                  {t('system.serverUpdate.apply')}
+                </Button>
+              ) : null}
+            </Space>
+          ) : null}
         </Space>
       )}
     </SectionCard>

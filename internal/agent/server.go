@@ -114,9 +114,10 @@ type MountSpec struct {
 	// RepoGroup 存储库分组：用于判断是否套用"分组挂载配置"（见 Config.GroupMounts）。
 	RepoGroup string `json:"repo_group"`
 	// Steam 游戏库信息（非 Steam 库为 0/空）：用于挂载到 Steam 库并写 appmanifest。
-	SteamAppID   int64  `json:"steam_app_id,omitempty"`
-	SteamAppName string `json:"steam_app_name,omitempty"`
-	SteamBuildID string `json:"steam_build_id,omitempty"`
+	SteamAppID      int64  `json:"steam_app_id,omitempty"`
+	SteamAppName    string `json:"steam_app_name,omitempty"`
+	SteamInstallDir string `json:"steam_install_dir,omitempty"`
+	SteamBuildID    string `json:"steam_build_id,omitempty"`
 
 	TargetIQN     string `json:"target_iqn"`
 	PortalAddress string `json:"portal_address"`

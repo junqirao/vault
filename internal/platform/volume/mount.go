@@ -27,9 +27,11 @@ type MountInfo struct {
 //
 // 已占用磁盘号（usedDiskNumbers）会被排除，避免同一容量下多块盘互相抢占。
 //
-// ⚠️ 多块同尺寸 iSCSI 盘时仅凭容量无法精确定位，真实环境需要用 unique id
-// （Get-Disk 的 UniqueId / SerialNumber / Path）配合服务端下发的 disk_unique_id；
-// 本方法目前取编号最小的候选并记录 WARN —— 需实测确认。
+// 匹配策略（见 winps/scripts/volume_find_iscsi_disk.ps1 的 .NOTES）：
+//  1. 优先精确匹配容量；
+//  2. 精确匹配不到但**恰好只有一块未占用 iSCSI 磁盘**时选它（服务端容量可能来自
+//     导入时的文件大小估算，与真实标称容量不等）；这种情况会记 WARN，但挂载继续；
+//  3. 多块候选时只按容量取编号最小的，并记 WARN（精确匹配需靠 unique id，需实测确认）。
 func (m *Manager) FindIscsiDisk(ctx context.Context, sizeBytes int64, usedDiskNumbers []int) (int, error) {
 	if sizeBytes <= 0 {
 		return 0, apperr.InvalidParam("size_bytes")
@@ -46,8 +48,11 @@ func (m *Manager) FindIscsiDisk(ctx context.Context, sizeBytes int64, usedDiskNu
 		usedParam,
 	}
 	var result struct {
-		Number         int `json:"number"`
-		CandidateCount int `json:"candidate_count"`
+		Number         int   `json:"number"`
+		Size           int64 `json:"size"`
+		ExpectedSize   int64 `json:"expected_size"`
+		SizeMismatch   bool  `json:"size_mismatch"`
+		CandidateCount int   `json:"candidate_count"`
 	}
 	if err := m.ps.RunScriptJSON(ctx, winps.ScriptVolumeFindIscsiDisk, params, &result); err != nil {
 		if mapped := mappedReasonError(err, map[string]*apperr.Error{
@@ -57,7 +62,14 @@ func (m *Manager) FindIscsiDisk(ctx context.Context, sizeBytes int64, usedDiskNu
 		}
 		return 0, err
 	}
-	if result.CandidateCount > 1 {
+	if result.SizeMismatch {
+		// 容量兜底命中：服务端记录的容量与现场磁盘不一致（多半是导入时按文件大小猜的）。
+		// 挂载可以继续，但必须留痕 —— 下次再遇到"找不到盘"时，这条日志就是答案。
+		m.logger.Warn("iSCSI 磁盘容量与预期不一致，已按唯一未占用的 iSCSI 磁盘兜底挂载",
+			"expected_size", sizeBytes,
+			"actual_size", result.Size,
+			"disk_number", result.Number)
+	} else if result.CandidateCount > 1 {
 		m.logger.Warn("存在多块同容量 iSCSI 磁盘，已取编号最小的候选（精确匹配需靠 unique id，需实测确认）",
 			"size_bytes", sizeBytes,
 			"candidate_count", result.CandidateCount,

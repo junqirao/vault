@@ -986,7 +986,7 @@ export type DiskImportSkipReason =
   | 'create_failed'
 
 /** 建议容量的来源（与后端 app.DiskImportCapacity* 一致），决定界面对这个数字的信赖程度。 */
-export type DiskImportCapacitySource = 'meta' | 'manual' | 'file'
+export type DiskImportCapacitySource = 'meta' | 'manual' | 'vhdx' | 'file'
 
 /** sidecar 里记录的"这块盘是怎么来的"。 */
 export interface DiskMetaSourceDTO {

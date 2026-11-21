@@ -255,7 +255,7 @@ export function DiskImport({ onBack }: DiskImportProps): JSX.Element {
               <Typography.Text>{formatBytes(row.suggested_capacity_bytes)}</Typography.Text>
             )}
             <Tooltip title={t('diskImport.capacityHint')}>
-              <Tag color={source === 'file' ? 'orange' : source === 'meta' ? 'green' : 'blue'}>
+              <Tag color={source === 'file' ? 'orange' : source === 'meta' || source === 'vhdx' ? 'green' : 'blue'}>
                 {t(`diskImport.capacity.${source}`)}
               </Tag>
             </Tooltip>

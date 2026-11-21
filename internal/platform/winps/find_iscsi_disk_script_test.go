@@ -30,17 +30,54 @@ function Get-Disk {
 }
 `
 
+// stubGetDiskCapacityMismatch 只有一块 iSCSI 盘，且**容量与预期不符**。
+//
+// 这模拟真实事故：服务端把导入磁盘的文件大小当成标称容量（198870176638），
+// 与 Get-Disk 报告的真实容量永远不相等。脚本必须退到"唯一未占用 iSCSI 盘"。
+const stubGetDiskCapacityMismatch = `
+function Get-Disk {
+    [CmdletBinding()]
+    param()
+    @(
+        [pscustomobject]@{ Number = 0; Size = 500107862016; BusType = 'NVMe'; PartitionStyle = 'GPT'; IsOffline = $false; IsReadOnly = $false; Location = '' }
+        [pscustomobject]@{ Number = 3; Size = 2147483648; BusType = 'iSCSI'; PartitionStyle = 'GPT'; IsOffline = $false; IsReadOnly = $false; Location = 'D:\x.vhdx' }
+    )
+}
+`
+
+// stubGetDiskTwoMismatch 有两块未占用、容量都与预期不符的 iSCSI 盘：
+// 此时无法判断哪块才是本次登录的目标，脚本必须失败并报告现场容量。
+const stubGetDiskTwoMismatch = `
+function Get-Disk {
+    [CmdletBinding()]
+    param()
+    @(
+        [pscustomobject]@{ Number = 3; Size = 2147483648; BusType = 'iSCSI'; PartitionStyle = 'GPT'; IsOffline = $false; IsReadOnly = $false; Location = 'D:\x.vhdx' }
+        [pscustomobject]@{ Number = 4; Size = 3221225472; BusType = 'iSCSI'; PartitionStyle = 'GPT'; IsOffline = $false; IsReadOnly = $false; Location = 'D:\y.vhdx' }
+    )
+}
+`
+
 // findIscsiDiskOut 对应脚本的 JSON 输出（ok=false 时 reason 有值）。
 type findIscsiDiskOut struct {
 	OK             *bool  `json:"ok"`
 	Reason         string `json:"reason"`
 	Message        string `json:"message"`
 	Number         int    `json:"number"`
+	Size           int64  `json:"size"`
+	ExpectedSize   int64  `json:"expected_size"`
+	SizeMismatch   bool   `json:"size_mismatch"`
 	CandidateCount int    `json:"candidate_count"`
 }
 
 // runFindIscsiDisk 用真实脚本（注入假 Get-Disk）跑一次，返回脚本的输出。
 func runFindIscsiDisk(t *testing.T, usedDiskNumbers string) findIscsiDiskOut {
+	t.Helper()
+	return runFindIscsiDiskWithStub(t, stubGetDisk, 1073741824, usedDiskNumbers)
+}
+
+// runFindIscsiDiskWithStub 用指定的假 Get-Disk 与预期容量跑一次脚本。
+func runFindIscsiDiskWithStub(t *testing.T, stub string, sizeBytes int64, usedDiskNumbers string) findIscsiDiskOut {
 	t.Helper()
 
 	pwsh, err := exec.LookPath("powershell.exe")
@@ -63,7 +100,7 @@ func runFindIscsiDisk(t *testing.T, usedDiskNumbers string) findIscsiDiskOut {
 	}
 	// string(src) 会把文件头部的 BOM 保留为 U+FEFF，写回时仍是 UTF-8 with BOM
 	// （PowerShell 5.1 缺了 BOM 会按 ANSI 解析中文注释）。
-	patched := strings.Replace(string(src), anchor, anchor+"\n"+stubGetDisk, 1)
+	patched := strings.Replace(string(src), anchor, anchor+"\n"+stub, 1)
 
 	probe := filepath.Join(t.TempDir(), "find_iscsi_disk_probe.ps1")
 	if err := os.WriteFile(probe, []byte(patched), 0o600); err != nil {
@@ -73,7 +110,7 @@ func runFindIscsiDisk(t *testing.T, usedDiskNumbers string) findIscsiDiskOut {
 	cmd := exec.Command(pwsh,
 		"-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
 		"-File", probe,
-		"-SizeBytes", strconv.Itoa(1073741824),
+		"-SizeBytes", strconv.FormatInt(sizeBytes, 10),
 		"-UsedDiskNumbers", usedDiskNumbers,
 		// 关掉缓存刷新：本用例不需要它，也不想在测试里碰需要管理员权限的 cmdlet。
 		"-RefreshCache", "false",
@@ -148,6 +185,53 @@ func TestFindIscsiDiskScriptParsesUsedDiskNumbers(t *testing.T) {
 		}
 		if got.Reason != "disk_not_found" {
 			t.Fatalf("期望 reason=disk_not_found，实际 %q（message=%s）", got.Reason, got.Message)
+		}
+	})
+}
+
+// TestFindIscsiDiskScriptCapacityFallback 锁定"容量兜底"：
+//
+// 服务端导入磁盘时可能把文件大小误当标称容量，客户端精确匹配永远失败。只要现场
+// **恰好只有一块未占用的 iSCSI 磁盘**，它就是本次刚登录的目标，应当直接使用并
+// 标记 size_mismatch；多于一块时必须失败，并在 message 里带出现场容量。
+func TestFindIscsiDiskScriptCapacityFallback(t *testing.T) {
+	t.Run("唯一未占用磁盘容量不符时兜底", func(t *testing.T) {
+		got := runFindIscsiDiskWithStub(t, stubGetDiskCapacityMismatch, 198870176638, "[]")
+		if got.OK == nil || !*got.OK {
+			t.Fatalf("唯一未占用的 iSCSI 盘应被选中，实际 ok=%v reason=%s message=%s",
+				got.OK, got.Reason, got.Message)
+		}
+		if got.Number != 3 {
+			t.Fatalf("应选中磁盘 3，实际 %d", got.Number)
+		}
+		if !got.SizeMismatch {
+			t.Fatal("容量不符时必须标记 size_mismatch（上层据此记 WARN）")
+		}
+		if got.Size != 2147483648 || got.ExpectedSize != 198870176638 {
+			t.Fatalf("应回报现场容量与预期容量，实际 size=%d expected=%d", got.Size, got.ExpectedSize)
+		}
+	})
+
+	t.Run("唯一未占用磁盘也被占用时不猜", func(t *testing.T) {
+		got := runFindIscsiDiskWithStub(t, stubGetDiskCapacityMismatch, 198870176638, "[3]")
+		if got.OK == nil || *got.OK {
+			t.Fatalf("没有未占用候选时不应成功，实际 ok=%v number=%d", got.OK, got.Number)
+		}
+		if got.Reason != "disk_not_found" {
+			t.Fatalf("期望 reason=disk_not_found，实际 %q", got.Reason)
+		}
+		if !strings.Contains(got.Message, "#3:2147483648") {
+			t.Fatalf("错误信息应带出现场磁盘容量，便于本机诊断，实际=%q", got.Message)
+		}
+	})
+
+	t.Run("多块容量不符的候选时失败并报告全部容量", func(t *testing.T) {
+		got := runFindIscsiDiskWithStub(t, stubGetDiskTwoMismatch, 198870176638, "[]")
+		if got.OK == nil || *got.OK {
+			t.Fatalf("多块候选时不应猜，实际 ok=%v number=%d", got.OK, got.Number)
+		}
+		if !strings.Contains(got.Message, "#3:2147483648") || !strings.Contains(got.Message, "#4:3221225472") {
+			t.Fatalf("错误信息应列出全部 iSCSI 磁盘容量，实际=%q", got.Message)
 		}
 	})
 }

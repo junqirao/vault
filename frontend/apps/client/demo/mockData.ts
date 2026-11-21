@@ -12,38 +12,39 @@ const TB = 1024 ** 4
 const NOW = Date.now()
 const NOW_SEC = Math.floor(NOW / 1000)
 
+// 所有姓名、库名、游戏名、容量和曲线都是虚构的演示数据，不对应任何真实用户或资产。
 export const demoUser = {
-  id: 'u-zhuzhu',
-  username: 'zhuzhu',
+  id: 'u-demo-admin',
+  username: 'demo_admin',
   role: 'super_admin' as const,
   enabled: true,
   quota_bytes: 3.91 * TB,
   used_bytes: 499 * GB,
-  remark: '实验室共享盘',
+  remark: '演示管理员',
   created_at: NOW - 26 * 24 * 3600 * 1000,
   updated_at: NOW - 2 * 3600 * 1000
 }
 
 const users = [
   demoUser,
-  { id: 'u-linyu', username: 'linyu', role: 'user', enabled: true, quota_bytes: 1 * TB, used_bytes: 312 * GB, remark: '', created_at: NOW - 19 * 24 * 3600 * 1000, updated_at: NOW - 6 * 3600 * 1000 },
-  { id: 'u-chenxi', username: 'chenxi', role: 'user', enabled: true, quota_bytes: 2 * TB, used_bytes: 764 * GB, remark: '美术组', created_at: NOW - 14 * 24 * 3600 * 1000, updated_at: NOW - 3 * 24 * 3600 * 1000 },
-  { id: 'u-wangqi', username: 'wangqi', role: 'user', enabled: true, quota_bytes: 1 * TB, used_bytes: 208 * GB, remark: '', created_at: NOW - 12 * 24 * 3600 * 1000, updated_at: NOW - 2 * 24 * 3600 * 1000 },
-  { id: 'u-heyan', username: 'heyan', role: 'user', enabled: false, quota_bytes: 512 * GB, used_bytes: 0, remark: '已停用', created_at: NOW - 9 * 24 * 3600 * 1000, updated_at: NOW - 5 * 24 * 3600 * 1000 }
+  { id: 'u-nova', username: 'nova', role: 'user', enabled: true, quota_bytes: 1 * TB, used_bytes: 312 * GB, remark: '美术组', created_at: NOW - 19 * 24 * 3600 * 1000, updated_at: NOW - 6 * 3600 * 1000 },
+  { id: 'u-orbit', username: 'orbit', role: 'user', enabled: true, quota_bytes: 2 * TB, used_bytes: 764 * GB, remark: '客户端组', created_at: NOW - 14 * 24 * 3600 * 1000, updated_at: NOW - 3 * 24 * 3600 * 1000 },
+  { id: 'u-lumen', username: 'lumen', role: 'user', enabled: true, quota_bytes: 1 * TB, used_bytes: 208 * GB, remark: '测试组', created_at: NOW - 12 * 24 * 3600 * 1000, updated_at: NOW - 2 * 24 * 3600 * 1000 },
+  { id: 'u-echo', username: 'echo', role: 'user', enabled: false, quota_bytes: 512 * GB, used_bytes: 0, remark: '已停用', created_at: NOW - 9 * 24 * 3600 * 1000, updated_at: NOW - 5 * 24 * 3600 * 1000 }
 ]
 
 export const demoStorages = [
   {
-    id: 'stor-vaultdata',
-    name: 'VaultData',
-    path: 'D:\\VaultData',
+    id: 'stor-atlas',
+    name: 'AtlasData',
+    path: 'D:\\AtlasData',
     enabled: true,
     created_at: NOW - 80 * 24 * 3600 * 1000,
     updated_at: NOW - 12 * 3600 * 1000,
     file_system: 'NTFS',
     free_bytes: 14.5 * TB,
     total_bytes: 25.5 * TB,
-    volume_name: 'VaultData',
+    volume_name: 'AtlasData',
     media_type: 'hdd' as const,
     disk_count: 22,
     used_bytes: 11.0 * TB,
@@ -54,16 +55,16 @@ export const demoStorages = [
     size_bytes: 0
   },
   {
-    id: 'stor-ssd',
-    name: 'VaultSSD',
-    path: 'E:\\VaultSSD',
+    id: 'stor-nova',
+    name: 'NovaSSD',
+    path: 'E:\\NovaSSD',
     enabled: true,
     created_at: NOW - 46 * 24 * 3600 * 1000,
     updated_at: NOW - 2 * 24 * 3600 * 1000,
     file_system: 'NTFS',
     free_bytes: 2.8 * TB,
     total_bytes: 4.0 * TB,
-    volume_name: 'VaultSSD',
+    volume_name: 'NovaSSD',
     media_type: 'ssd' as const,
     disk_count: 6,
     used_bytes: 1.2 * TB,
@@ -75,15 +76,15 @@ export const demoStorages = [
   },
   {
     id: 'stor-archive',
-    name: 'Archive',
-    path: 'F:\\VaultArchive',
+    name: 'ArchiveBay',
+    path: 'F:\\ArchiveBay',
     enabled: true,
     created_at: NOW - 120 * 24 * 3600 * 1000,
     updated_at: NOW - 9 * 24 * 3600 * 1000,
     file_system: 'NTFS',
     free_bytes: 7.9 * TB,
     total_bytes: 10.0 * TB,
-    volume_name: 'Archive',
+    volume_name: 'ArchiveBay',
     media_type: 'hdd' as const,
     disk_count: 4,
     used_bytes: 2.1 * TB,
@@ -131,8 +132,8 @@ function repo(input: {
     note: input.note ?? '',
     auto_compact: true,
     pool: true,
-    storage_id: input.storage === 'ssd' ? 'stor-ssd' : 'stor-vaultdata',
-    storage_name: input.storage === 'ssd' ? 'VaultSSD' : 'VaultData',
+    storage_id: input.storage === 'ssd' ? 'stor-nova' : 'stor-atlas',
+    storage_name: input.storage === 'ssd' ? 'NovaSSD' : 'AtlasData',
     permission: 'manage' as const,
     created_at: NOW - input.createdDaysAgo * 24 * 3600 * 1000,
     updated_at: NOW - 3 * 3600 * 1000,
@@ -145,15 +146,15 @@ function repo(input: {
 }
 
 export const demoRepos = [
-  repo({ id: 'repo-steam', name: 'SteamLibrary-Shared', group: 'Game', capacity: 512 * GB, diffUsed: 84.2 * GB, parentUsed: 96.4 * GB, shares: 8, createdDaysAgo: 38, parentVersion: 3, note: 'Steam 公共库，含 CS2 / Dota2 / PUBG', mounted: true, drive: 'G:', cacheGB: 3.38 }),
-  repo({ id: 'repo-epic', name: 'EpicGames-Base', group: 'Game', capacity: 256 * GB, diffUsed: 12.6 * GB, parentUsed: 41.8 * GB, shares: 6, createdDaysAgo: 31, note: 'Epic 启动器与常用游戏', mounted: true, drive: 'H:', cacheGB: 1.12 }),
-  repo({ id: 'repo-minecraft', name: 'Minecraft-Modpack', group: 'Game', capacity: 64 * GB, diffUsed: 3.4 * GB, parentUsed: 8.9 * GB, shares: 12, createdDaysAgo: 22, note: '整合包测试库', mounted: false }),
-  repo({ id: 'repo-unreal', name: 'UnrealEditor-5.4', group: 'Game', capacity: 320 * GB, diffUsed: 48.7 * GB, parentUsed: 121.5 * GB, shares: 4, createdDaysAgo: 17, parentVersion: 2, note: 'UE 5.4 + 示例工程', mounted: true, drive: 'I:', cacheGB: 5.44 }),
-  repo({ id: 'repo-office', name: 'Office2021-Base', group: 'Office', capacity: 64 * GB, diffUsed: 8.9 * GB, parentUsed: 22.7 * GB, shares: 20, createdDaysAgo: 52, note: '办公软件基础镜像', mounted: true, drive: 'J:', cacheGB: 0.86 }),
-  repo({ id: 'repo-cad', name: 'CAD-Workstation', group: 'Office', capacity: 200 * GB, diffUsed: 22.5 * GB, parentUsed: 73.6 * GB, shares: 5, createdDaysAgo: 44, note: 'AutoCAD + SolidWorks', mounted: false }),
-  repo({ id: 'repo-adobe', name: 'Adobe-CC', group: 'Office', capacity: 160 * GB, diffUsed: 31.2 * GB, parentUsed: 58.3 * GB, shares: 6, createdDaysAgo: 35, note: 'PS / PR / AE 2024', mounted: false }),
-  repo({ id: 'repo-win11', name: 'Win11-24H2', group: 'Test', capacity: 128 * GB, diffUsed: 31.8 * GB, parentUsed: 27.4 * GB, shares: 10, createdDaysAgo: 63, note: '系统镜像回归测试', mounted: true, drive: 'K:', cacheGB: 2.11 }),
-  repo({ id: 'repo-ubuntu', name: 'Ubuntu-24.04', group: 'Test', capacity: 48 * GB, diffUsed: 5.2 * GB, parentUsed: 6.8 * GB, shares: 8, createdDaysAgo: 12, note: 'Linux 桌面验证', mounted: false })
+  repo({ id: 'repo-nebula', name: 'NebulaDrift-Shared', group: 'Game', capacity: 512 * GB, diffUsed: 84.2 * GB, parentUsed: 96.4 * GB, shares: 8, createdDaysAgo: 38, parentVersion: 3, note: 'Steam 公共库 · 低峰自动更新', mounted: true, drive: 'G:', cacheGB: 3.38, storage: 'ssd' }),
+  repo({ id: 'repo-iron', name: 'IronHarbor-Base', group: 'Game', capacity: 256 * GB, diffUsed: 12.6 * GB, parentUsed: 41.8 * GB, shares: 6, createdDaysAgo: 31, note: 'Steam 游戏基础库', mounted: true, drive: 'H:', cacheGB: 1.12, storage: 'ssd' }),
+  repo({ id: 'repo-pixel', name: 'PixelOrchard-Modpack', group: 'Game', capacity: 64 * GB, diffUsed: 3.4 * GB, parentUsed: 8.9 * GB, shares: 12, createdDaysAgo: 22, note: '模组整合包测试库', mounted: false, storage: 'hdd' }),
+  repo({ id: 'repo-starfall', name: 'StarfallTactics-Base', group: 'Game', capacity: 320 * GB, diffUsed: 48.7 * GB, parentUsed: 121.5 * GB, shares: 4, createdDaysAgo: 17, parentVersion: 2, note: 'Steam 游戏基础库', mounted: true, drive: 'I:', cacheGB: 5.44, storage: 'ssd' }),
+  repo({ id: 'repo-docs', name: 'DocsSuite-Base', group: 'Work', capacity: 64 * GB, diffUsed: 8.9 * GB, parentUsed: 22.7 * GB, shares: 20, createdDaysAgo: 52, note: '文档套件基础镜像', mounted: true, drive: 'J:', cacheGB: 0.86, storage: 'hdd' }),
+  repo({ id: 'repo-cad', name: 'CADSuite-Workstation', group: 'Work', capacity: 200 * GB, diffUsed: 22.5 * GB, parentUsed: 73.6 * GB, shares: 5, createdDaysAgo: 44, note: 'CAD 工程库', mounted: false, storage: 'hdd' }),
+  repo({ id: 'repo-creative', name: 'CreativeSuite-Base', group: 'Work', capacity: 160 * GB, diffUsed: 31.2 * GB, parentUsed: 58.3 * GB, shares: 6, createdDaysAgo: 35, note: '创意工具基础镜像', mounted: false, storage: 'hdd' }),
+  repo({ id: 'repo-os', name: 'OSImage-Regression', group: 'Lab', capacity: 128 * GB, diffUsed: 31.8 * GB, parentUsed: 27.4 * GB, shares: 10, createdDaysAgo: 63, note: '系统镜像回归测试', mounted: true, drive: 'K:', cacheGB: 2.11, storage: 'hdd' }),
+  repo({ id: 'repo-linux', name: 'LinuxDesktop-QA', group: 'Lab', capacity: 48 * GB, diffUsed: 5.2 * GB, parentUsed: 6.8 * GB, shares: 8, createdDaysAgo: 12, note: 'Linux 桌面验证', mounted: false, storage: 'hdd' })
 ]
 
 export const demoUsers = users
@@ -172,13 +173,14 @@ export const demoAllocations = demoRepos.map((item) => ({
 export function disksOf(repoId: string) {
   const target = demoRepos.find((item) => item.id === repoId)
   if (!target) return []
-  const isFirst = target.id === 'repo-steam'
+  const isFirst = target.id === 'repo-nebula'
+  const basePath = target.storage_id === 'stor-nova' ? 'E:\\NovaSSD' : 'D:\\AtlasData'
   return [
     {
       id: `disk-${repoId}-parent`,
       repo_id: repoId,
       kind: 'parent' as const,
-      vhdx_path: `D:\\VaultData\\${target.name}\\parent.vhdx`,
+      vhdx_path: `${basePath}\\${target.name}\\parent.vhdx`,
       parent_version: 0,
       size_bytes: target.capacity_bytes,
       physical_bytes: target.parent_used_bytes,
@@ -192,7 +194,7 @@ export function disksOf(repoId: string) {
       id: `disk-${repoId}-diff`,
       repo_id: repoId,
       kind: 'diff' as const,
-      vhdx_path: `D:\\VaultData\\${target.name}\\diff-${isFirst ? 'zhuzhu-01' : 'zhuzhu'}.vhdx`,
+      vhdx_path: `${basePath}\\${target.name}\\diff-${isFirst ? 'demo-01' : 'demo'}.vhdx`,
       parent_id: `disk-${repoId}-parent`,
       parent_version: target.parent_version,
       size_bytes: target.capacity_bytes,
@@ -211,18 +213,18 @@ export const demoMounts = demoRepos
   .map((item) => ({
     repo_id: item.id,
     repo_name: item.name,
-    server_key: 'srv-vault',
-    server_url: 'https://vault.example.lan:8443',
-    server_name: 'WIN-E095H11JSS',
+    server_key: 'srv-demo',
+    server_url: 'https://vault.demo.lan:8443',
+    server_name: 'VAULT-DEMO-01',
     allocation_id: `alloc-${item.id}`,
     lease_id: `lease-${item.id}`,
-    target_iqn: `iqn.2026-02.lan.vault:${item.id}`,
-    portal: '10.10.20.8:3260',
+    target_iqn: `iqn.2026-02.demo.vault:${item.id}`,
+    portal: '10.20.30.40:3260',
     mount_mode: 'letter' as const,
     mount_path: item._drive,
     disk_number: 3,
     state: 'mounted' as const,
-    mounted_at: NOW - (item.id === 'repo-steam' ? 5.4 * 3600 * 1000 : 2.1 * 3600 * 1000),
+    mounted_at: NOW - (item.id === 'repo-nebula' ? 5.4 * 3600 * 1000 : 2.1 * 3600 * 1000),
     last_heartbeat_at: NOW - 8 * 1000,
     session_active: true,
     session_checked_at: NOW - 5 * 1000,
@@ -250,7 +252,7 @@ export const demoCacheTargets = demoRepos
   .filter((item) => item._mounted)
   .map((item, index) => ({
     allocation_id: `alloc-${item.id}`,
-    target_iqn: `iqn.2026-02.lan.vault:${item.id}`,
+    target_iqn: `iqn.2026-02.demo.vault:${item.id}`,
     cache_enabled: true,
     l1_used_bytes: Math.round(item._cacheGB * 0.18 * GB),
     l1_limit_bytes: Math.round(512 * GB / 5),
@@ -363,17 +365,17 @@ export const demoCacheHistory = (() => {
 export const demoAgentState = {
   servers: [
     {
-      server_key: 'srv-vault',
+      server_key: 'srv-demo',
       primary: true,
-      url: 'https://vault.example.lan:8443',
-      instance_id: 'srv-vault',
-      name: 'WIN-E095H11JSS',
+      url: 'https://vault.demo.lan:8443',
+      instance_id: 'srv-demo',
+      name: 'VAULT-DEMO-01',
       connected: true,
       phase: 'connected',
       user: { id: demoUser.id, username: demoUser.username, role: 'super_admin' },
       session: {
-        server_key: 'srv-vault',
-        server_url: 'https://vault.example.lan:8443',
+        server_key: 'srv-demo',
+        server_url: 'https://vault.demo.lan:8443',
         token: 'demo-token',
         expires_at: NOW + 12 * 3600 * 1000,
         user_id: demoUser.id,
@@ -382,13 +384,13 @@ export const demoAgentState = {
       }
     }
   ],
-  primary_key: 'srv-vault',
+  primary_key: 'srv-demo',
   server: {
-    server_key: 'srv-vault',
+    server_key: 'srv-demo',
     primary: true,
-    url: 'https://vault.example.lan:8443',
-    instance_id: 'srv-vault',
-    name: 'WIN-E095H11JSS',
+    url: 'https://vault.demo.lan:8443',
+    instance_id: 'srv-demo',
+    name: 'VAULT-DEMO-01',
     connected: true,
     phase: 'connected'
   },
@@ -404,14 +406,14 @@ export const demoAgentState = {
   },
   update: {
     channel: 'stable',
-    current_version: '0.2.0',
+    current_version: '0.0.0-demo',
     downloading: false,
     received_bytes: 0,
     total_bytes: 0
   },
   session: {
-    server_key: 'srv-vault',
-    server_url: 'https://vault.example.lan:8443',
+    server_key: 'srv-demo',
+    server_url: 'https://vault.demo.lan:8443',
     token: 'demo-token',
     expires_at: NOW + 12 * 3600 * 1000,
     user_id: demoUser.id,
@@ -422,18 +424,18 @@ export const demoAgentState = {
 
 export const demoAgentHealth = {
   ok: true,
-  agent_version: '0.2.0',
+  agent_version: '0.0.0-demo',
   platform: 'windows',
   admin: true,
   host: demoAgentState.host,
   servers: demoAgentState.servers,
-  primary_key: 'srv-vault',
-  expected_version: '0.2.0',
+  primary_key: 'srv-demo',
+  expected_version: '0.0.0-demo',
   version_mismatch: false,
   server: {
     connected: true,
-    url: 'https://vault.example.lan:8443',
-    name: 'WIN-E095H11JSS'
+    url: 'https://vault.demo.lan:8443',
+    name: 'VAULT-DEMO-01'
   }
 }
 
@@ -446,7 +448,7 @@ export const demoAgentConfig = {
   language: 'zh-CN',
   start_at_login: true,
   update_channel: 'stable',
-  server_alias: 'WIN-E095H11JSS',
+  server_alias: 'VAULT-DEMO-01',
   auto_login: true,
   auto_update: true,
   cache_l1_bytes: 512 * MB,
@@ -458,12 +460,12 @@ export const demoAgentConfig = {
 }
 
 export const demoSystemInfo = {
-  server_instance_id: 'srv-vault',
-  server_name: 'WIN-E095H11JSS',
+  server_instance_id: 'srv-demo',
+  server_name: 'VAULT-DEMO-01',
   api_version: 1,
-  server_version: '0.2.0',
-  client_compat: { min: '0.1.0', max: '0.3.0', recommended: '0.2.0' },
-  features: ['shared_repo', 'diff_disk', 'cert_login', 'auto_update', 'pool'],
+  server_version: '0.0.0-demo',
+  client_compat: { min: '0.0.0-demo', max: '0.0.0-demo', recommended: '0.0.0-demo' },
+  features: ['shared_repo', 'diff_disk', 'cert_login', 'auto_update', 'pool', 'steam'],
   capabilities: {
     platform_kind: 'windows',
     win_target: true,
@@ -471,8 +473,8 @@ export const demoSystemInfo = {
     lvm: false,
     lvm_cache: false,
     hyperv: true,
-    storage_root: 'D:\\VaultData',
-    storage_roots: ['D:\\VaultData', 'E:\\VaultSSD', 'F:\\VaultArchive'],
+    storage_root: 'D:\\AtlasData',
+    storage_roots: ['D:\\AtlasData', 'E:\\NovaSSD', 'F:\\ArchiveBay'],
     file_system: 'NTFS',
     volume_free_bytes: demoStorages.reduce((sum, item) => sum + item.free_bytes, 0),
     volume_total_bytes: demoStorages.reduce((sum, item) => sum + item.total_bytes, 0),
@@ -492,4 +494,288 @@ export const demoDepsReport = {
   items: [],
   missing: [],
   fixed: []
+}
+
+// ---------- Steam 游戏库（全部为虚构账号、游戏与 AppID） ----------
+
+export const demoSteamAccounts = [
+  {
+    id: 'steam-demo-01',
+    username: 'demo_steam_01',
+    display_name: 'Demo Steam 01',
+    status: 'active' as const,
+    credential_kind: 'password' as const,
+    has_credential: true,
+    guard_type: 'email' as const,
+    has_guard_secret: true,
+    session_state: 'idle',
+    max_concurrent: 1,
+    active_leases: 0,
+    last_login_at: NOW - 3 * 3600 * 1000,
+    last_checked_at: NOW - 8 * 60 * 1000,
+    last_guard_at: NOW - 26 * 3600 * 1000,
+    last_error: '',
+    last_output: '',
+    session_home: 'C:\\VaultDemo\\SteamCMD\\session-01',
+    cmd_root: 'C:\\VaultDemo\\SteamCMD',
+    created_at: NOW - 42 * 24 * 3600 * 1000,
+    updated_at: NOW - 3 * 3600 * 1000
+  },
+  {
+    id: 'steam-demo-02',
+    username: 'demo_steam_02',
+    display_name: 'Demo Steam 02',
+    status: 'active' as const,
+    credential_kind: 'refresh_token' as const,
+    has_credential: true,
+    guard_type: 'none' as const,
+    has_guard_secret: false,
+    session_state: 'idle',
+    max_concurrent: 1,
+    active_leases: 0,
+    last_login_at: NOW - 9 * 3600 * 1000,
+    last_checked_at: NOW - 21 * 60 * 1000,
+    last_guard_at: 0,
+    last_error: '',
+    last_output: '',
+    session_home: 'C:\\VaultDemo\\SteamCMD\\session-02',
+    cmd_root: 'C:\\VaultDemo\\SteamCMD',
+    created_at: NOW - 28 * 24 * 3600 * 1000,
+    updated_at: NOW - 9 * 3600 * 1000
+  }
+]
+
+export const demoSteamGroups = [
+  {
+    id: 'grp-nebula',
+    name: 'Nebula 公共游戏库',
+    kind: 'steam' as const,
+    description: '热门游戏集中维护，低峰自动更新',
+    steam_account_id: 'steam-demo-01',
+    target_platform: 'windows' as const,
+    auto_update: true,
+    update_schedule: '',
+    update_window: '03:00-06:00',
+    max_concurrent: 1,
+    storage_id: 'stor-nova',
+    access_mode: 'all' as const,
+    member_ids: [],
+    game_count: 4,
+    created_at: NOW - 38 * 24 * 3600 * 1000,
+    updated_at: NOW - 2 * 3600 * 1000
+  },
+  {
+    id: 'grp-qa',
+    name: 'QA 游戏验证库',
+    kind: 'steam' as const,
+    description: '发布前验证与回滚，手动更新',
+    steam_account_id: 'steam-demo-02',
+    target_platform: 'windows' as const,
+    auto_update: false,
+    update_schedule: '',
+    update_window: '',
+    max_concurrent: 1,
+    storage_id: 'stor-atlas',
+    access_mode: 'selected' as const,
+    member_ids: ['u-nova', 'u-orbit'],
+    game_count: 2,
+    created_at: NOW - 21 * 24 * 3600 * 1000,
+    updated_at: NOW - 5 * 3600 * 1000
+  }
+]
+
+export const demoSteamGames = [
+  {
+    id: 'game-nebula',
+    group_id: 'grp-nebula',
+    repo_id: 'repo-nebula',
+    app_id: 900001,
+    app_name: 'Nebula Drift',
+    install_dir: 'NebulaDrift',
+    build_id: '18420011',
+    available_build_id: '',
+    target_platform: 'windows' as const,
+    steam_account_id: 'steam-demo-01',
+    auto_update: true,
+    status: 'ready' as const,
+    progress_percent: 0,
+    progress_phase: '' as const,
+    progress_stage: '',
+    progress_bytes_done: 0,
+    progress_bytes_total: 0,
+    progress_speed: 0,
+    can_stop: false,
+    last_checked_at: NOW - 8 * 60 * 1000,
+    last_updated_at: NOW - 6 * 24 * 3600 * 1000,
+    last_error: '',
+    created_at: NOW - 38 * 24 * 3600 * 1000,
+    updated_at: NOW - 8 * 60 * 1000
+  },
+  {
+    id: 'game-iron',
+    group_id: 'grp-nebula',
+    repo_id: 'repo-iron',
+    app_id: 900002,
+    app_name: 'Iron Harbor',
+    install_dir: 'IronHarbor',
+    build_id: '18419904',
+    available_build_id: '18420607',
+    target_platform: 'windows' as const,
+    steam_account_id: 'steam-demo-01',
+    auto_update: true,
+    status: 'updating' as const,
+    progress_percent: 62.4,
+    progress_phase: 'downloading' as const,
+    progress_stage: 'downloading',
+    progress_bytes_done: 4.7 * GB,
+    progress_bytes_total: 7.5 * GB,
+    progress_speed: 268 * MB,
+    can_stop: true,
+    last_checked_at: NOW - 2 * 60 * 1000,
+    last_updated_at: NOW - 6 * 24 * 3600 * 1000,
+    last_error: '',
+    created_at: NOW - 31 * 24 * 3600 * 1000,
+    updated_at: NOW - 20 * 1000
+  },
+  {
+    id: 'game-pixel',
+    group_id: 'grp-nebula',
+    repo_id: 'repo-pixel',
+    app_id: 900003,
+    app_name: 'Pixel Orchard',
+    install_dir: 'PixelOrchard',
+    build_id: '18411022',
+    available_build_id: '18411880',
+    target_platform: 'windows' as const,
+    steam_account_id: 'steam-demo-01',
+    auto_update: true,
+    status: 'paused' as const,
+    progress_percent: 38,
+    progress_phase: 'downloading' as const,
+    progress_stage: 'paused',
+    progress_bytes_done: 1.1 * GB,
+    progress_bytes_total: 2.9 * GB,
+    progress_speed: 0,
+    can_stop: true,
+    last_checked_at: NOW - 14 * 60 * 1000,
+    last_updated_at: NOW - 11 * 24 * 3600 * 1000,
+    last_error: '',
+    created_at: NOW - 22 * 24 * 3600 * 1000,
+    updated_at: NOW - 14 * 60 * 1000
+  },
+  {
+    id: 'game-starfall',
+    group_id: 'grp-nebula',
+    repo_id: 'repo-starfall',
+    app_id: 900004,
+    app_name: 'Starfall Tactics',
+    install_dir: 'StarfallTactics',
+    build_id: '18418841',
+    available_build_id: '',
+    target_platform: 'windows' as const,
+    steam_account_id: 'steam-demo-01',
+    auto_update: true,
+    status: 'ready' as const,
+    progress_percent: 0,
+    progress_phase: '' as const,
+    progress_stage: '',
+    progress_bytes_done: 0,
+    progress_bytes_total: 0,
+    progress_speed: 0,
+    can_stop: false,
+    last_checked_at: NOW - 8 * 60 * 1000,
+    last_updated_at: NOW - 3 * 24 * 3600 * 1000,
+    last_error: '',
+    created_at: NOW - 17 * 24 * 3600 * 1000,
+    updated_at: NOW - 8 * 60 * 1000
+  },
+  {
+    id: 'game-echo',
+    group_id: 'grp-qa',
+    repo_id: 'repo-docs',
+    app_id: 900005,
+    app_name: 'Echo Vanguard',
+    install_dir: 'EchoVanguard',
+    build_id: '18420155',
+    available_build_id: '',
+    target_platform: 'windows' as const,
+    steam_account_id: 'steam-demo-02',
+    auto_update: false,
+    status: 'ready' as const,
+    progress_percent: 0,
+    progress_phase: '' as const,
+    progress_stage: '',
+    progress_bytes_done: 0,
+    progress_bytes_total: 0,
+    progress_speed: 0,
+    can_stop: false,
+    last_checked_at: NOW - 21 * 60 * 1000,
+    last_updated_at: NOW - 4 * 24 * 3600 * 1000,
+    last_error: '',
+    created_at: NOW - 21 * 24 * 3600 * 1000,
+    updated_at: NOW - 21 * 60 * 1000
+  },
+  {
+    id: 'game-crimson',
+    group_id: 'grp-qa',
+    repo_id: 'repo-cad',
+    app_id: 900006,
+    app_name: 'Crimson Circuit',
+    install_dir: 'CrimsonCircuit',
+    build_id: '',
+    available_build_id: '',
+    target_platform: 'windows' as const,
+    steam_account_id: 'steam-demo-02',
+    auto_update: false,
+    status: 'error' as const,
+    progress_percent: 0,
+    progress_phase: '' as const,
+    progress_stage: '',
+    progress_bytes_done: 0,
+    progress_bytes_total: 0,
+    progress_speed: 0,
+    can_stop: false,
+    last_checked_at: NOW - 33 * 60 * 1000,
+    last_updated_at: 0,
+    last_error: 'SteamCMD: login required',
+    created_at: NOW - 19 * 24 * 3600 * 1000,
+    updated_at: NOW - 33 * 60 * 1000
+  }
+]
+
+const STEAM_ICON_STYLES: Record<number, { a: string; b: string; label: string }> = {
+  900001: { a: '#4f7cff', b: '#8f6bff', label: 'ND' },
+  900002: { a: '#1e9e8a', b: '#2f6f62', label: 'IH' },
+  900003: { a: '#e28b2d', b: '#b24b2f', label: 'PO' },
+  900004: { a: '#6f5bd6', b: '#2e2a66', label: 'ST' },
+  900005: { a: '#2f9fd0', b: '#1b4f72', label: 'EV' },
+  900006: { a: '#c74f6b', b: '#6d2437', label: 'CC' }
+}
+
+/** 生成一张纯几何的虚构封面图标，避免截图里出现任何真实游戏素材。 */
+export function demoSteamIcon(appID: number): string | null {
+  const style = STEAM_ICON_STYLES[appID]
+  if (!style) return null
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96">
+<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="${style.a}"/><stop offset="1" stop-color="${style.b}"/></linearGradient></defs>
+<rect width="96" height="96" rx="20" fill="url(#g)"/>
+<circle cx="72" cy="24" r="26" fill="rgba(255,255,255,.12)"/>
+<path d="M0 72 Q24 54 48 72 T96 72 V96 H0Z" fill="rgba(0,0,0,.18)"/>
+<text x="48" y="57" text-anchor="middle" font-family="Segoe UI,Arial,sans-serif" font-size="28" font-weight="700" fill="#fff" letter-spacing="1">${style.label}</text>
+</svg>`
+  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+}
+
+export const demoSteamLibrary = {
+  available: true,
+  steam_root: 'C:\\VaultDemo\\Steam',
+  account_name: 'demo_steam_01',
+  games: demoSteamGames.map((game) => ({
+    app_id: game.app_id,
+    name: game.app_name,
+    installed: true,
+    has_image: true,
+    has_icon: true,
+    size_bytes: 0
+  }))
 }

@@ -11,6 +11,7 @@ import (
 
 	"vault/internal/apperr"
 	"vault/internal/domain"
+	"vault/internal/platform/vhdx"
 	"vault/internal/secret"
 )
 
@@ -34,14 +35,15 @@ type MountSpec struct {
 	RepoGroup string `json:"repo_group,omitempty"`
 	// SteamAppID / SteamAppName / SteamBuildID 仅 Steam 游戏库有值：
 	// 客户端据此把游戏挂到 Steam 库并生成 appmanifest_<appid>.acf。
-	SteamAppID    int64  `json:"steam_app_id,omitempty"`
-	SteamAppName  string `json:"steam_app_name,omitempty"`
-	SteamBuildID  string `json:"steam_build_id,omitempty"`
-	TargetIQN     string `json:"target_iqn"`
-	PortalAddress string `json:"portal_address"`
-	PortalPort    int    `json:"portal_port"`
-	AuthMode      string `json:"auth_mode"`
-	ChapUser      string `json:"chap_user,omitempty"`
+	SteamAppID      int64  `json:"steam_app_id,omitempty"`
+	SteamAppName    string `json:"steam_app_name,omitempty"`
+	SteamInstallDir string `json:"steam_install_dir,omitempty"`
+	SteamBuildID    string `json:"steam_build_id,omitempty"`
+	TargetIQN       string `json:"target_iqn"`
+	PortalAddress   string `json:"portal_address"`
+	PortalPort      int    `json:"portal_port"`
+	AuthMode        string `json:"auth_mode"`
+	ChapUser        string `json:"chap_user,omitempty"`
 	// ChapSecret 仅本次下发，不落盘到客户端配置。
 	ChapSecret       string `json:"chap_secret,omitempty"`
 	DiskSizeBytes    int64  `json:"disk_size_bytes"`
@@ -137,6 +139,10 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		}
 	}
 
+	// 容量以 VHDX 头部为准（历史导入记录可能把文件大小当成了标称容量）。
+	// 必须在 Publish 之前读：发布后 VHDX 由 iSCSI 目标服务打开，可能读不到。
+	diskSize := s.authoritativeDiskSize(ctx, disk)
+
 	// 阶段推进（推送界面）：从这里开始是服务端侧的耗时操作 —— 等差异盘就绪 + 用
 	// PowerShell 下发 iSCSI 目标，实测数十秒。期间客户端只有一个 HTTP 请求在等待。
 	s.emitMountPhase(allocationID, MountPhaseAllocating)
@@ -192,10 +198,11 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 	}
 
 	var steamAppID int64
-	var steamAppName, steamBuildID string
+	var steamAppName, steamInstallDir, steamBuildID string
 	if game, gErr := s.Store.GetGameByRepoID(ctx, repo.ID); gErr == nil && game != nil {
 		steamAppID = game.AppID
 		steamAppName = game.AppName
+		steamInstallDir = game.InstallDir
 		steamBuildID = game.BuildID
 	}
 
@@ -206,6 +213,7 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		RepoGroup:        repo.Meta.Group,
 		SteamAppID:       steamAppID,
 		SteamAppName:     steamAppName,
+		SteamInstallDir:  steamInstallDir,
 		SteamBuildID:     steamBuildID,
 		// 必须是**平台实际存储**的目标名：推导出来的 IQN 若与平台不一致，
 		// 客户端就是"TCP 3260 可达、但登录失败"（见 IscsiService.targetIQN 的说明）。
@@ -215,7 +223,7 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		AuthMode:         string(target.AuthMode),
 		ChapUser:         target.ChapUser,
 		ChapSecret:       chapSecret,
-		DiskSizeBytes:    disk.SizeBytes,
+		DiskSizeBytes:    diskSize,
 		LeaseID:          lease.ID,
 		LeaseTTLSeconds:  int(d.LeaseTTL.Seconds()),
 		HeartbeatSeconds: int(d.HeartbeatEvery.Seconds()),
@@ -233,6 +241,43 @@ func (s *LeaseService) RequestMount(ctx context.Context, allocationID, clientID,
 		"state":         string(domain.LeaseStateActive),
 	})
 	return spec, nil
+}
+
+// authoritativeDiskSize 返回下发给客户端的磁盘标称容量，并顺手纠正历史错误值。
+//
+// 背景（真实事故）：导入已有磁盘时如果旁边没有 sidecar 元数据，早期版本会把
+// **文件大小**当成标称容量写进 disks.size_bytes。VHDX 是稀疏文件，这个值通常连
+// 512 字节都不整除（真实日志里的 198870176638），而客户端用 `Get-Disk.Size` 做
+// **精确**匹配，于是这块库每次挂载都在 find_disk 阶段失败
+// （platform.iscsi_disk_not_found），且无论重试多少次都不会成功。
+//
+// VHDX 头部里的 VirtualDiskSize 才是权威值。读到且与记录不一致时先写回数据库
+// （配额、界面容量都读 disks.size_bytes），再下发；读不到（平台不是 Windows、
+// 路径不是 VHDX、文件损坏）就沿用记录 —— 容量纠正绝不能反过来阻断挂载。
+func (s *LeaseService) authoritativeDiskSize(ctx context.Context, disk *domain.Disk) int64 {
+	recorded := disk.SizeBytes
+	actual, err := vhdx.VirtualSize(disk.VHDXPath)
+	if err != nil || actual <= 0 || actual == recorded {
+		return recorded
+	}
+	s.Log.Warn("磁盘标称容量与 VHDX 头部不一致，已按头部值纠正（客户端按容量精确匹配）",
+		"disk_id", disk.ID, "path", disk.VHDXPath,
+		"recorded_size", recorded, "actual_size", actual)
+	if err := s.Store.UpdateDiskSize(ctx, disk.ID, actual); err != nil {
+		// 写不回数据库不影响本次挂载：把正确值下发出去才是关键。
+		s.Log.Warn("纠正磁盘容量写库失败（本次仍按正确值下发）", "disk_id", disk.ID, "error", err)
+	}
+	// 差异盘的标称容量必须等于母盘（CreateDiff 继承父盘的虚拟大小）。
+	// 顺手纠正母盘记录：库容量、配额与后续派生都读母盘的 size_bytes，
+	// 只改差异盘会让同一个库在界面上出现两种容量。
+	if disk.ParentID != nil && *disk.ParentID != "" {
+		if parent, pErr := s.Store.GetDisk(ctx, *disk.ParentID); pErr == nil && parent != nil && parent.SizeBytes != actual {
+			if uErr := s.Store.UpdateDiskSize(ctx, parent.ID, actual); uErr != nil {
+				s.Log.Warn("纠正母盘容量写库失败", "disk_id", parent.ID, "error", uErr)
+			}
+		}
+	}
+	return actual
 }
 
 // Heartbeat 续期租约。

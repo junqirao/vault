@@ -102,7 +102,9 @@ These are package-level floors, not end-to-end promises. See [Performance](#perf
 - **From directory to mountable disk**: create from a server-side directory or a client-side local directory, upload in chunks with resumable transfers, and verify files one by one afterwards.
 - **Manage and use from one client**: regular users see their repositories and mounts; super admins manage users, storage, jobs, audit, and server configuration in the same app. Multiple servers and automatic updates are supported.
 - **HDD iSCSI bypass acceleration**: misses stay close to direct-connect speed, while hits read from local memory or SSD without touching the network or HDD.
+- **Steam libraries**: host SteamCMD accounts centrally; one shared base per game with a per-user differencing disk; check updates per group and download them in an off-peak window, with progress, pause/stop, and raw output.
 - **Server-side SSD cache**: on Linux, an SSD can serve as the `dm-cache` for an LVM thin pool, accelerating the HDD at the block layer.
+- **Per-library placement (best practice)**: put SSD-hungry Steam games and engineering libraries on SSD storage as a whole; keep cold libraries, archives, and large sequential reads on HDD. Do not mix SSD and HDD into one ordinary thin pool.
 - **Controllable online state**: client lease heartbeats are authoritative; leases can be revoked and sessions forced offline. Certificate login, audit, and automatic updates are included.
 
 ## Interface

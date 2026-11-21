@@ -45,6 +45,7 @@ import { fontSize, palette, spacing } from '../../tokens/palette'
 import { formatBytes, formatTime, repoUsage, userDiffUsage } from '../../utils/format'
 import { repoModeLabel } from '../../utils/labels'
 import { RepoCard, RepoRow } from './RepoCards'
+import { mountSessionLive } from '../mount/MountControls'
 import { GroupMountSettingsModal } from './RepoMountSettings'
 import { PerformanceMonitor } from './PerformanceMonitor'
 import { CacheOverview } from './CacheOverview'
@@ -692,8 +693,8 @@ function buildGroups(
 interface GroupOpState {
   busy: boolean
   /**
-   * 操作开始时固定的类型：挂载过程中已挂载数量会一格格增长，
-   * 如果按钮继续用 `mountedCount > 0` 判断，就会从"正在挂载"变成"正在卸载"。
+   * 本次操作是挂载还是卸载：挂载过程中已挂载数量会增长，不能再用数量反推；
+   * 两个按钮各自按 kind 展示进度与 loading。
    */
   kind: 'mount' | 'unmount' | null
   progress: { done: number; total: number }
@@ -776,7 +777,9 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
 
   const mountAll = useCallback(async (): Promise<void> => {
     if (groupOps.get(groupKey)?.busy) return
-    const targets = repos.filter((repo) => repo.state === 'active' && !isPlaceholderRepoId(repo.id))
+    // 只挂“还没挂上”的库：分组里已经挂着的、正在转场的都跳过。
+    // 这样失败/断线的库可以单独重试，不会因为组里有一个已挂载就只能卸载。
+    const targets = groupMountSummary(repos, agent.state?.mounts ?? []).mountTargets
     if (targets.length === 0) return
     setGroupOp(groupKey, { busy: true, kind: 'mount', progress: { done: 0, total: targets.length } })
     let ok = 0
@@ -817,7 +820,12 @@ function useGroupMount(groupKey: string, repos: RepoDTO[], currentUserId: string
     await queryClient.invalidateQueries({ queryKey: ['leases'] })
     setGroupOp(groupKey, GROUP_OP_IDLE)
     if (fail > 0) message.warning(t('repo.group.mountPartial', { ok, fail }))
-    else message.success(t('repo.group.mountDone', { count: ok }))
+    else if (allowAllocate) {
+      // Steam 客户端的已安装列表在启动时读取 appmanifest；运行中外部写入的清单
+      // 通常不会热刷新（社区工具也要求重启 Steam）。这里给一次明确提示，避免用户
+      // 以为"挂载失败/Steam 灰色"是 Vault 的问题。
+      message.success(t('repo.group.mountDoneSteam', { count: ok }))
+    } else message.success(t('repo.group.mountDone', { count: ok }))
   }, [active?.baseUrl, active?.key, agent, allowAllocate, api, currentUserId, groupKey, queryClient, repos, t])
 
   const unmountAll = useCallback(async (): Promise<void> => {
@@ -859,6 +867,47 @@ function mountOfRepo(mounts: AgentMountState[], repo: RepoDTO): AgentMountState 
   return mounts.find(
     (mount) => mount.repo_id === repo.id || (mount.repo_id === '' && mount.repo_name === repo.name)
   )
+}
+
+/**
+ * 分组批量操作的目标集合。
+ *
+ * 关键点：**挂载与卸载必须同时可用**。以前分组按钮只有一个，按 mountedCount 在
+ * 「挂载分组 / 卸载分组」之间切换；只要组里有一个库挂上了（或留下一条 error 挂载记录），
+ * 按钮就只剩「卸载」，没挂上的库再也没有入口。这里把两类目标拆开：
+ *   - mountTargets：未挂载、挂载失败、会话已断开的活跃库；
+ *   - unmountTargets：所有仍有挂载记录的库（含 error，用于清理残留）。
+ */
+function groupMountSummary(
+  repos: RepoDTO[],
+  mounts: AgentMountState[]
+): { mountedRepos: RepoDTO[]; mountTargets: RepoDTO[]; unmountTargets: AgentMountState[] } {
+  const entries = repos.map((repo) => ({ repo, mount: mountOfRepo(mounts, repo) }))
+  const mountedRepos = entries
+    .filter(
+      (entry) =>
+        entry.mount !== undefined &&
+        entry.mount.state === 'mounted' &&
+        mountSessionLive(entry.mount) !== false
+    )
+    .map((entry) => entry.repo)
+  const mountTargets = entries
+    .filter((entry) => repoCanBeMounted(entry.repo, entry.mount))
+    .map((entry) => entry.repo)
+  const unmountTargets = entries
+    .filter((entry): entry is { repo: RepoDTO; mount: AgentMountState } => entry.mount !== undefined)
+    .map((entry) => entry.mount)
+  return { mountedRepos, mountTargets, unmountTargets }
+}
+
+/** 这个库现在是否值得点「挂载」：没记录、失败、断线都可以重试；转场中/已挂载则跳过。 */
+function repoCanBeMounted(repo: RepoDTO, mount: AgentMountState | undefined): boolean {
+  if (repo.state !== 'active' || isPlaceholderRepoId(repo.id)) return false
+  if (!mount) return true
+  if (mount.state === 'mounting' || mount.state === 'unmounting') return false
+  if (mount.state === 'mounted') return mountSessionLive(mount) === false
+  // error / revoked：保留记录，但允许直接重新挂载（代理会先清理残留）。
+  return true
 }
 
 /** 分组卡片里的一行紧凑指标：标签 + 数值 + 短条，三者横向排布。 */
@@ -932,8 +981,7 @@ function RepoGroupCard({
     bucket.steam
   )
   const mounts = agent.state?.mounts ?? []
-  const mountedRepos = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined)
-  const mountedCount = mountedRepos.length
+  const { mountedRepos, mountTargets, unmountTargets } = groupMountSummary(repos, mounts)
   const activeCount = repos.filter((repo) => repo.state === 'active').length
 
   // 「已挂载」报**空间**而不是个数（反馈："已挂载 1/3 展示空间，而不是数量，直接展示已挂载空间大小"）：
@@ -988,9 +1036,6 @@ function RepoGroupCard({
   const diffLoading =
     diskQueries.some((query) => query.isLoading) || allocationQueries.some((query) => query.isLoading)
 
-  // 操作开始后按固定的 kind 出文案：挂载过程中 mountedCount 会增长，
-  // 不能再用它判断"这一次到底是在挂载还是卸载"。
-  const activeKind = kind ?? (mountedCount > 0 ? 'unmount' : 'mount')
   const steamGroupPref = bucket.steam ? agent.config?.group_mounts?.[bucket.key] : undefined
   const steamMountReady =
     !bucket.steam || Boolean(steamGroupPref?.use_for_repos && (steamGroupPref?.steam_library ?? '').trim())
@@ -1096,33 +1141,37 @@ function RepoGroupCard({
           marginRight: spacing.md
         }}
       >
-        <Tooltip
-          title={
-            activeKind === 'mount' && !steamMountReady ? t('repo.group.steamLibraryRequired') : undefined
-          }
-        >
+        <Tooltip title={!steamMountReady ? t('repo.group.steamLibraryRequired') : undefined}>
           <span>
             <Button
               size="small"
-              type={activeKind === 'unmount' ? 'default' : 'primary'}
-              loading={busy}
-              disabled={
-                repos.length === 0 ||
-                (activeKind === 'mount' && (activeCount === 0 || !steamMountReady))
-              }
+              type="primary"
+              loading={busy && kind === 'mount'}
+              disabled={busy || mountTargets.length === 0 || !steamMountReady}
               onClick={(event) => {
                 event.stopPropagation()
-                void (activeKind === 'unmount' ? unmountAll() : mountAll())
+                void mountAll()
               }}
             >
-              {busy && progress.total > 0
-                ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
-                : activeKind === 'unmount'
-                  ? t('repo.group.unmountAll')
-                  : t('repo.group.mountAll')}
+              {busy && kind === 'mount' && progress.total > 0
+                ? `${t('repo.group.mounting')} ${progress.done}/${progress.total}`
+                : t('repo.group.mountAll')}
             </Button>
           </span>
         </Tooltip>
+        <Button
+          size="small"
+          loading={busy && kind === 'unmount'}
+          disabled={busy || unmountTargets.length === 0}
+          onClick={(event) => {
+            event.stopPropagation()
+            void unmountAll()
+          }}
+        >
+          {busy && kind === 'unmount' && progress.total > 0
+            ? `${t('repo.group.unmounting')} ${progress.done}/${progress.total}`
+            : t('repo.group.unmountAll')}
+        </Button>
         {/* 未分组没有分组名，无法承载分组配置；不给设置入口。 */}
         {bucket.key ? (
           <Tooltip title={t('repo.group.settings')}>
@@ -1239,10 +1288,7 @@ function RepoGroupDetail({
     bucket.steam
   )
   const mounts = agent.state?.mounts ?? []
-  const mountedCount = repos.filter((repo) => mountOfRepo(mounts, repo) !== undefined).length
-  const activeCount = repos.filter((repo) => repo.state === 'active').length
-  // 与总览卡片同一处修复：操作期间固定 kind，避免按钮文案随 mountedCount 翻转。
-  const activeKind = kind ?? (mountedCount > 0 ? 'unmount' : 'mount')
+  const { mountTargets, unmountTargets } = groupMountSummary(repos, mounts)
   // Steam 分组必须先选好 Steam 库才能挂载：否则游戏没有落点，Steam 也发现不了。
   const steamGroupPref = bucket.steam ? agent.config?.group_mounts?.[bucket.key] : undefined
   const steamMountReady =
@@ -1283,30 +1329,35 @@ function RepoGroupDetail({
             ) : null}
             <Tooltip
               title={
-                activeKind === 'mount' && !steamMountReady
+                !steamMountReady
                   ? t('repo.group.steamLibraryRequired')
                   : undefined
               }
             >
               <span>
                 <Button
-                  type={activeKind === 'unmount' ? 'default' : 'primary'}
+                  type="primary"
                   size="small"
-                  loading={busy}
-                  disabled={
-                    repos.length === 0 ||
-                    (activeKind === 'mount' && (activeCount === 0 || !steamMountReady))
-                  }
-                  onClick={() => void (activeKind === 'unmount' ? unmountAll() : mountAll())}
+                  loading={busy && kind === 'mount'}
+                  disabled={busy || mountTargets.length === 0 || !steamMountReady}
+                  onClick={() => void mountAll()}
                 >
-                  {busy && progress.total > 0
-                    ? `${t(activeKind === 'unmount' ? 'repo.group.unmounting' : 'repo.group.mounting')} ${progress.done}/${progress.total}`
-                    : activeKind === 'unmount'
-                      ? t('repo.group.unmountAll')
-                      : t('repo.group.mountAll')}
+                  {busy && kind === 'mount' && progress.total > 0
+                    ? `${t('repo.group.mounting')} ${progress.done}/${progress.total}`
+                    : t('repo.group.mountAll')}
                 </Button>
               </span>
             </Tooltip>
+            <Button
+              size="small"
+              loading={busy && kind === 'unmount'}
+              disabled={busy || unmountTargets.length === 0}
+              onClick={() => void unmountAll()}
+            >
+              {busy && kind === 'unmount' && progress.total > 0
+                ? `${t('repo.group.unmounting')} ${progress.done}/${progress.total}`
+                : t('repo.group.unmountAll')}
+            </Button>
             {bucket.key ? (
               <Tooltip title={t('repo.group.settings')}>
                 <Button

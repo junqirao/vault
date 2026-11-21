@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Vault · 存储共享与端侧加速</title>
+    <title>Vault · 存储共享、Steam 游戏库与端侧加速</title>
     <meta
       name="description"
       content="Vault 是一个自托管的虚拟磁盘与 iSCSI 存储平台：安全的块级存储分发，以及不终止会话的端侧 iSCSI 旁路缓存加速。"
@@ -450,6 +450,7 @@
       .hero-grid > *,
       .perf-grid > *,
       .storage-grid > *,
+      .steam-grid > *,
       .bypass-grid > *,
       .last-grid > * {
         min-width: 0;
@@ -1020,6 +1021,90 @@
         line-height: 1.68;
       }
 
+      /* steam */
+
+      .steam-grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 14px;
+        margin-top: 20px;
+      }
+
+      .steam-main img {
+        width: 100%;
+        display: block;
+      }
+
+      .steam-details {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 0 22px;
+        margin-top: 0;
+        border-top: 1px solid var(--line);
+      }
+
+      .steam-details .detail-item {
+        grid-template-columns: 20px 1fr;
+        padding: 10px 0;
+        border-bottom: 0;
+      }
+
+      .limits.best .limit .n {
+        color: var(--accent);
+      }
+
+      .practice-split {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 18px;
+      }
+
+      .practice-card {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 11px 14px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: #fff;
+      }
+
+      .practice-card.ssd {
+        border-color: rgba(10, 108, 255, 0.28);
+        background: var(--accent-soft);
+      }
+
+      .practice-card.hdd {
+        background: rgba(11, 18, 32, 0.04);
+      }
+
+      .practice-card .tag {
+        flex: none;
+      }
+
+      .practice-card b {
+        display: block;
+        font-size: 12.5px;
+      }
+
+      .practice-card small {
+        display: block;
+        margin-top: 2px;
+        color: var(--muted);
+        font-size: 10px;
+        line-height: 1.5;
+      }
+
+      .practice-note {
+        margin: 14px 0 0;
+        padding: 10px 12px;
+        border-left: 2px solid var(--accent);
+        background: var(--accent-soft);
+        color: #29405f;
+        font-size: 10.5px;
+        line-height: 1.7;
+      }
+
       /* last slide */
 
       .last-grid {
@@ -1448,6 +1533,7 @@
         .hero-grid,
         .perf-grid,
         .storage-grid,
+        .steam-grid,
         .bypass-grid,
         .last-grid {
           gap: 28px;
@@ -1496,6 +1582,7 @@
         .hero-grid,
         .perf-grid,
         .storage-grid,
+        .steam-grid,
         .bypass-grid,
         .last-grid {
           grid-template-columns: 1fr;
@@ -1522,6 +1609,7 @@
         .lifecycle,
         .details,
         .limits,
+        .practice-split,
         .last-shots {
           grid-template-columns: 1fr;
         }
@@ -1615,6 +1703,7 @@
 
         .perf-grid,
         .storage-grid,
+        .steam-grid,
         .bypass-grid,
         .last-grid {
           margin-top: 14px;
@@ -1678,6 +1767,14 @@
         .platform-list li {
           padding: 5px 0;
           font-size: 9.5px;
+        }
+
+        .practice-split {
+          margin-top: 10px;
+        }
+
+        .practice-card {
+          padding: 8px 11px;
         }
 
         .limits {
@@ -1750,6 +1847,8 @@
         <nav class="nav-links" aria-label="页面导航">
           <a href="#performance" data-go="performance">性能</a>
           <a href="#shared" data-go="shared">存储共享</a>
+          <a href="#steam" data-go="steam">Steam 游戏库</a>
+          <a href="#best-practice" data-go="best-practice">最佳实践</a>
           <a href="#cache" data-go="cache">旁路加速</a>
           <a href="#client" data-go="client">客户端</a>
         </nav>
@@ -1777,10 +1876,11 @@
             <h1 class="hero-title" data-i18n-html="heroTitle">存储共享&nbsp;&nbsp;&nbsp;&nbsp;<em>端侧加速</em></h1>
             <p class="hero-lead">
               iSCSI 自动设置分配，端侧 iSCSI 旁路代理加速，支持 L1 内存、L2 本地存储加速；
-              重排缓存结构，随机读转为顺序读，优化读场景。
+              Steam 游戏库共享母盘、定时自动更新；重排缓存结构，随机读转为顺序读。
             </p>
             <div class="hero-pills">
               <span>安全的块级存储分发</span>
+              <span>Steam 游戏库自动更新</span>
               <span>旁路缓存加速读场景</span>
             </div>
             <div class="hero-actions">
@@ -1835,7 +1935,7 @@
             </figure>
             <div class="shot-caption">
               <span>界面来自正式客户端</span>
-              <span>存储库、用户和曲线为模拟数据</span>
+              <span>存储库、用户、游戏和曲线均为模拟数据</span>
             </div>
           </div>
         </div>
@@ -1869,7 +1969,7 @@
             </div>
           </div>
         </div>
-        <span class="slide-index">01 / 05</span>
+        <span class="slide-index">01 / 07</span>
       </section>
 
       <!-- 02 -->
@@ -1945,7 +2045,7 @@
             </div>
           </div>
         </div>
-        <span class="slide-index">02 / 05</span>
+        <span class="slide-index">02 / 07</span>
       </section>
 
       <!-- 03 -->
@@ -1969,15 +2069,15 @@
                 <div class="reuse-arrow" aria-hidden="true"></div>
                 <div class="reuse-list">
                   <div class="reuse-row">
-                    <strong>diff-zhuzhu.vhdx</strong>
+                    <strong>diff-demo-01.vhdx</strong>
                     <span>独立盘 · G:</span>
                   </div>
                   <div class="reuse-row">
-                    <strong>diff-linyu.vhdx</strong>
+                    <strong>diff-nova.vhdx</strong>
                     <span>独立盘 · H:</span>
                   </div>
                   <div class="reuse-row">
-                    <strong>diff-chenxi.vhdx</strong>
+                    <strong>diff-orbit.vhdx</strong>
                     <span>独立盘 · I:</span>
                   </div>
                 </div>
@@ -2020,7 +2120,7 @@
               <figure class="shot" style="margin: 0">
                 <img
                   src="assets/repository-detail.png"
-                  alt="Vault 存储库详情页，展示基础盘版本、独立盘用量和成员"
+                  alt="Vault 存储库详情页，展示存储位置、共享模式、母盘版本和用量"
                   width="1600"
                   height="640"
                   loading="lazy"
@@ -2040,10 +2140,137 @@
             </div>
           </div>
         </div>
-        <span class="slide-index">03 / 05</span>
+        <span class="slide-index">03 / 07</span>
       </section>
 
       <!-- 04 -->
+      <section class="slide" id="steam" data-title="Steam 游戏库">
+        <div class="slide-inner">
+          <p class="kicker">Steam library</p>
+          <h2 class="slide-title">Steam 游戏库：共享母盘，自动更新</h2>
+          <p class="slide-lead">
+            集中托管 Steam 账号与游戏库：一个 App 只存一份共享母盘，每个用户派生独立差异盘；
+            定时检查更新，在低峰窗口自动下载，更新一次全员生效。
+          </p>
+
+          <div class="steam-grid">
+            <figure class="shot steam-main" style="margin: 0">
+              <img
+                src="assets/steam-games.png"
+                alt="Vault Steam 游戏库详情，展示游戏列表、构建版本、更新进度和操作"
+                width="1600"
+                height="520"
+                loading="lazy"
+                data-lightbox
+              />
+            </figure>
+            <p class="shot-caption">
+              <span>Steam 库界面来自正式客户端</span>
+              <span>游戏、账号和 AppID 为模拟数据</span>
+            </p>
+
+            <div class="details steam-details">
+              <div class="detail-item">
+                <span class="n">01</span>
+                <div>
+                  <h4>账号托管</h4>
+                  <p>SteamCMD 账号与 Guard 集中保存，普通用户不接触凭据。</p>
+                </div>
+              </div>
+              <div class="detail-item">
+                <span class="n">02</span>
+                <div>
+                  <h4>共享母盘 + 差异盘</h4>
+                  <p>一个游戏一份母盘，按用户派生差异盘；分配即用，释放回池。</p>
+                </div>
+              </div>
+              <div class="detail-item">
+                <span class="n">03</span>
+                <div>
+                  <h4>定时自动更新</h4>
+                  <p>按分组设置检查与更新时间窗口；进度、暂停/停止和原始输出可见。</p>
+                </div>
+              </div>
+              <div class="detail-item">
+                <span class="n">04</span>
+                <div>
+                  <h4>按库选择介质</h4>
+                  <p>游戏库可放在 SSD 或 HDD 存储；吃 SSD 的游戏放 SSD 库。</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <span class="slide-index">04 / 07</span>
+      </section>
+
+      <!-- 05 -->
+      <section class="slide" id="best-practice" data-title="最佳实践">
+        <div class="slide-inner">
+          <p class="kicker">Best practices</p>
+          <h2 class="slide-title">最佳实践：让 SSD 用在刀刃上</h2>
+          <p class="slide-lead">
+            SSD 贵，不要用 HDD 硬顶吃 SSD 的场景。按库放置：吃 SSD 的游戏和工程库放 SSD 存储；
+            冷数据、归档和大顺序读留在 HDD。
+          </p>
+
+          <div class="practice-split">
+            <div class="practice-card ssd">
+              <span class="tag">SSD</span>
+              <div>
+                <b>吃 SSD 的库</b>
+                <small>Steam 游戏 · 工程库 · 随机 4K · 写入多</small>
+              </div>
+            </div>
+            <div class="practice-card hdd">
+              <span class="tag">HDD</span>
+              <div>
+                <b>冷库 / 归档</b>
+                <small>长期冷数据 · 大顺序读 · 成本优先</small>
+              </div>
+            </div>
+          </div>
+
+          <div class="limits best">
+            <div class="limit">
+              <span class="n">01</span>
+              <div>
+                <h4>吃 SSD 的库放 SSD</h4>
+                <p>Steam 游戏、工程库、频繁随机读写：整库（母盘 + 差异盘）放 SSD 存储。</p>
+              </div>
+            </div>
+            <div class="limit">
+              <span class="n">02</span>
+              <div>
+                <h4>冷库留 HDD</h4>
+                <p>归档、长期不用的库、大顺序读；用 HDD 容量换成本。</p>
+              </div>
+            </div>
+            <div class="limit">
+              <span class="n">03</span>
+              <div>
+                <h4>客户端缓存按需开</h4>
+                <p>L1 常开；L2 用客户端已有 SSD，默认每库 4 GiB，热门游戏可调大。</p>
+              </div>
+            </div>
+            <div class="limit">
+              <span class="n">04</span>
+              <div>
+                <h4>更新窗口与容量</h4>
+                <p>Steam 自动更新放低峰；SSD 库预留空间，差异盘会增长；定期看水位与 TRIM。</p>
+              </div>
+            </div>
+          </div>
+
+          <p class="practice-note">
+            判断标准：随机 4K 多、写入多、首次加载慢 → SSD；顺序读为主、长期冷数据 → HDD。
+            先拿一个热库 + 一块 SSD 做 A/B，命中率或延迟达标再批量；不要把 SSD 和 HDD 混成一个普通 thin pool。
+          </p>
+        </div>
+        <span class="slide-index">05 / 07</span>
+      </section>
+
+      <!-- 06 -->
       <section class="slide" id="cache" data-title="旁路加速">
         <div class="slide-inner">
           <p class="kicker">Bypass acceleration</p>
@@ -2119,7 +2346,7 @@
             </div>
           </div>
         </div>
-        <span class="slide-index">04 / 05</span>
+        <span class="slide-index">06 / 07</span>
       </section>
 
       <!-- 05 -->
@@ -2263,7 +2490,7 @@ sudo ./scripts/setup.sh
             </span>
           </div>
         </footer>
-        <span class="slide-index">05 / 05</span>
+        <span class="slide-index">07 / 07</span>
       </section>
     </div>
 
@@ -2277,11 +2504,17 @@ sudo ./scripts/setup.sh
       <button class="chapter" type="button" data-go="shared" aria-label="存储共享">
         <span class="num">03</span><span class="label" data-zh="存储共享" data-en="Storage">存储共享</span><span class="dot"></span>
       </button>
+      <button class="chapter" type="button" data-go="steam" aria-label="Steam 游戏库">
+        <span class="num">04</span><span class="label" data-zh="Steam 游戏库" data-en="Steam">Steam 游戏库</span><span class="dot"></span>
+      </button>
+      <button class="chapter" type="button" data-go="best-practice" aria-label="最佳实践">
+        <span class="num">05</span><span class="label" data-zh="最佳实践" data-en="Best practices">最佳实践</span><span class="dot"></span>
+      </button>
       <button class="chapter" type="button" data-go="cache" aria-label="旁路加速">
-        <span class="num">04</span><span class="label" data-zh="旁路加速" data-en="Bypass">旁路加速</span><span class="dot"></span>
+        <span class="num">06</span><span class="label" data-zh="旁路加速" data-en="Bypass">旁路加速</span><span class="dot"></span>
       </button>
       <button class="chapter" type="button" data-go="client" aria-label="客户端与部署">
-        <span class="num">05</span><span class="label" data-zh="客户端与部署" data-en="Client">客户端与部署</span><span class="dot"></span>
+        <span class="num">07</span><span class="label" data-zh="客户端与部署" data-en="Client">客户端与部署</span><span class="dot"></span>
       </button>
     </nav>
 
@@ -2314,6 +2547,7 @@ sudo ./scripts/setup.sh
           "旁路加速": "Bypass acceleration",
           "客户端": "Client",
           "自托管 · 虚拟磁盘 · iSCSI": "Self-hosted · virtual disks · iSCSI",
+          "iSCSI 自动设置分配，端侧 iSCSI 旁路代理加速，支持 L1 内存、L2 本地存储加速； Steam 游戏库共享母盘、定时自动更新；重排缓存结构，随机读转为顺序读。": "iSCSI setup and allocation are automatic. The edge-side iSCSI bypass proxy accelerates reads with L1 memory and L2 local storage. Steam libraries share one base disk and update on schedule. The cache layout turns random reads into sequential reads.",
           "iSCSI 自动设置分配，端侧 iSCSI 旁路代理加速，支持 L1 内存、L2 本地存储加速； 重排缓存结构，随机读转为顺序读，优化读场景。": "iSCSI setup and allocation are automatic. The edge-side iSCSI bypass proxy accelerates reads with L1 memory and L2 local storage. The cache layout turns random reads into sequential reads.",
           "安全的块级存储分发": "Secure block-level storage distribution",
           "旁路缓存加速读场景": "Bypass cache for read acceleration",
@@ -2321,6 +2555,7 @@ sudo ./scripts/setup.sh
           "Windows / Linux 服务端 · Windows 客户端 · 自托管": "Windows / Linux server · Windows client · self-hosted",
           "界面来自正式客户端": "UI from the production client",
           "存储库、用户和曲线为模拟数据": "Repositories, users and charts are mock data",
+          "存储库、用户、游戏和曲线均为模拟数据": "Repositories, users, games and charts are all mock data",
           "块级隔离": "Block isolation",
           "基础盘只读，写入落独立盘": "Base disk is read-only; writes go to per-user disks",
           "分配即用": "Ready on allocation",
@@ -2396,6 +2631,37 @@ sudo ./scripts/setup.sh
           "第一次读、冷数据和大顺序扫描仍走原来的链路。": "First reads, cold data and large sequential scans still take the original path.",
           "一个分配单客户端": "One allocation per client",
           "多客户端同写同一 LUN 不在缓存一致性范围内。": "Multiple clients writing the same LUN are outside the cache consistency scope.",
+          "Steam 游戏库": "Steam library",
+          "Steam 游戏库自动更新": "Steam library auto-update",
+          "Steam 游戏库：共享母盘，自动更新": "Steam library: one shared base, automatic updates",
+          "Steam 库界面来自正式客户端": "Steam UI from the production client",
+          "游戏、账号和 AppID 为模拟数据": "Games, accounts and AppIDs are mock data",
+          "集中托管 Steam 账号与游戏库：一个 App 只存一份共享母盘，每个用户派生独立差异盘； 定时检查更新，在低峰窗口自动下载，更新一次全员生效。": "Host Steam accounts and libraries centrally: one shared base per app, with an independent differencing disk per user. Updates are checked on schedule, downloaded in an off-peak window, and apply to everyone at once.",
+          "账号托管": "Account custody",
+          "SteamCMD 账号与 Guard 集中保存，普通用户不接触凭据。": "SteamCMD accounts and Guard secrets are stored centrally; regular users never touch the credentials.",
+          "共享母盘 + 差异盘": "Shared base + differencing disk",
+          "一个游戏一份母盘，按用户派生差异盘；分配即用，释放回池。": "One base per game, with a per-user differencing disk. Allocations are ready to use and return to the pool on release.",
+          "定时自动更新": "Scheduled auto-update",
+          "按分组设置检查与更新时间窗口；进度、暂停/停止和原始输出可见。": "Set check and update windows per group. Progress, pause/stop, and raw output are all visible.",
+          "按库选择介质": "Per-library media placement",
+          "游戏库可放在 SSD 或 HDD 存储；吃 SSD 的游戏放 SSD 库。": "Game libraries can live on SSD or HDD storage; put SSD-hungry games in an SSD library.",
+          "最佳实践": "Best practices",
+          "最佳实践：让 SSD 用在刀刃上": "Best practices: spend SSD where it matters",
+          "SSD 贵，不要用 HDD 硬顶吃 SSD 的场景。按库放置：吃 SSD 的游戏和工程库放 SSD 存储； 冷数据、归档和大顺序读留在 HDD。": "SSD is expensive, so do not force SSD-hungry workloads onto HDD. Place by library: put SSD-hungry games and engineering libraries on SSD storage, and leave cold data, archives, and large sequential reads on HDD.",
+          "吃 SSD 的库": "SSD-hungry libraries",
+          "Steam 游戏 · 工程库 · 随机 4K · 写入多": "Steam games · engineering libraries · random 4K · write-heavy",
+          "冷库 / 归档": "Cold libraries / archives",
+          "长期冷数据 · 大顺序读 · 成本优先": "Long-cold data · large sequential reads · cost first",
+          "吃 SSD 的库放 SSD": "Put SSD-hungry libraries on SSD",
+          "Steam 游戏、工程库、频繁随机读写：整库（母盘 + 差异盘）放 SSD 存储。": "Steam games, engineering libraries, and frequent random I/O: put the whole library (base + differencing disks) on SSD storage.",
+          "冷库留 HDD": "Keep cold libraries on HDD",
+          "归档、长期不用的库、大顺序读；用 HDD 容量换成本。": "Archives, long-unused libraries, and large sequential reads: trade capacity for cost on HDD.",
+          "客户端缓存按需开": "Enable client cache as needed",
+          "L1 常开；L2 用客户端已有 SSD，默认每库 4 GiB，热门游戏可调大。": "Keep L1 on; use the client's existing SSD for L2. The default is 4 GiB per library, and it can be raised for hot games.",
+          "更新窗口与容量": "Update windows and capacity",
+          "Steam 自动更新放低峰；SSD 库预留空间，差异盘会增长；定期看水位与 TRIM。": "Run Steam auto-updates off-peak. Leave headroom on SSD libraries because differencing disks grow; check watermarks and TRIM regularly.",
+          "判断标准：随机 4K 多、写入多、首次加载慢 → SSD；顺序读为主、长期冷数据 → HDD。 不要把 SSD 和 HDD 混成一个普通 thin pool，否则 LVM 不保证热数据落在 SSD。": "Rule of thumb: lots of random 4K, lots of writes, slow first loads → SSD; mostly sequential reads and long-cold data → HDD. Do not mix SSD and HDD into one ordinary thin pool, because LVM does not guarantee hot data lands on SSD.",
+          "判断标准：随机 4K 多、写入多、首次加载慢 → SSD；顺序读为主、长期冷数据 → HDD。 先拿一个热库 + 一块 SSD 做 A/B，命中率或延迟达标再批量；不要把 SSD 和 HDD 混成一个普通 thin pool。": "Rule of thumb: lots of random 4K, lots of writes, slow first loads → SSD; mostly sequential reads and long-cold data → HDD. Pilot one hot library and one SSD, then roll out only if hit rate or latency improves. Do not mix SSD and HDD into one ordinary thin pool.",
           "源码和文档": "Source and docs",
           "构建脚本、接口文档和基准方法都在 GitHub 上。": "Build scripts, API docs and benchmark methods are on GitHub.",
           "查看源码": "View source",
@@ -2419,6 +2685,8 @@ sudo ./scripts/setup.sh
             hero: "概览",
             performance: "性能",
             shared: "存储共享",
+            steam: "Steam 游戏库",
+            "best-practice": "最佳实践",
             cache: "旁路加速",
             client: "客户端与部署"
           },
@@ -2426,6 +2694,8 @@ sudo ./scripts/setup.sh
             hero: "Overview",
             performance: "Performance",
             shared: "Storage",
+            steam: "Steam",
+            "best-practice": "Best practices",
             cache: "Bypass",
             client: "Client & deploy"
           }
@@ -2462,7 +2732,10 @@ sudo ./scripts/setup.sh
         const applyLanguage = (lang) => {
           currentLang = lang
           document.documentElement.lang = lang
-          document.title = lang === "en-US" ? "Vault · Storage sharing & edge acceleration" : "Vault · 存储共享与端侧加速"
+          document.title =
+            lang === "en-US"
+              ? "Vault · Storage sharing, Steam libraries & edge acceleration"
+              : "Vault · 存储共享、Steam 游戏库与端侧加速"
           const map = lang === "en-US" ? EN : null
 
           const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)

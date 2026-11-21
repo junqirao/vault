@@ -1,6 +1,6 @@
 {
   "name": "@vault/client",
-  "version": "0.3.287",
+  "version": "0.3.289",
   "private": true,
   "license": "PolyForm-Noncommercial-1.0.0",
   "description": "Vault",

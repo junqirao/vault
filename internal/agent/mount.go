@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1638,8 +1639,93 @@ func steamLibraryRoot(raw string) string {
 	return root
 }
 
+// steamInstallLeaf 计算 Steam 游戏在 steamapps/common 下的目录名。
+//
+// 不能用存储库名：服务端默认库名是 "游戏名 (AppID)"，而 Steam 的 appmanifest
+// 里 installdir 通常是 "游戏名"（如 Palworld）。目录名与官方 installdir 不一致时，
+// Steam 可能认不出已安装游戏，或者在覆盖 manifest 时把用户的真实安装目录改坏。
+//
+// 优先使用库里已有 appmanifest 的 installdir；旧版本写进去的 "名称 (AppID)"
+// 视为历史残留，改用游戏名；最后才退回管理端配置的 install_dir / 游戏名。
+func (e *mountEngine) steamInstallLeaf(req MountRequest, spec *MountSpec) string {
+	if spec == nil || spec.SteamAppID <= 0 {
+		return ""
+	}
+	library := ""
+	if gp, ok := e.groupOverride(req, spec); ok {
+		library = strings.TrimSpace(gp.SteamLibrary)
+	}
+	if library == "" {
+		if pref, ok := e.repoPref(req.RepoID); ok {
+			library = strings.TrimSpace(pref.SteamLibrary)
+		}
+	}
+	if library != "" {
+		if dir := steamManifestInstallDir(library, spec.SteamAppID); dir != "" {
+			if !isLegacySteamInstallDir(dir, spec) {
+				if leaf := sanitizePathSegment(filepath.Base(filepath.FromSlash(dir))); leaf != "" {
+					return leaf
+				}
+			}
+		}
+	}
+	if dir := strings.TrimSpace(spec.SteamInstallDir); dir != "" {
+		if leaf := sanitizePathSegment(filepath.Base(filepath.FromSlash(dir))); leaf != "" {
+			return leaf
+		}
+	}
+	if name := strings.TrimSpace(spec.SteamAppName); name != "" {
+		return sanitizePathSegment(name)
+	}
+	return ""
+}
+
+// steamManifestInstallDir 读取 Steam 库中某个 AppID 的 appmanifest installdir。
+func steamManifestInstallDir(library string, appID int64) string {
+	if appID <= 0 {
+		return ""
+	}
+	root := steamLibraryRoot(library)
+	if root == "" {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(root, "steamapps", fmt.Sprintf("appmanifest_%d.acf", appID)))
+	if err != nil {
+		return ""
+	}
+	match := steamInstallDirRE.FindSubmatch(data)
+	if len(match) != 2 {
+		return ""
+	}
+	return strings.TrimSpace(string(match[1]))
+}
+
+var steamInstallDirRE = regexp.MustCompile(`(?im)"installdir"\s+"([^"]+)"`)
+
+// isLegacySteamInstallDir 判断 installdir 是否是旧版本自动生成的 "名称 (AppID)"。
+func isLegacySteamInstallDir(dir string, spec *MountSpec) bool {
+	if spec == nil || spec.SteamAppID <= 0 {
+		return false
+	}
+	legacy := fmt.Sprintf("%s (%d)", strings.TrimSpace(spec.SteamAppName), spec.SteamAppID)
+	return strings.TrimSpace(spec.SteamAppName) != "" && strings.EqualFold(strings.TrimSpace(dir), legacy)
+}
+
+// steamManifestName 返回某个 AppID 的 appmanifest 文件名。
+func steamManifestName(appID int64) string {
+	return fmt.Sprintf("appmanifest_%d.acf", appID)
+}
+
 // writeSteamAppManifest 在 Steam 库的 steamapps 下写入 appmanifest，让 Steam 把
 // 挂载目录当作已安装游戏发现。返回清单路径，供卸载时删除。
+//
+// ⚠️ 不能只写一份"最小清单"（appid/installdir/StateFlags/buildid）。真实反馈：
+// 游戏能被识别，但一直显示"更新失败"。原因是 Steam 判断"已安装 / 是否需要更新"
+// 还依赖清单里的 InstalledDepots / MountedDepots / SizeOnDisk —— 这些字段缺失时，
+// Steam 会认为 depot 没装齐，于是反复排一次注定失败的更新。
+//
+// 因此优先以**盘内 SteamCMD 写出的官方清单**为基线（<挂载点>\steamapps\appmanifest_<appid>.acf，
+// 它描述的正是这份内容），只覆盖"随挂载点变化"的字段；只有盘内没有清单时才合成最小清单。
 func writeSteamAppManifest(spec *MountSpec, library, mountPath string) (string, error) {
 	if spec == nil || spec.SteamAppID <= 0 {
 		return "", nil
@@ -1653,11 +1739,67 @@ func writeSteamAppManifest(spec *MountSpec, library, mountPath string) (string, 
 		return "", err
 	}
 	installdir := filepath.Base(filepath.Clean(mountPath))
+	name := steamManifestName(spec.SteamAppID)
+	path := filepath.Join(steamapps, name)
+
+	content := ""
+	// 盘内官方清单：SteamCMD 的 force_install_dir 会把 appmanifest 写在安装目录的
+	// steamapps/ 下，并随游戏内容一起被同步进存储库。
+	if raw, err := os.ReadFile(filepath.Join(mountPath, "steamapps", name)); err == nil {
+		content = strings.TrimSpace(string(raw))
+	}
+	if content == "" {
+		content = synthesizeSteamManifest(spec, installdir)
+	} else {
+		content = refreshSteamManifest(content, spec, installdir)
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	_ = os.Remove(path)
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return "", err
+	}
+	return path, nil
+}
+
+// refreshSteamManifest 把盘内官方清单改写成"挂载在这个 Steam 库里的这一份"。
+//
+// 只动挂载相关与更新状态字段：buildid / InstalledDepots / MountedDepots /
+// SizeOnDisk / SharedDepots 等描述内容本身的字段原样保留 —— 它们必须与盘上的
+// 文件完全对应，否则 Steam 会开始校验并重新下载。
+func refreshSteamManifest(content string, spec *MountSpec, installdir string) string {
+	content = setSteamManifestField(content, "appid", strconv.FormatInt(spec.SteamAppID, 10))
+	if name := strings.TrimSpace(spec.SteamAppName); name != "" {
+		content = setSteamManifestField(content, "name", name)
+	}
+	content = setSteamManifestField(content, "installdir", installdir)
+	content = setSteamManifestField(content, "StateFlags", "4")
+	content = setSteamManifestField(content, "UpdateResult", "0")
+	content = setSteamManifestField(content, "BytesToDownload", "0")
+	content = setSteamManifestField(content, "BytesDownloaded", "0")
+	content = setSteamManifestField(content, "StagingSize", "0")
+	// 只在前台启动时检查更新（0 = 后台常驻自动更新）。挂载出来的共享库写的是
+	// 临时差异盘，后台自动更新既没意义，失败后还会一直挂着"更新失败"。
+	content = setSteamManifestField(content, "AutoUpdateBehavior", "1")
+	// 兜底：极老的清单没有 SizeOnDisk 时补一个，避免 Steam 按 0 字节计算可用空间。
+	if !steamManifestHasField(content, "SizeOnDisk") && spec.DiskSizeBytes > 0 {
+		content = setSteamManifestField(content, "SizeOnDisk", strconv.FormatInt(spec.DiskSizeBytes, 10))
+	}
+	return content
+}
+
+// synthesizeSteamManifest 是没有官方清单时的最小可用清单（只保证"能被识别为已安装"）。
+func synthesizeSteamManifest(spec *MountSpec, installdir string) string {
 	build := strings.TrimSpace(spec.SteamBuildID)
-	if build == "" {
+	if !isDecimalDigits(build) {
+		// Steam 只接受数字 buildid；服务端的 "unknown" 哨兵不能直接写进去。
 		build = "0"
 	}
-	content := fmt.Sprintf(`"AppState"
+	return fmt.Sprintf(`"AppState"
 {
 	"appid"	"%d"
 	"Universe"	"1"
@@ -1672,23 +1814,53 @@ func writeSteamAppManifest(spec *MountSpec, library, mountPath string) (string, 
 	"UpdateResult"	"0"
 	"BytesToDownload"	"0"
 	"BytesDownloaded"	"0"
-	"AutoUpdateBehavior"	"0"
+	"AutoUpdateBehavior"	"1"
 	"AllowOtherDownloadsWhileRunning"	"0"
 	"ScheduledAutoUpdate"	"0"
 }
 `, spec.SteamAppID, vdfEscape(spec.SteamAppName), vdfEscape(installdir),
 		time.Now().Unix(), spec.DiskSizeBytes, vdfEscape(build))
-	path := filepath.Join(steamapps, fmt.Sprintf("appmanifest_%d.acf", spec.SteamAppID))
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
-		return "", err
+}
+
+// setSteamManifestField 覆盖 VDF 里的一个一级字段；字段不存在时插到最外层大括号之前。
+func setSteamManifestField(content, key, value string) string {
+	// 值里允许出现 \" 转义（游戏名可能带引号），不能简单用 [^"]* 截断。
+	re := regexp.MustCompile(`(?im)^([ \t]*"` + regexp.QuoteMeta(key) + `"[ \t]*)("(?:[^"\\\r\n]|\\.)*")`)
+	escaped := `"` + vdfEscape(value) + `"`
+	if re.MatchString(content) {
+		return re.ReplaceAllStringFunc(content, func(line string) string {
+			match := re.FindStringSubmatch(line)
+			if len(match) < 2 {
+				return line
+			}
+			return match[1] + escaped
+		})
 	}
-	_ = os.Remove(path)
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return "", err
+	idx := strings.LastIndex(content, "}")
+	if idx < 0 {
+		return content
 	}
-	return path, nil
+	insert := "\t\"" + key + "\"\t\t" + escaped + "\n"
+	return content[:idx] + insert + content[idx:]
+}
+
+// steamManifestHasField 判断 VDF 里是否存在某个一级字段。
+func steamManifestHasField(content, key string) bool {
+	re := regexp.MustCompile(`(?im)^[ \t]*"` + regexp.QuoteMeta(key) + `"[ \t]*"`)
+	return re.MatchString(content)
+}
+
+// isDecimalDigits 判断字符串是否只由 ASCII 数字组成（Steam 的 buildid 要求）。
+func isDecimalDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func vdfEscape(value string) string {
@@ -1735,6 +1907,12 @@ func repoGroupOf(req MountRequest, spec *MountSpec) string {
 func (e *mountEngine) resolveMountDir(req MountRequest, spec *MountSpec) (string, error) {
 	base := strings.TrimSpace(e.a.cfg.Get().DefaultMountDir)
 	leaf := mountDirLeaf(repoNameOf(req, spec), req.AllocationID)
+	// Steam 游戏必须落在 Steam 预期的安装目录名上（例如 Palworld），不能直接用
+	// 存储库名 "Palworld (1623730)"：Steam 可能因此认不出已安装游戏，或者覆盖掉
+	// 官方 appmanifest 的 installdir。
+	if steamLeaf := e.steamInstallLeaf(req, spec); steamLeaf != "" {
+		leaf = steamLeaf
+	}
 
 	// 分组覆盖优先：它的语义就是"覆盖组内库自己的配置"，也包括自动挂载带进来的旧路径。
 	local := e.explicitMountDir(req, spec)
@@ -2043,6 +2221,10 @@ func (e *mountEngine) explicitMode(req MountRequest, spec *MountSpec) string {
 		return mode
 	}
 	if pref, ok := e.repoPref(req.RepoID); ok {
+		// Steam 库挂载必须是目录挂载：盘符模式无法让 Steam 按库目录发现游戏。
+		if strings.TrimSpace(pref.SteamLibrary) != "" {
+			return mountModeDirectory
+		}
 		return normalizeMountMode(pref.MountMode)
 	}
 	return ""
@@ -2057,6 +2239,11 @@ func (e *mountEngine) explicitMountDir(req MountRequest, spec *MountSpec) string
 		if dir := strings.TrimSpace(gp.MountDir); dir != "" {
 			return dir
 		}
+	}
+	// 单库配置也能选 Steam 库：不把父目录归一到 steamapps/common，
+	// 就会挂到库名目录下，Steam 永远发现不了。
+	if pref, ok := e.repoPref(req.RepoID); ok && strings.TrimSpace(pref.SteamLibrary) != "" {
+		return filepath.Join(steamLibraryRoot(pref.SteamLibrary), "steamapps", "common")
 	}
 	if dir := strings.TrimSpace(req.MountPath); dir != "" {
 		return dir

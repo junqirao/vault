@@ -52,13 +52,17 @@ func ErrMountDirNotNTFS(dir string) *apperr.Error {
 // mappedReasonError 把脚本通过 {"ok":false,"reason":"..."} 上报的失败原因映射为更精确的业务错误。
 //
 // 未命中映射时返回 nil，调用方应返回原始错误（保留 platform.ps_failed 语义）。
+//
+// 映射时保留原始脚本错误为 Cause：ScriptError.Error() 只含稳定的 reason/step（不含原始
+// 报错文本），所以不影响对外文案；而 agent 的 mountErrorDetailOf 能通过 errors.As
+// 取到脚本自报的 Message（例如"现场 iSCSI 磁盘编号:容量"），挂载失败时才有得诊断。
 func mappedReasonError(err error, mappings map[string]*apperr.Error) error {
 	var scriptErr *winps.ScriptError
 	if !errors.As(err, &scriptErr) {
 		return nil
 	}
 	if mapped, ok := mappings[scriptErr.Reason]; ok {
-		return mapped
+		return mapped.WithCause(err)
 	}
 	return nil
 }
